@@ -27,6 +27,16 @@ node_modules
 .venv
 .env
 .DS_Store
+outputs
+logs
+data
+*.pt
+*.pth
+*.ckpt
+*.png
+*.jpg
+*.npy
+*.npz
 """
 
 
@@ -36,6 +46,17 @@ class ShadowGit:
     def __init__(self, work_dir: Path, git_dir: Path):
         self.work_dir = work_dir.resolve()
         self.git_dir = git_dir.resolve()
+
+    # Config overrides applied to every shadow-git invocation. These are
+    # throwaway bookkeeping commits; never sign them (a user's global
+    # commit.gpgsign=true would otherwise make every commit fail), and pin a
+    # committer identity so commits work even if the user has no global identity.
+    _CONFIG_OVERRIDES = [
+        "-c", "commit.gpgsign=false",
+        "-c", "tag.gpgsign=false",
+        "-c", "user.name=agentlens-shadow",
+        "-c", "user.email=shadow@agentlens.local",
+    ]
 
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         """Run a git command with GIT_DIR and GIT_WORK_TREE set."""
@@ -47,7 +68,7 @@ class ShadowGit:
             "GIT_WORK_TREE": str(self.work_dir),
         }
         result = subprocess.run(
-            ["git", *args],
+            ["git", *self._CONFIG_OVERRIDES, *args],
             env=env,
             capture_output=True,
             text=True,
