@@ -1,7 +1,14 @@
 /runs/
 /runs_old/
 /repos/
-/experiments/
+/pipeline_runs/
+openrouter_api_key.txt
+# experiment configs are local by default...
+/experiments/*
+# ...but the budget-pressure pipeline configs are part of the committed deliverable:
+!/experiments/budget_pressure_tsp.yaml
+!/experiments/budget_pressure_tsp_smoke.yaml
+!/experiments/comb_opt_research_relaxed.yaml
 __pycache__/
 *.pyc
 .venv/

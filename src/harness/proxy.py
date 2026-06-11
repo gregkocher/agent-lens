@@ -133,10 +133,15 @@ class CaptureProxy:
 
         # Parse request body (but don't log yet — wait for response)
         request_data: dict | None = None
+        # Capture this request's index NOW: the counter may be incremented by a
+        # concurrent request while we await the response stream below, and the
+        # request_NNN/response_NNN pairing must use this request's own index.
+        request_index: int | None = None
         if is_messages and body:
             try:
                 request_data = json.loads(body)
                 self._request_index += 1
+                request_index = self._request_index
             except Exception:
                 logger.exception("Failed to parse API request body")
 
@@ -148,9 +153,9 @@ class CaptureProxy:
 
         # Raw dump for first N requests
         should_dump_raw = (
-            is_messages
+            request_index is not None
             and self._raw_dump_count > 0
-            and self._request_index <= self._raw_dump_count
+            and request_index <= self._raw_dump_count
             and self._log_path
         )
 
@@ -181,7 +186,7 @@ class CaptureProxy:
                     try:
                         resp_body = b"".join(response_chunks)
                         response_meta = _parse_sse_response(resp_body)
-                        self._log_exchange(request_data, response_meta)
+                        self._log_exchange(request_data, response_meta, request_index)
                     except Exception:
                         logger.exception("Failed to log API exchange")
 
@@ -189,7 +194,7 @@ class CaptureProxy:
                 if should_dump_raw and self._log_path:
                     raw_dir = self._log_path.parent / "raw_dumps"
                     raw_dir.mkdir(parents=True, exist_ok=True)
-                    idx = self._request_index
+                    idx = request_index
                     # Request
                     req_path = raw_dir / f"request_{idx:03d}.json"
                     with open(req_path, "wb") as f:
@@ -223,10 +228,13 @@ class CaptureProxy:
 
                 return response
 
-    def _log_exchange(self, request_data: dict, response_meta: dict) -> None:
+    def _log_exchange(self, request_data: dict, response_meta: dict,
+                      request_index: int | None = None) -> None:
         """Log combined request + response metadata to JSONL."""
         if not self._log_path:
             return
+        if request_index is None:
+            request_index = self._request_index
 
         system = request_data.get("system")
         tools = request_data.get("tools")
@@ -261,7 +269,7 @@ class CaptureProxy:
         # Build log entry
         entry: dict = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "request_index": self._request_index,
+            "request_index": request_index,
             "agent_context": agent_context,
             "model": request_data.get("model"),
             "sampling_params": {

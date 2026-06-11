@@ -12,6 +12,9 @@ dependencies = [
     "pydantic>=2.0",
     "aiohttp>=3.9",
     "httpx>=0.27",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.1",
+    "numpy>=2.4.2",
 ]
 
 [project.scripts]
@@ -24,5 +27,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/harness"]
 
+[tool.pytest.ini_options]
+# repo root on sys.path so tests can import the top-level `pipeline` package
+pythonpath = ["."]
+
 [tool.ruff]
 line-length = 100
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
