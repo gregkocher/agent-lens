@@ -52,9 +52,10 @@ async def run_experiment(config: RunConfig, output_base: Path | None = None) -> 
     shadow_git = ShadowGit(work_dir=work_dir, git_dir=run_dir / ".shadow_git")
     shadow_git.init()
 
-    # Initialize state manager and seed memory file
+    # Initialize state manager and seed memory file (memory_seed: null = no seeding)
     state = StateManager(work_dir=work_dir, shadow_git=shadow_git)
-    state.seed_memory(config.memory_file, config.memory_seed)
+    if config.memory_seed is not None:
+        state.seed_memory(config.memory_file, config.memory_seed)
 
     # Commit baseline (captures full working directory state)
     shadow_git.commit_baseline()

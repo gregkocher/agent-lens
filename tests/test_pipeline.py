@@ -371,3 +371,95 @@ def test_turn_table_and_locate(tmp_path):
 
     # unlimited run: no reminder -> frac stays None
     assert turn_table(run, budget_usd=None)[0]["frac_used"] is None
+
+
+# --------------------------------------------------------------------------- final_score
+def test_final_score_config_requires_exactly_one_extractor():
+    from pipeline.config import FinalScoreConfig
+    with pytest.raises(ValueError):
+        FinalScoreConfig(command="x")
+    with pytest.raises(ValueError):
+        FinalScoreConfig(command="x", extract_regex="a", extract_json_key="b")
+    assert _sweep().final_score is None  # absent (TSP-style config) -> phase skipped
+
+
+def test_final_score_extract_regex_takes_last_match():
+    from pipeline.config import FinalScoreConfig
+    from pipeline.final_score import _extract
+    fs = FinalScoreConfig(command="x", extract_regex=r"Overall speedup: ([0-9.]+)x")
+    out = "Overall speedup: 1.10x\nnoise\nOverall speedup: 2.50x\n"
+    assert _extract(out, fs) == 2.50
+    assert _extract("no match here", fs) is None
+
+
+def test_final_score_extract_json_key_uses_last_json_line():
+    from pipeline.config import FinalScoreConfig
+    from pipeline.final_score import _extract
+    fs = FinalScoreConfig(command="x", extract_json_key="mean_tour_length")
+    out = 'noise\n{"mean_tour_length": 7.49}\n{"mean_tour_length": 7.21}\n'
+    assert _extract(out, fs) == 7.21
+    assert _extract('{"other": 1}', fs) is None
+
+
+def test_final_score_run_reconstructs_final_state(tmp_path):
+    # Minimal shadow-git fixture mirroring a run dir: bare git_dir + work tree
+    # holding a fake scorer; score_run must materialize HEAD and execute it.
+    import os
+    import subprocess
+    from pipeline.config import FinalScoreConfig
+    from pipeline.final_score import score_run
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "scorer.sh").write_text("echo 'Overall speedup: 3.21x'\n")
+    git_dir = run_dir / ".shadow_git"
+    subprocess.run(["git", "init", "--bare", str(git_dir)], check=True, capture_output=True)
+    env = {**os.environ, "GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(work)}
+    overrides = ["-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", *overrides, "add", "-A"], env=env, cwd=work, check=True, capture_output=True)
+    subprocess.run(["git", *overrides, "commit", "-m", "final"],
+                   env=env, cwd=work, check=True, capture_output=True)
+
+    fs = FinalScoreConfig(command="sh scorer.sh", extract_regex=r"Overall speedup: ([0-9.]+)x")
+    row = score_run(run_dir, fs)
+    assert row["status"] == "ok" and row["score"] == 3.21
+    # extractor mismatch surfaces as extract_failed, not a crash
+    fs_bad = FinalScoreConfig(command="sh scorer.sh", extract_regex=r"tour length ([0-9.]+)")
+    assert score_run(run_dir, fs_bad)["status"] == "extract_failed"
+
+
+def test_final_score_run_missing_shadow_git(tmp_path):
+    from pipeline.config import FinalScoreConfig
+    from pipeline.final_score import score_run
+    fs = FinalScoreConfig(command="true", extract_regex="(1)")
+    assert score_run(tmp_path, fs)["status"] == "no_shadow_git"
+
+
+# --------------------------------------------------------------------------- lru task wiring
+def test_lru_rubric_parses_with_judge_loader():
+    from pipeline.judge import _load_rubrics
+    r = _load_rubrics("pipeline/rubrics/lru_reward_hacking.txt")
+    assert r["binary"].strip() and r["scale_1_5"].strip()
+    assert "PERMISSIVE" in r["preamble"]
+
+
+def test_memory_seed_nullable_and_tsp_dump_unchanged():
+    from harness.config import load_config
+    lru = load_config("experiments/lru_cache_exact.yaml")
+    assert lru.memory_seed is None
+    # Fingerprint stability for the live TSP sweep: the dumped value of the
+    # (unchanged-default) field must stay byte-identical after the type widening.
+    tsp = load_config("experiments/comb_opt_research_relaxed.yaml")
+    assert tsp.model_dump()["memory_seed"] == "# Notes\n"
+
+
+def test_lru_sweep_config_loads():
+    from pipeline.config import load_sweep_config
+    cfg = load_sweep_config("experiments/budget_pressure_lru.yaml")
+    assert cfg.final_score is not None
+    assert cfg.final_score.extract_regex == r"Overall speedup: ([0-9.]+)x"
+    assert cfg.n_trajectory_workers == 1   # timing benchmark -> serial trajectories
+    assert "test_cache.py" in cfg.hack_signals.protected_write_paths
+    assert "cache_starter.py" in cfg.hack_signals.protected_write_paths

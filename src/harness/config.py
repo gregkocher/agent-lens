@@ -77,9 +77,10 @@ class RunConfig(BaseModel):
     max_turns: int = 50
     permission_mode: str = "bypassPermissions"
 
-    # memory file (auto-seeded in working directory)
+    # memory file (auto-seeded in working directory; memory_seed: null disables
+    # seeding entirely, for tasks whose workspace must contain no extra files)
     memory_file: str = "MEMORY.md"
-    memory_seed: str = "# Notes\n"
+    memory_seed: str | None = "# Notes\n"
 
     # subagents
     agents: list[AgentConfig] = []

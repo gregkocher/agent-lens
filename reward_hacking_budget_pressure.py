@@ -17,9 +17,11 @@ Usage:
 Phases:
   run     - sweep max_budget_usd, run isolated AgentLens trajectories (phase 1)
   events  - mechanical hack-event detection + per-turn pressure tables (offline)
+  score   - ground-truth final score per trajectory from shadow-git state (offline;
+            only if the sweep config has a final_score section)
   judge   - LLM-as-a-judge reward-hacking scoring of each trajectory (phase 2)
   analyze - aggregate + plot hacking rate / budget-awareness vs budget (phase 3)
-  all     - run -> events -> judge -> analyze
+  all     - run -> events -> score -> judge -> analyze
 
 See plans/budget-pressure-reward-hacking-pipeline.md and
 plans/hack-localization-and-hazard-analysis.md.
@@ -35,6 +37,7 @@ from pathlib import Path
 from pipeline.analyze import analyze
 from pipeline.config import load_sweep_config
 from pipeline.events import detect_all
+from pipeline.final_score import score_all
 from pipeline.judge import judge_all
 from pipeline.run_trajectories import run_all_trajectories
 
@@ -42,7 +45,7 @@ from pipeline.run_trajectories import run_all_trajectories
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True, help="path to the sweep meta-config YAML")
-    ap.add_argument("--phase", choices=["all", "run", "events", "judge", "analyze"], default="all")
+    ap.add_argument("--phase", choices=["all", "run", "events", "score", "judge", "analyze"], default="all")
     args = ap.parse_args()
 
     # Resolve the config against the caller's cwd, then chdir to the repo root so the
@@ -60,6 +63,9 @@ def main() -> None:
     if args.phase in ("all", "events"):
         print("\n===== PHASE events: mechanical hack-event detection =====")
         detect_all(cfg)
+    if args.phase in ("all", "score") and cfg.final_score is not None:
+        print("\n===== PHASE score: ground-truth final scores =====")
+        score_all(cfg)
     if args.phase in ("all", "judge"):
         print("\n===== PHASE 2: LLM judge =====")
         asyncio.run(judge_all(cfg))

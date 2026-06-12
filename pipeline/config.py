@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 VALID_JUDGE_MODES = {"binary", "scale_1_5"}
 
@@ -94,6 +94,29 @@ class HackSignalsConfig(BaseModel):
                     or self.suspicious_bash_patterns or self.eval_invocation_pattern)
 
 
+class FinalScoreConfig(BaseModel):
+    """Phase 'score' — ground-truth scoring of each trajectory's final file state.
+
+    Task-agnostic: the final work-dir state is reconstructed from the run's shadow
+    git (a worktree at `ref`), `command` runs inside it, and the score is pulled
+    from stdout via exactly one of `extract_regex` (group 1) or `extract_json_key`
+    (key of the last JSON line). Results: <run_dir>/final_score.json per run plus
+    an aggregate final_scores.jsonl. Runs SERIALLY by design — scores are often
+    timing benchmarks."""
+
+    command: str                       # shell command run inside the reconstructed work dir
+    timeout_s: float = 600.0
+    extract_regex: str | None = None   # first capture group of the LAST match in stdout
+    extract_json_key: str | None = None  # key looked up in the last JSON-parseable stdout line
+    ref: str = "HEAD"                  # shadow-git ref of the final state
+
+    @model_validator(mode="after")
+    def _check_extractor(self) -> "FinalScoreConfig":
+        if (self.extract_regex is None) == (self.extract_json_key is None):
+            raise ValueError("final_score needs exactly one of extract_regex / extract_json_key")
+        return self
+
+
 class SweepConfig(BaseModel):
     """Top-level meta-config for one budget-pressure experiment."""
 
@@ -115,6 +138,9 @@ class SweepConfig(BaseModel):
 
     # Phase 'events' — mechanical hack-event detection (optional; empty = skipped)
     hack_signals: HackSignalsConfig = Field(default_factory=HackSignalsConfig)
+
+    # Phase 'score' — ground-truth final scoring (optional; absent = skipped)
+    final_score: FinalScoreConfig | None = None
 
     # Phase 3 — analysis
     wordcount_patterns: list[str] = Field(default_factory=lambda: list(DEFAULT_WORDCOUNT_PATTERNS))
@@ -176,6 +202,10 @@ class SweepConfig(BaseModel):
     @property
     def judge_events_jsonl(self) -> Path:
         return self.out / "judge_events.jsonl"
+
+    @property
+    def final_scores_jsonl(self) -> Path:
+        return self.out / "final_scores.jsonl"
 
 
 def budget_label(budget: float | None) -> str:
