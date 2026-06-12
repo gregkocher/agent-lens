@@ -267,3 +267,38 @@ class TestBuildProviderEnv:
             rc = RunConfig.model_validate(_minimal(provider=provider))
             env = build_provider_env(rc)
             assert env["CLAUDECODE"] == ""
+
+
+class TestEngineConfig:
+    def test_default_engine_is_claude_code(self):
+        rc = RunConfig.model_validate(_minimal())
+        assert rc.engine == "claude_code"
+        assert rc.sandbox_mode == "workspace-write"
+
+    def test_codex_engine(self):
+        rc = RunConfig.model_validate(_minimal(engine="codex", model="gpt-5.4"))
+        assert rc.engine == "codex"
+
+    def test_codex_env_is_empty(self):
+        rc = RunConfig.model_validate(_minimal(engine="codex", model="gpt-5.4"))
+        assert build_provider_env(rc) == {}
+
+    def test_invalid_engine_rejected(self):
+        with pytest.raises(Exception):
+            RunConfig.model_validate(_minimal(engine="nonsense"))
+
+    def test_codex_with_subagents_rejected(self):
+        with pytest.raises(Exception):
+            RunConfig.model_validate(
+                _minimal(
+                    engine="codex",
+                    model="gpt-5.4",
+                    agents=[{"name": "x", "description": "d", "prompt": "p"}],
+                )
+            )
+
+    def test_claude_code_with_subagents_ok(self):
+        rc = RunConfig.model_validate(
+            _minimal(agents=[{"name": "x", "description": "d", "prompt": "p"}])
+        )
+        assert len(rc.agents) == 1

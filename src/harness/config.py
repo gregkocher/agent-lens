@@ -15,6 +15,7 @@ __all__ = [
     "SessionMode",
     "SessionConfig",
     "AgentConfig",
+    "JudgeConfig",
     "RunConfig",
     "load_config",
     "build_provider_env",
@@ -48,6 +49,36 @@ class AgentConfig(BaseModel):
     model: Literal["sonnet", "opus", "haiku", "inherit"] | None = None
 
 
+class JudgeConfig(BaseModel):
+    """Auto-judge: an LLM that evaluates the running trajectory against a rubric.
+
+    The judge runs every ``every_n_turns`` agent turns, sees the trajectory so
+    far, and returns a structured verdict (flagged + reason + confidence). If a
+    verdict is flagged and ``early_exit`` is set, the session stops after the
+    current turn. The judge runs independently of the agent engine, so it can
+    judge both Claude Code and Codex runs.
+    """
+
+    model: str
+    rubric: str  # what to flag — the judge's instructions/criteria
+
+    # backend (configurable: anthropic | openai | openrouter, or a custom
+    # OpenAI-/Anthropic-compatible endpoint via base_url + api_key_env)
+    provider: Literal["anthropic", "openai", "openrouter"] = "anthropic"
+    base_url: str | None = None
+    api_key_env: str | None = None  # override the env var holding the API key
+
+    # cadence + behavior
+    every_n_turns: int = Field(default=5, ge=1)
+    early_exit: bool = False
+
+    # rendering / sampling
+    name: str = "judge"
+    include_reasoning: bool = True  # show the agent's thinking to the judge
+    max_tokens: int = 1024
+    temperature: float = 0.0
+
+
 class RunConfig(BaseModel):
     """Top-level run configuration."""
 
@@ -56,10 +87,21 @@ class RunConfig(BaseModel):
     hypothesis: str | None = None
     tags: list[str] = []
 
+    # engine (which coding-agent runtime executes the session)
+    engine: Literal["claude_code", "codex"] = "claude_code"
+
     # model
     model: str
     provider: str = "anthropic"
     base_url: str | None = None
+
+    # codex sandbox policy (codex engine only)
+    sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] = (
+        "workspace-write"
+    )
+    # codex multi-agent: enable `features.multi_agent` so Codex can spawn
+    # subagents; AgentLens then captures each as a linked subagent trajectory.
+    codex_multi_agent: bool = False
 
     # working directory
     work_dir: str
@@ -84,6 +126,9 @@ class RunConfig(BaseModel):
     # subagents
     agents: list[AgentConfig] = []
     capture_subagent_trajectories: bool = True
+
+    # auto-judge (optional)
+    judge: JudgeConfig | None = None
 
     # capture (required for resampling turns)
     capture_api_requests: bool = True
@@ -119,6 +164,18 @@ class RunConfig(BaseModel):
                         f"Session {s.session_index} has fork_from={s.fork_from}, "
                         f"but fork_from must reference an earlier session."
                     )
+
+        # `provider` is a Claude-routing concept; for Codex the meaningful
+        # default is OpenAI. Only override when the user didn't set it.
+        if self.engine == "codex" and "provider" not in self.model_fields_set:
+            self.provider = "openai"
+
+        # Subagents are a Claude Code feature; Codex has no equivalent.
+        if self.engine == "codex" and self.agents:
+            raise ValueError(
+                "Subagents (`agents:`) are only supported by the claude_code engine. "
+                "Remove `agents:` to run with the codex engine."
+            )
         return self
 
 
@@ -130,10 +187,15 @@ def load_config(path: str | Path) -> RunConfig:
 
 
 def build_provider_env(config: RunConfig) -> dict[str, str]:
-    """Build environment variable dict for ClaudeAgentOptions.env.
+    """Build environment variable dict passed to the engine.
 
     Returns a dict — does NOT mutate os.environ.
     """
+    # Codex authenticates via ~/.codex/auth.json (or OPENAI_API_KEY inherited
+    # from the process env) and does not use the Anthropic provider plumbing.
+    if config.engine == "codex":
+        return {}
+
     env: dict[str, str] = {
         # Unset CLAUDECODE to allow launching from within a Claude Code session
         "CLAUDECODE": "",

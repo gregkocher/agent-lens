@@ -30,9 +30,13 @@ async def run_experiment(config: RunConfig, output_base: Path | None = None) -> 
     Returns:
         Path to the run directory.
     """
+    from harness.runner import install_quiet_exception_handler
+
+    install_quiet_exception_handler()
+
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
     model_slug = config.model.replace("/", "_").replace(":", "_")
-    run_name = config.run_name or f"{timestamp}_{model_slug}"
+    run_name = config.run_name or f"{timestamp}_{config.engine}_{model_slug}"
 
     base = output_base or Path("runs")
     run_dir = base / run_name
@@ -228,6 +232,7 @@ def _build_run_meta(
     return {
         "run_name": run_name,
         "hypothesis": config.hypothesis,
+        "engine": config.engine,
         "model": config.model,
         "provider": config.provider,
         "sdk_version": _get_version("claude-agent-sdk"),
@@ -251,6 +256,9 @@ def _build_run_meta(
                 "total_cost_usd": r.total_cost_usd,
                 "compaction_count": r.compaction_count,
                 "subagent_count": r.subagent_count,
+                **({"judge_flagged": r.judge_flagged} if r.judge_verdict_count else {}),
+                **({"judge_early_exit": r.judge_early_exit} if r.judge_early_exit else {}),
+                **({"judge_verdict_count": r.judge_verdict_count} if r.judge_verdict_count else {}),
                 "error": r.error,
                 "started_at": r.started_at,
                 "finished_at": r.finished_at,
@@ -269,5 +277,7 @@ def _build_run_meta(
         "total_file_writes": len(state.write_log),
         "total_compaction_events": sum(r.compaction_count for r in results),
         "total_subagent_invocations": sum(r.subagent_count for r in results),
+        "judge_flagged_sessions": sum(1 for r in results if r.judge_flagged),
+        "judge_early_exits": sum(1 for r in results if r.judge_early_exit),
         "errors": [r.error for r in results if r.error],
     }

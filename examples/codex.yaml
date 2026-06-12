@@ -1,0 +1,35 @@
+# Codex engine example.
+#
+# Prerequisites:
+#   - The `codex` CLI installed and on PATH (codex-cli >= 0.135).
+#   - Authenticated via `codex login` OR an OPENAI_API_KEY in the environment
+#     (API-key auth is recommended for unattended/programmatic runs).
+#
+# Runs are labeled "Codex" everywhere (CLI, run_meta.json, web UI).
+
+engine: codex
+model: "gpt-5.4"
+
+# Codex sandbox policy: read-only | workspace-write | danger-full-access
+sandbox_mode: workspace-write
+
+work_dir: "./repos/test_repo"
+session_mode: isolated
+tags: ["codex", "example"]
+
+system_prompt: |
+  You are a careful software engineer. Keep notes in MEMORY.md as you work.
+
+max_turns: 30
+permission_mode: bypassPermissions
+memory_seed: "# Notes\n"
+
+# API capture (and the resampling it enables) routes Codex through a proxy using
+# OpenAI API-key auth — requires OPENAI_API_KEY with active billing. Turn-level
+# replay (`harness replay`) works regardless via the rollout transcript.
+# Set true only if your OPENAI_API_KEY has billing; otherwise keep false.
+capture_api_requests: false
+
+sessions:
+  - session_index: 1
+    prompt: "Explore this project and summarize its structure in MEMORY.md."

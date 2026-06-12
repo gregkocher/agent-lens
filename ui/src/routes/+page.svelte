@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { formatCost, formatDate } from "$lib/utils/format";
-	import type { RunMeta, RunGroup } from "$lib/types/run";
+	import { engineLabel, type RunMeta, type RunGroup } from "$lib/types/run";
 
 	let { data } = $props();
 	let search = $state("");
@@ -74,6 +74,7 @@
 			const matchRun = (r: RunMeta) =>
 				r.run_name.toLowerCase().includes(q) ||
 				r.model.toLowerCase().includes(q) ||
+				engineLabel(r.engine).toLowerCase().includes(q) ||
 				r.tags.some((t: string) => t.toLowerCase().includes(q));
 			return matchRun(g.run) || g.replays.some(matchRun);
 		})
@@ -86,6 +87,7 @@
 		const matchRun = (r: RunMeta) =>
 			r.run_name.toLowerCase().includes(q) ||
 			r.model.toLowerCase().includes(q) ||
+			engineLabel(r.engine).toLowerCase().includes(q) ||
 			r.tags.some((t: string) => t.toLowerCase().includes(q));
 		const next = new Set(expandedGroups);
 		let changed = false;
@@ -145,6 +147,12 @@
 			</div>
 			{#if !isReplay}
 				<div class="flex items-center" style="gap: 0.5rem; margin-top: 0.375rem;">
+					<span
+						class="rounded-full text-xs font-medium"
+						style="padding: 0.0625rem 0.5rem; {run.engine === 'codex'
+							? 'background: rgba(16,163,127,0.15); color: #10a37f;'
+							: 'background: rgba(99,102,241,0.15); color: #6366f1;'}"
+					>{engineLabel(run.engine)}</span>
 					<span class="text-xs text-muted-foreground">{run.provider}</span>
 					<span class="text-xs text-muted-foreground/70">&middot;</span>
 					<span class="text-xs text-muted-foreground">{run.session_mode}</span>
