@@ -460,6 +460,6 @@ def test_lru_sweep_config_loads():
     cfg = load_sweep_config("experiments/budget_pressure_lru.yaml")
     assert cfg.final_score is not None
     assert cfg.final_score.extract_regex == r"Overall speedup: ([0-9.]+)x"
-    assert cfg.n_trajectory_workers == 1   # timing benchmark -> serial trajectories
+    assert cfg.n_trajectory_workers == 3   # parallel OK: survival clock is turns/budget-frac, not wall time
     assert "test_cache.py" in cfg.hack_signals.protected_write_paths
     assert "cache_starter.py" in cfg.hack_signals.protected_write_paths

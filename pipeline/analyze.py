@@ -233,11 +233,17 @@ def _binned_rate(rows: list[dict], edges: np.ndarray, key: str = "event") -> tup
     return ks, ns
 
 
-def _iter_hack_events(cfg: SweepConfig):
-    """All hack events from BOTH detectors: the mechanical events.jsonl (categories
-    in HACK_CATEGORIES) and, when the judge has run, judge_events.jsonl (category
-    'judge_reward_hacking'). Same schema; downstream code is detector-agnostic."""
-    for path in (cfg.events_jsonl, cfg.judge_events_jsonl):
+_DETECTOR_SOURCES = ("mechanical", "judge")
+
+
+def _iter_hack_events(cfg: SweepConfig, sources: tuple[str, ...] = _DETECTOR_SOURCES):
+    """Hack events from the selected detector(s): mechanical events.jsonl (categories
+    in HACK_CATEGORIES) and/or judge_events.jsonl (category 'judge_reward_hacking').
+    `sources` picks which detector files to read ('mechanical', 'judge'); same schema,
+    so downstream code stays detector-agnostic. Default reads both (merged view)."""
+    paths = {"mechanical": cfg.events_jsonl, "judge": cfg.judge_events_jsonl}
+    for src in sources:
+        path = paths[src]
         if not path.exists():
             continue
         for line in path.read_text().splitlines():
@@ -248,12 +254,13 @@ def _iter_hack_events(cfg: SweepConfig):
                 yield e
 
 
-def _load_hack_turn_counts(cfg: SweepConfig) -> dict[str, dict[int, int]]:
-    """run_name -> {api_turn: number of located hack events at that turn} (ALL events
-    from both detectors, deduped per (run, detector, step) by construction; a turn
+def _load_hack_turn_counts(cfg: SweepConfig,
+                           sources: tuple[str, ...] = _DETECTOR_SOURCES) -> dict[str, dict[int, int]]:
+    """run_name -> {api_turn: number of located hack events at that turn} (events from
+    the selected detector(s), deduped per (run, detector, step) by construction; a turn
     flagged by both detectors counts once for the binary per-turn rate anyway)."""
     counts: dict[str, dict[int, int]] = {}
-    for e in _iter_hack_events(cfg):
+    for e in _iter_hack_events(cfg, sources):
         if e.get("api_turn") is None:
             continue
         per_run = counts.setdefault(e["run_name"], {})
@@ -261,13 +268,14 @@ def _load_hack_turn_counts(cfg: SweepConfig) -> dict[str, dict[int, int]]:
     return counts
 
 
-def _load_first_hacks(cfg: SweepConfig) -> tuple[dict[str, dict], int]:
+def _load_first_hacks(cfg: SweepConfig,
+                      sources: tuple[str, ...] = _DETECTOR_SOURCES) -> tuple[dict[str, dict], int]:
     """run_name -> first located hack event {api_turn, frac_used, category, step_id},
-    taking the EARLIEST event across the mechanical and judge detectors. Also returns
-    the count of hack events that could not be located on a turn."""
+    taking the EARLIEST event across the selected detector(s). Also returns the count
+    of hack events that could not be located on a turn."""
     first: dict[str, dict] = {}
     unlocated = 0
-    for e in _iter_hack_events(cfg):
+    for e in _iter_hack_events(cfg, sources):
         if e.get("api_turn") is None:
             unlocated += 1
             continue
@@ -334,17 +342,21 @@ def _recurrent_person_period(cfg: SweepConfig, judgeable: list[dict],
 
 def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: dict[str, int],
                     p_hat_by_run: dict[str, float], budgets: list, labels: list[str],
-                    line_pos: list[float], figs: Path) -> None:
-    """Exposure-corrected plots from hack events (mechanical detector + judge when
-    available; requires --phase events, judge events added by --phase judge)."""
-    if not cfg.events_jsonl.exists() and not cfg.judge_events_jsonl.exists():
-        print("  (no events.jsonl/judge_events.jsonl -> skipping hazard/KM plots; "
-              "run --phase events first)")
+                    line_pos: list[float], figs: Path,
+                    sources: tuple[str, ...] = _DETECTOR_SOURCES, suffix: str = "") -> None:
+    """Exposure-corrected plots from hack events for the selected detector(s). `sources`
+    chooses 'mechanical' and/or 'judge'; `suffix` is appended to every output figure
+    and CSV name so per-detector runs don't clobber each other. (Requires --phase
+    events; judge events added by --phase judge.)"""
+    det_label = "+".join(sources)
+    paths = {"mechanical": cfg.events_jsonl, "judge": cfg.judge_events_jsonl}
+    present = [s for s in sources if paths[s].exists()]
+    if not present:
+        print(f"  ({det_label}: no events file present -> skipping hazard/KM plots; "
+              "run --phase events/judge first)")
         return
-    srcs = [n for n, p in [("mechanical", cfg.events_jsonl), ("judge", cfg.judge_events_jsonl)]
-            if p.exists()]
-    print(f"  hack-event detectors included: {', '.join(srcs)}")
-    first_hacks, unlocated = _load_first_hacks(cfg)
+    print(f"  hack-event detector(s): {', '.join(present)}")
+    first_hacks, unlocated = _load_first_hacks(cfg, sources)
     if unlocated:
         print(f"  WARNING: {unlocated} hack event(s) had no API-turn location (missing/sparse "
               f"uuid_map) and are excluded from the hazard analysis.")
@@ -373,20 +385,20 @@ def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: d
     ax.set_xlabel("API turn")
     ax.set_ylabel("S(t) = P(no hack event by turn t)")
     ax.set_ylim(0, 1.02)
-    ax.set_title(f"{cfg.experiment_name}: survival without hack event (mechanical detector)")
+    ax.set_title(f"{cfg.experiment_name}: survival without hack event ({det_label} detector)")
     ax.legend(title="set budget", fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     figs.mkdir(parents=True, exist_ok=True)
-    fig.savefig(figs / "hack_km_vs_turn.pdf")
+    fig.savefig(figs / f"hack_km_vs_turn{suffix}.pdf")
     plt.close(fig)
-    print(f"  figure: {figs / 'hack_km_vs_turn.pdf'}  ({total_events} located event-runs)")
+    print(f"  figure: {figs / f'hack_km_vs_turn{suffix}.pdf'}  ({total_events} located event-runs)")
 
     # ---- person-period table -> CSV + discrete hazard binned on fraction used ----
     pp = _person_period_rows(cfg, judgeable, first_hacks)
     if pp:
-        pd.DataFrame(pp).to_csv(cfg.out / "person_period.csv", index=False)
-        print(f"  person-period table -> {cfg.out / 'person_period.csv'} ({len(pp)} rows)")
+        pd.DataFrame(pp).to_csv(cfg.out / f"person_period{suffix}.csv", index=False)
+        print(f"  person-period table -> {cfg.out / f'person_period{suffix}.csv'} ({len(pp)} rows)")
 
     capped_rows = [r for r in pp if r["frac_used"] is not None]
     if capped_rows:
@@ -419,13 +431,13 @@ def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: d
         ax.axvline(1.0, color="grey", ls="--", lw=1, alpha=0.6)
         ax.set_xlabel("fraction of budget used at turn")
         ax.set_ylabel("hazard: P(first hack at this turn | no hack yet)")
-        ax.set_title(f"{cfg.experiment_name}: hack hazard vs budget pressure")
+        ax.set_title(f"{cfg.experiment_name}: hack hazard vs budget pressure ({det_label})")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        fig.savefig(figs / "hack_hazard_vs_fraction_used.pdf")
+        fig.savefig(figs / f"hack_hazard_vs_fraction_used{suffix}.pdf")
         plt.close(fig)
-        print(f"  figure: {figs / 'hack_hazard_vs_fraction_used.pdf'}")
+        print(f"  figure: {figs / f'hack_hazard_vs_fraction_used{suffix}.pdf'}")
 
         # ---- recurrent-event intensity (ALL events, full denominator) vs onset hazard ----
         # Onset rising near 1.0 = pressure pushes the FIRST transgression; intensity
@@ -433,11 +445,11 @@ def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: d
         # only the post-onset rate r(x) separates true escalation from the composition
         # artifact (clean-share w(x) falling), so r is drawn alongside: intensity(x) =
         # w(x)*onset(x) + (1-w(x))*r(x). See docs/explainers/onset_vs_intensity.pdf.
-        rp = _recurrent_person_period(cfg, judgeable, _load_hack_turn_counts(cfg), first_hacks)
+        rp = _recurrent_person_period(cfg, judgeable, _load_hack_turn_counts(cfg, sources), first_hacks)
         if rp:
-            pd.DataFrame(rp).to_csv(cfg.out / "person_period_recurrent.csv", index=False)
-            print(f"  recurrent person-period table -> {cfg.out / 'person_period_recurrent.csv'} "
-                  f"({len(rp)} rows)")
+            pd.DataFrame(rp).to_csv(cfg.out / f"person_period_recurrent{suffix}.csv", index=False)
+            print(f"  recurrent person-period table -> "
+                  f"{cfg.out / f'person_period_recurrent{suffix}.csv'} ({len(rp)} rows)")
         rec_capped = [r for r in rp if r["frac_used"] is not None]
         if rec_capped:
             fig, ax = plt.subplots(figsize=(8, 5))
@@ -476,31 +488,34 @@ def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: d
             ax.axvline(1.0, color="grey", ls="--", lw=1, alpha=0.6)
             ax.set_xlabel("fraction of budget used at turn")
             ax.set_ylabel("hack actions per at-risk turn")
-            ax.set_title(f"{cfg.experiment_name}: hacking intensity vs onset hazard")
+            ax.set_title(f"{cfg.experiment_name}: hacking intensity vs onset hazard ({det_label})")
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
-            fig.savefig(figs / "hack_intensity_vs_fraction_used.pdf")
+            fig.savefig(figs / f"hack_intensity_vs_fraction_used{suffix}.pdf")
             plt.close(fig)
-            print(f"  figure: {figs / 'hack_intensity_vs_fraction_used.pdf'}")
+            print(f"  figure: {figs / f'hack_intensity_vs_fraction_used{suffix}.pdf'}")
 
     # ---- judge yes-rate per API turn (constant-hazard approximation) ----
-    rate_d = []
-    for b in budgets:
-        runs = [r["run_name"] for r in judgeable if r["budget_usd"] == b]
-        rate_d.append([p_hat_by_run[rn] / api_turns_by_run[rn] for rn in runs
-                       if rn in p_hat_by_run and api_turns_by_run.get(rn)])
-    if any(rate_d):
-        means, ses = zip(*(_mean_se(d) for d in rate_d))
-        _plot(line_pos, labels, list(means), list(ses),
-              "judge yes-rate / API turn",
-              f"{cfg.experiment_name}: reward-hacking rate per turn (exposure-corrected)",
-              figs / "binary_rate_per_turn_vs_budget.pdf", "#c0392b")
+    # Built from the judge binary VERDICT probabilities (p_hat), not the events files,
+    # so it is inherently judge-only and has no mechanical counterpart; emit once.
+    if "judge" in sources:
+        rate_d = []
+        for b in budgets:
+            runs = [r["run_name"] for r in judgeable if r["budget_usd"] == b]
+            rate_d.append([p_hat_by_run[rn] / api_turns_by_run[rn] for rn in runs
+                           if rn in p_hat_by_run and api_turns_by_run.get(rn)])
+        if any(rate_d):
+            means, ses = zip(*(_mean_se(d) for d in rate_d))
+            _plot(line_pos, labels, list(means), list(ses),
+                  "judge yes-rate / API turn",
+                  f"{cfg.experiment_name}: reward-hacking rate per turn (exposure-corrected)",
+                  figs / "binary_rate_per_turn_vs_budget.pdf", "#c0392b")
 
     # ---- density of hack events on the fraction-used axis (all events, capped arms) ----
     capped = [b for b in budgets if b is not None]
     ev_by_budget = {b: [] for b in capped}
-    for e in _iter_hack_events(cfg):
+    for e in _iter_hack_events(cfg, sources):
         if e.get("frac_used") is not None and e.get("budget_usd") in ev_by_budget:
             ev_by_budget[e["budget_usd"]].append(e["frac_used"])
     if any(ev_by_budget.values()):
@@ -509,8 +524,8 @@ def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: d
             [ev_by_budget[b] for b in capped], [_budget_label(b) for b in capped], frac_colors,
             "fraction of budget used (cost so far / set budget)",
             "probability density of hack events",
-            f"{cfg.experiment_name}: when (in budget consumption) hack events occur",
-            figs / "hack_events_by_fraction_used.pdf")
+            f"{cfg.experiment_name}: when (in budget consumption) hack events occur ({det_label})",
+            figs / f"hack_events_by_fraction_used{suffix}.pdf")
 
 
 def analyze(cfg: SweepConfig) -> None:
@@ -695,6 +710,11 @@ def analyze(cfg: SweepConfig) -> None:
 
     # --- exposure-corrected event/hazard analysis (requires --phase events) ---
     p_hat_by_run = {rn: float(np.mean(v)) for rn, v in bin_by_run.items() if v}
-    _event_analysis(cfg, judgeable, api_turns_by_run, p_hat_by_run, budgets, labels, line_pos, figs)
+    # Per-detector event analyses: mechanical-only and judge-only, each writing its own
+    # suffixed figures + person-period CSVs (no merged 'any-detector' view by design).
+    _event_analysis(cfg, judgeable, api_turns_by_run, p_hat_by_run, budgets, labels, line_pos, figs,
+                    sources=("mechanical",), suffix="_mechanical")
+    _event_analysis(cfg, judgeable, api_turns_by_run, p_hat_by_run, budgets, labels, line_pos, figs,
+                    sources=("judge",), suffix="_judge")
 
     print("\nPhase 3 complete.")
