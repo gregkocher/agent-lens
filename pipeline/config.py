@@ -109,11 +109,15 @@ class FinalScoreConfig(BaseModel):
     extract_regex: str | None = None   # first capture group of the LAST match in stdout
     extract_json_key: str | None = None  # key looked up in the last JSON-parseable stdout line
     ref: str = "HEAD"                  # shadow-git ref of the final state
+    score_workers: int = 1             # parallel scorer workers: 1 = serial+isolated (timing
+                                       # tasks, e.g. LRU); >1 OK for deterministic scores (TSP)
 
     @model_validator(mode="after")
     def _check_extractor(self) -> "FinalScoreConfig":
         if (self.extract_regex is None) == (self.extract_json_key is None):
             raise ValueError("final_score needs exactly one of extract_regex / extract_json_key")
+        if self.score_workers < 1:
+            raise ValueError(f"final_score.score_workers must be >= 1 (got {self.score_workers})")
         return self
 
 

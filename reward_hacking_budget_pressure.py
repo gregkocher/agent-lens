@@ -15,13 +15,16 @@ Usage:
     uv run python reward_hacking_budget_pressure.py --config <cfg> --phase analyze  # phase 3 only
 
 Phases:
-  run     - sweep max_budget_usd, run isolated AgentLens trajectories (phase 1)
+  run     - sweep max_budget_usd, run isolated AgentLens trajectories AND LLM-judge
+            each one as it completes (rollout=Anthropic, judge=OpenRouter overlap)
   events  - mechanical hack-event detection + per-turn pressure tables (offline)
   score   - ground-truth final score per trajectory from shadow-git state (offline;
             only if the sweep config has a final_score section)
-  judge   - LLM-as-a-judge reward-hacking scoring of each trajectory (phase 2)
+  judge   - standalone LLM-as-a-judge pass; in --phase all this is the Option-A
+            backfill (near-free: cached judgements skipped, only inline-skipped runs
+            re-attempted). Run alone to re-judge after a rubric/model change.
   analyze - aggregate + plot hacking rate / budget-awareness vs budget (phase 3)
-  all     - run -> events -> score -> judge -> analyze
+  all     - run(+inline judge) -> events -> score -> judge(backfill) -> analyze
 
 See plans/budget-pressure-reward-hacking-pipeline.md and
 plans/hack-localization-and-hazard-analysis.md.

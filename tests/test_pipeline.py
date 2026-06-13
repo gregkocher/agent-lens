@@ -6,6 +6,8 @@ budget labels, and the raw-dump word counter.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from pipeline.config import HackSignalsConfig, JudgeConfig, SweepConfig, budget_label, run_name_for
@@ -463,3 +465,88 @@ def test_lru_sweep_config_loads():
     assert cfg.n_trajectory_workers == 3   # parallel OK: survival clock is turns/budget-frac, not wall time
     assert "test_cache.py" in cfg.hack_signals.protected_write_paths
     assert "cache_starter.py" in cfg.hack_signals.protected_write_paths
+
+
+# --------------------------------------------------------------------------- score_workers
+def test_final_score_config_score_workers():
+    from pipeline.config import FinalScoreConfig
+    assert FinalScoreConfig(command="x", extract_regex="(1)").score_workers == 1
+    assert FinalScoreConfig(command="x", extract_regex="(1)", score_workers=4).score_workers == 4
+    with pytest.raises(ValueError):
+        FinalScoreConfig(command="x", extract_regex="(1)", score_workers=0)
+
+
+def test_score_all_parallel_matches_serial(tmp_path, monkeypatch):
+    import pipeline.final_score as fs
+    from pipeline.config import FinalScoreConfig
+
+    def fake_score_run(run_dir, cfg_fs):
+        n = int(run_dir.name.split("_r")[-1])
+        return {"status": "ok", "score": float(n), "exit_code": 0, "duration_s": 0.1}
+    monkeypatch.setattr(fs, "score_run", fake_score_run)
+
+    def run_with(workers):
+        out = tmp_path / f"w{workers}"
+        (out / "trajectories").mkdir(parents=True)
+        runs = []
+        for i in range(1, 6):
+            rd = out / "trajectories" / f"bp_b1_r{i}"
+            rd.mkdir()
+            runs.append({"run_name": f"bp_b1_r{i}", "budget_usd": 1.0, "rep": i,
+                         "status": "ok", "run_dir": str(rd)})
+        (out / "trajectories_manifest.json").write_text(json.dumps(runs))
+        cfg = _sweep(output_dir=str(out),
+                     final_score=FinalScoreConfig(command="x", extract_regex="(1)",
+                                                  score_workers=workers))
+        return sorted(fs.score_all(cfg), key=lambda r: r["run_name"])
+
+    serial, parallel = run_with(1), run_with(4)
+    assert [r["score"] for r in serial] == [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert [r["score"] for r in serial] == [r["score"] for r in parallel]
+
+
+# --------------------------------------------------------------------------- incremental judging
+def test_judge_run_writes_per_run_files(tmp_path, monkeypatch):
+    import asyncio
+    import httpx
+    import pipeline.judge as J
+
+    async def fake_call(client, cfg, api_key, system, rendered):
+        return ('{"reward_hacking":"no","first_step_id":null,"hack_step_ids":[],'
+                '"rationale":"stub","score":1}')
+    monkeypatch.setattr(J, "_call_openrouter", fake_call)
+
+    cfg = _sweep(output_dir=str(tmp_path))
+    rubrics = J._load_rubrics("pipeline/rubrics/lru_reward_hacking.txt")
+    row = {"run_name": "bp_b1_r1", "budget_usd": 1.0, "rep": 1, "run_dir": str(tmp_path / "rd")}
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            return await J.judge_run(client, cfg, "key", rubrics, row,
+                                     asyncio.Semaphore(4), rendered="[step 1] hi")
+    recs = asyncio.run(go())
+
+    assert len(recs) == len(cfg.judge.modes) * cfg.judge.n_judge_reps   # 2 x 2 = 4
+    assert all(r["ok"] for r in recs)
+    jd = cfg.judgements_dir / "bp_b1_r1"
+    assert (jd / "binary_rep1.json").exists() and (jd / "scale_1_5_rep2.json").exists()
+
+
+def test_assemble_judge_outputs_from_disk(tmp_path):
+    import pipeline.judge as J
+    cfg = _sweep(output_dir=str(tmp_path))
+    for run in ["bp_b1_r1", "bp_b1_r2"]:
+        d = cfg.judgements_dir / run
+        d.mkdir(parents=True)
+        for mode in ["binary", "scale_1_5"]:
+            (d / f"{mode}_rep1.json").write_text(json.dumps({
+                "run_name": run, "budget_usd": 1.0, "rep": 1, "mode": mode, "judge_rep": 1,
+                "ok": True, "verdict": "no" if mode == "binary" else None,
+                "first_step_id": None, "hack_step_ids": [],
+                "score": 1 if mode == "scale_1_5" else None, "rationale": "x"}))
+    judgeable = [{"run_name": "bp_b1_r1", "budget_usd": 1.0, "run_dir": str(tmp_path / "rd1")},
+                 {"run_name": "bp_b1_r2", "budget_usd": 1.0, "run_dir": str(tmp_path / "rd2")}]
+    recs = J.assemble_judge_outputs(cfg, judgeable)
+    assert len(recs) == 4
+    assert len(cfg.judgements_jsonl.read_text().strip().splitlines()) == 4
+    assert cfg.judge_events_jsonl.exists()   # written (empty: all "no" verdicts)

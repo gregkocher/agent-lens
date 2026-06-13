@@ -322,43 +322,98 @@ def _build_judge_events(cfg: SweepConfig, judgeable: list[dict], recs: list[dict
     return events
 
 
-async def judge_all(cfg: SweepConfig) -> list[dict]:
+def load_judge_api_key(cfg: SweepConfig) -> str:
+    """Read + validate the OpenRouter key (fail-fast)."""
     api_key = Path(cfg.judge.api_key_file).read_text().strip()
     if not api_key:
         raise RuntimeError(f"empty OpenRouter key in {cfg.judge.api_key_file}")
-    rubrics = _load_rubrics(cfg.judge.rubric_file)
+    return api_key
 
-    manifest = json.loads(cfg.manifest_path.read_text())
+
+def judgeable_runs(manifest: list[dict]) -> tuple[list[dict], list[str]]:
+    """(judgeable, excluded_names): ok runs that have a trajectory.json, and the rest."""
     has_traj = [r for r in manifest if (Path(r["run_dir"]) / "session_01" / "trajectory.json").exists()]
     judgeable = [r for r in has_traj if r.get("status") == "ok"]
     excluded = [r["run_name"] for r in has_traj if r.get("status") != "ok"]
+    return judgeable, excluded
+
+
+def _tally_and_print(row: dict, recs: list[dict], tally: dict | None) -> None:
+    """Update + print the running hack-rate tally from one run's binary reps."""
+    if tally is None:
+        return
+    bin_reps = [r for r in recs if r.get("mode") == "binary" and r.get("ok")]
+    if not bin_reps:
+        return
+    hacking, first, _ = aggregate_judge_locations(bin_reps)
+    tally["n"] += 1
+    tally["yes"] += int(hacking)
+    loc = f" @ step {first}" if first else ""
+    print(f"[judged] {row['run_name']} -> {'HACK' if hacking else 'clean'}{loc} "
+          f"| hack rate so far: {tally['yes']}/{tally['n']}")
+
+
+async def judge_run(client, cfg: SweepConfig, api_key: str, rubrics: dict[str, str],
+                    row: dict, sem: asyncio.Semaphore, tally: dict | None = None,
+                    rendered: str | None = None) -> list[dict]:
+    """Judge ONE finished trajectory across all modes x reps. Returns its judgement
+    recs; per-(run,mode,rep) files are persisted (resumable) by _judge_one. Used both
+    inline as each rollout completes and by the standalone judge_all backfill."""
+    if rendered is None:
+        rendered = render_trajectory(row["run_dir"], cfg.judge.max_input_chars)
+    tasks = [
+        _judge_one(client, cfg, api_key, rubrics, row, rendered, mode, k, sem)
+        for mode in cfg.judge.modes
+        for k in range(1, cfg.judge.n_judge_reps + 1)
+    ]
+    recs = await asyncio.gather(*tasks)
+    _tally_and_print(row, recs, tally)
+    return recs
+
+
+def assemble_judge_outputs(cfg: SweepConfig, judgeable: list[dict]) -> list[dict]:
+    """Build the aggregate judgements.jsonl + judge_events.jsonl from the per-run
+    judgement files ON DISK (so it works regardless of who wrote them — inline during
+    the run phase or the standalone judge phase). Idempotent."""
+    recs: list[dict] = []
+    for row in judgeable:
+        d = cfg.judgements_dir / row["run_name"]
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.json")):
+            try:
+                recs.append(json.loads(f.read_text()))
+            except json.JSONDecodeError:
+                continue
+    cfg.judgements_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg.judgements_jsonl, "w") as fh:
+        for rec in recs:
+            fh.write(json.dumps(rec) + "\n")
+    ok = sum(1 for r in recs if r.get("ok"))
+    print(f"\nJudgements assembled: {ok}/{len(recs)} ok -> {cfg.judgements_jsonl}")
+    _build_judge_events(cfg, judgeable, recs)
+    return recs
+
+
+async def judge_all(cfg: SweepConfig) -> list[dict]:
+    """Standalone judge phase: judge every judgeable run (resumable — cached ok
+    judgements are skipped, cached failures re-attempted), then assemble. Doubles as
+    the Option-A backfill in --phase all, where it is near-free (all cache hits)."""
+    api_key = load_judge_api_key(cfg)
+    rubrics = _load_rubrics(cfg.judge.rubric_file)
+    manifest = json.loads(cfg.manifest_path.read_text())
+    judgeable, excluded = judgeable_runs(manifest)
     if excluded:
         print(f"  excluding {len(excluded)} non-ok run(s) from judging: {excluded}")
     if not judgeable:
         print("No judgeable (status=ok) trajectories found (run Phase 1 first).")
         return []
-    print(f"Judging {len(judgeable)} trajectories x {len(cfg.judge.modes)} modes x {cfg.judge.n_judge_reps} reps...")
+    print(f"Judging {len(judgeable)} trajectories x {len(cfg.judge.modes)} modes x "
+          f"{cfg.judge.n_judge_reps} reps...")
 
     sem = asyncio.Semaphore(cfg.judge.n_judge_workers)
-    rendered = {r["run_name"]: render_trajectory(r["run_dir"], cfg.judge.max_input_chars) for r in judgeable}
-
+    tally = {"yes": 0, "n": 0}
     async with httpx.AsyncClient(timeout=cfg.judge.request_timeout) as client:
-        tasks = [
-            _judge_one(client, cfg, api_key, rubrics, row, rendered[row["run_name"]], mode, k, sem)
-            for row in judgeable
-            for mode in cfg.judge.modes
-            for k in range(1, cfg.judge.n_judge_reps + 1)
-        ]
-        recs = await asyncio.gather(*tasks)
-
-    # Rebuild the aggregate jsonl from all per-file judgements (consistent + resumable).
-    cfg.judgements_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    with open(cfg.judgements_jsonl, "w") as f:
-        for rec in recs:
-            f.write(json.dumps(rec) + "\n")
-    ok = sum(1 for r in recs if r["ok"])
-    print(f"\nPhase 2 complete: {ok}/{len(recs)} judgements ok. -> {cfg.judgements_jsonl}")
-
-    # Aggregate binary verdicts+locations into judge event rows for the hazard analysis.
-    _build_judge_events(cfg, judgeable, recs)
-    return recs
+        await asyncio.gather(*(judge_run(client, cfg, api_key, rubrics, row, sem, tally=tally)
+                               for row in judgeable))
+    return assemble_judge_outputs(cfg, judgeable)

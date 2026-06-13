@@ -112,17 +112,28 @@ def score_all(cfg: SweepConfig) -> list[dict]:
         return []
     manifest = json.loads(cfg.manifest_path.read_text())
     runs = [r for r in manifest if r.get("status") == "ok"]
-    print(f"scoring {len(runs)} trajectories serially: {cfg.final_score.command!r}")
+    workers = cfg.final_score.score_workers
 
-    rows: list[dict] = []
-    for r in runs:
+    def _score_and_record(r: dict) -> dict:
         result = score_run(Path(r["run_dir"]), cfg.final_score)
         row = {"run_name": r["run_name"], "budget_usd": r.get("budget_usd"),
                "rep": r.get("rep"), **result}
         (Path(r["run_dir"]) / "final_score.json").write_text(json.dumps(row, indent=1))
-        rows.append(row)
         score_txt = f"{row['score']:g}" if row["score"] is not None else "-"
         print(f"  {row['run_name']}: {row['status']}  score={score_txt}")
+        return row
+
+    if workers > 1:
+        # Parallel is safe ONLY for deterministic scores; timing benchmarks must stay
+        # serial (score_workers=1) or their measurements contend. Each score_run uses
+        # its own temp worktree + subprocess, so threads are safe here.
+        from concurrent.futures import ThreadPoolExecutor
+        print(f"scoring {len(runs)} trajectories with {workers} workers: {cfg.final_score.command!r}")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            rows = list(ex.map(_score_and_record, runs))
+    else:
+        print(f"scoring {len(runs)} trajectories serially: {cfg.final_score.command!r}")
+        rows = [_score_and_record(r) for r in runs]
 
     cfg.final_scores_jsonl.write_text("".join(json.dumps(r) + "\n" for r in rows))
     n_ok = sum(1 for r in rows if r["status"] == "ok")

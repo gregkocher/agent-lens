@@ -145,20 +145,48 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, budget, rep: int, 
 
 
 async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
+    """Roll out every (budget, rep) trajectory AND judge each one as it completes.
+
+    Rollout (Anthropic) and judging (OpenRouter) use separate semaphores and APIs, so
+    trajectory B rolls out while trajectory A is judged — no rate-limit contention.
+    Judge failures are non-fatal (retried inline by _call_openrouter, then skipped); the
+    Option-A backfill judge step in --phase all fills any gaps. Judge outputs are
+    assembled from the per-run files after the gather."""
+    import httpx
+    from pipeline.judge import (assemble_judge_outputs, judge_run, judgeable_runs,
+                                load_judge_api_key, _load_rubrics)
+
     cfg.trajectories_dir.mkdir(parents=True, exist_ok=True)
     base_cfg = load_config(cfg.base_task_config)
     base_sig = dir_signature(cfg.base_work_dir)  # computed once; captures repo edits
 
-    sem = asyncio.Semaphore(cfg.n_trajectory_workers)
-    tasks = [
-        _run_one(cfg, base_cfg, base_sig, budget, rep, sem)
-        for budget in cfg.budgets_usd
-        for rep in range(1, cfg.n_reps + 1)
-    ]
-    rows = await asyncio.gather(*tasks)
+    api_key = load_judge_api_key(cfg)            # fail-fast before any rollout
+    rubrics = _load_rubrics(cfg.judge.rubric_file)
+    sem = asyncio.Semaphore(cfg.n_trajectory_workers)       # Anthropic rollouts
+    judge_sem = asyncio.Semaphore(cfg.judge.n_judge_workers)  # OpenRouter judging
+    tally = {"yes": 0, "n": 0}
+
+    async with httpx.AsyncClient(timeout=cfg.judge.request_timeout) as client:
+        async def _run_and_judge(budget, rep) -> dict:
+            row = await _run_one(cfg, base_cfg, base_sig, budget, rep, sem)
+            if row.get("status") == "ok":
+                try:
+                    await judge_run(client, cfg, api_key, rubrics, row, judge_sem, tally=tally)
+                except Exception as e:  # judging must never sink a completed rollout
+                    print(f"[judge SKIP] {row['run_name']}: {e!r} (backfilled by --phase judge)")
+            return row
+
+        rows = await asyncio.gather(*(
+            _run_and_judge(budget, rep)
+            for budget in cfg.budgets_usd
+            for rep in range(1, cfg.n_reps + 1)
+        ))
 
     cfg.manifest_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.manifest_path.write_text(json.dumps(rows, indent=2))
     ok = sum(1 for r in rows if r["status"] == "ok")
     print(f"\nPhase 1 complete: {ok}/{len(rows)} trajectories ok. Manifest: {cfg.manifest_path}")
+
+    # Assemble judgements.jsonl + judge_events.jsonl from the per-run files judged inline.
+    assemble_judge_outputs(cfg, [r for r in rows if r.get("status") == "ok"])
     return rows
