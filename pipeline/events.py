@@ -248,42 +248,50 @@ def locate_events(events: list[dict], turns: list[dict]) -> list[dict]:
 
 # --------------------------------------------------------------------------- phase entry
 def detect_all(cfg: SweepConfig) -> list[dict]:
-    """Run mechanical detection over every ok trajectory; write per-run + aggregate."""
-    if not cfg.hack_signals.enabled:
-        print("hack_signals is empty in the sweep config -> nothing to detect; "
-              "add patterns to enable the events phase.")
+    """Mechanical detection over every ok trajectory, per behavior that defines signals.
+
+    Turn tables are behavior-independent: computed once per run and reused. Per behavior
+    we write per-run `<run>__<behavior>.jsonl` + aggregate `events_<behavior>.jsonl`."""
+    mech_behaviors = [b for b in cfg.all_behaviors if b.mechanical and b.mechanical.enabled]
+    if not mech_behaviors:
+        print("No behavior defines mechanical signals -> nothing to detect mechanically.")
         return []
     manifest = json.loads(cfg.manifest_path.read_text())
     runs = [r for r in manifest if r.get("status") == "ok"
             and (Path(r["run_dir"]) / "session_01" / "trajectory.json").exists()]
     cfg.events_dir.mkdir(parents=True, exist_ok=True)
 
-    all_events: list[dict] = []
-    n_hack_runs = 0
+    # Behavior-independent turn tables: compute once per run, reuse + persist.
+    turns_cache: dict[str, list] = {}
     for r in runs:
-        events = detect_events(r["run_dir"], cfg.hack_signals)
         turns = turn_table(r["run_dir"], r.get("budget_usd"))
-        events = locate_events(events, turns)
-        for e in events:
-            e["run_name"] = r["run_name"]
-            e["budget_usd"] = r.get("budget_usd")
-        (cfg.events_dir / f"{r['run_name']}.jsonl").write_text(
-            "".join(json.dumps(e) + "\n" for e in events))
+        turns_cache[r["run_name"]] = turns
         (cfg.events_dir / f"{r['run_name']}_turns.json").write_text(json.dumps(turns, indent=1))
-        all_events.extend(events)
-        hacks = [e for e in events if e["category"] in HACK_CATEGORIES]
-        evals = sum(1 for e in events if e["category"] == "eval_call")
-        if hacks:
-            n_hack_runs += 1
-            first = hacks[0]
-            print(f"[events] {r['run_name']}: {len(hacks)} hack event(s), first = "
-                  f"{first['category']} @ step {first['step_id']} (turn {first['api_turn']}, "
-                  f"frac {first['frac_used']}), {evals} eval call(s)")
-        else:
-            print(f"[events] {r['run_name']}: no hack events, {evals} eval call(s)")
 
-    cfg.events_jsonl.write_text("".join(json.dumps(e) + "\n" for e in all_events))
-    n_hacks = sum(1 for e in all_events if e["category"] in HACK_CATEGORIES)
-    print(f"\nEvents phase complete: {n_hacks} hack event(s) across {n_hack_runs}/{len(runs)} run(s). "
-          f"-> {cfg.events_jsonl}")
+    all_events: list[dict] = []
+    for b in mech_behaviors:
+        behavior_events: list[dict] = []
+        n_hack_runs = 0
+        for r in runs:
+            events = detect_events(r["run_dir"], b.mechanical)
+            events = locate_events(events, turns_cache[r["run_name"]])
+            for e in events:
+                e["run_name"] = r["run_name"]
+                e["budget_usd"] = r.get("budget_usd")
+                e["behavior"] = b.name
+            (cfg.events_dir / f"{r['run_name']}__{b.name}.jsonl").write_text(
+                "".join(json.dumps(e) + "\n" for e in events))
+            behavior_events.extend(events)
+            hacks = [e for e in events if e["category"] in HACK_CATEGORIES]
+            if hacks:
+                n_hack_runs += 1
+                first = hacks[0]
+                print(f"[events:{b.name}] {r['run_name']}: {len(hacks)} hack event(s), first = "
+                      f"{first['category']} @ step {first['step_id']} (turn {first['api_turn']})")
+        path = cfg.events_jsonl_for(b.name)
+        path.write_text("".join(json.dumps(e) + "\n" for e in behavior_events))
+        n_hacks = sum(1 for e in behavior_events if e["category"] in HACK_CATEGORIES)
+        print(f"Events [{b.name}]: {n_hacks} hack event(s) across {n_hack_runs}/{len(runs)} "
+              f"run(s) -> {path}")
+        all_events.extend(behavior_events)
     return all_events

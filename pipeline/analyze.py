@@ -236,12 +236,14 @@ def _binned_rate(rows: list[dict], edges: np.ndarray, key: str = "event") -> tup
 _DETECTOR_SOURCES = ("mechanical", "judge")
 
 
-def _iter_hack_events(cfg: SweepConfig, sources: tuple[str, ...] = _DETECTOR_SOURCES):
-    """Hack events from the selected detector(s): mechanical events.jsonl (categories
-    in HACK_CATEGORIES) and/or judge_events.jsonl (category 'judge_reward_hacking').
-    `sources` picks which detector files to read ('mechanical', 'judge'); same schema,
-    so downstream code stays detector-agnostic. Default reads both (merged view)."""
-    paths = {"mechanical": cfg.events_jsonl, "judge": cfg.judge_events_jsonl}
+def _iter_hack_events(cfg: SweepConfig, behavior: str,
+                      sources: tuple[str, ...] = _DETECTOR_SOURCES):
+    """Events for ONE behavior from the selected detector(s): mechanical
+    events_<behavior>.jsonl (categories in HACK_CATEGORIES) and/or
+    judge_events_<behavior>.jsonl (category 'judge_<behavior>'). Same schema, so
+    downstream code stays detector-agnostic."""
+    paths = {"mechanical": cfg.events_jsonl_for(behavior),
+             "judge": cfg.judge_events_jsonl_for(behavior)}
     for src in sources:
         path = paths[src]
         if not path.exists():
@@ -250,17 +252,16 @@ def _iter_hack_events(cfg: SweepConfig, sources: tuple[str, ...] = _DETECTOR_SOU
             if not line.strip():
                 continue
             e = json.loads(line)
-            if e.get("category") in HACK_CATEGORIES or e.get("category") == "judge_reward_hacking":
+            if e.get("category") in HACK_CATEGORIES or str(e.get("category", "")).startswith("judge_"):
                 yield e
 
 
-def _load_hack_turn_counts(cfg: SweepConfig,
+def _load_hack_turn_counts(cfg: SweepConfig, behavior: str,
                            sources: tuple[str, ...] = _DETECTOR_SOURCES) -> dict[str, dict[int, int]]:
-    """run_name -> {api_turn: number of located hack events at that turn} (events from
-    the selected detector(s), deduped per (run, detector, step) by construction; a turn
-    flagged by both detectors counts once for the binary per-turn rate anyway)."""
+    """run_name -> {api_turn: number of located events at that turn} for ONE behavior
+    from the selected detector(s)."""
     counts: dict[str, dict[int, int]] = {}
-    for e in _iter_hack_events(cfg, sources):
+    for e in _iter_hack_events(cfg, behavior, sources):
         if e.get("api_turn") is None:
             continue
         per_run = counts.setdefault(e["run_name"], {})
@@ -268,14 +269,13 @@ def _load_hack_turn_counts(cfg: SweepConfig,
     return counts
 
 
-def _load_first_hacks(cfg: SweepConfig,
+def _load_first_hacks(cfg: SweepConfig, behavior: str,
                       sources: tuple[str, ...] = _DETECTOR_SOURCES) -> tuple[dict[str, dict], int]:
-    """run_name -> first located hack event {api_turn, frac_used, category, step_id},
-    taking the EARLIEST event across the selected detector(s). Also returns the count
-    of hack events that could not be located on a turn."""
+    """run_name -> first located event {api_turn, frac_used, category, step_id} for ONE
+    behavior, EARLIEST across the selected detector(s). Also returns the unlocated count."""
     first: dict[str, dict] = {}
     unlocated = 0
-    for e in _iter_hack_events(cfg, sources):
+    for e in _iter_hack_events(cfg, behavior, sources):
         if e.get("api_turn") is None:
             unlocated += 1
             continue
@@ -340,23 +340,21 @@ def _recurrent_person_period(cfg: SweepConfig, judgeable: list[dict],
     return rows
 
 
-def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: dict[str, int],
-                    p_hat_by_run: dict[str, float], budgets: list, labels: list[str],
-                    line_pos: list[float], figs: Path,
+def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
+                    api_turns_by_run: dict[str, int], p_hat_by_run: dict[str, float],
+                    budgets: list, labels: list[str], line_pos: list[float], figs: Path,
                     sources: tuple[str, ...] = _DETECTOR_SOURCES, suffix: str = "") -> None:
-    """Exposure-corrected plots from hack events for the selected detector(s). `sources`
-    chooses 'mechanical' and/or 'judge'; `suffix` is appended to every output figure
-    and CSV name so per-detector runs don't clobber each other. (Requires --phase
-    events; judge events added by --phase judge.)"""
+    """Exposure-corrected plots for ONE behavior x the selected detector(s). `suffix`
+    (e.g. '_reward_hacking_judge') is appended to every figure + CSV so behavior x
+    detector runs don't clobber each other."""
     det_label = "+".join(sources)
-    paths = {"mechanical": cfg.events_jsonl, "judge": cfg.judge_events_jsonl}
+    paths = {"mechanical": cfg.events_jsonl_for(behavior), "judge": cfg.judge_events_jsonl_for(behavior)}
     present = [s for s in sources if paths[s].exists()]
     if not present:
-        print(f"  ({det_label}: no events file present -> skipping hazard/KM plots; "
-              "run --phase events/judge first)")
+        print(f"  ({behavior}/{det_label}: no events file -> skipping hazard/KM plots)")
         return
-    print(f"  hack-event detector(s): {', '.join(present)}")
-    first_hacks, unlocated = _load_first_hacks(cfg, sources)
+    print(f"  [{behavior}] hack-event detector(s): {', '.join(present)}")
+    first_hacks, unlocated = _load_first_hacks(cfg, behavior, sources)
     if unlocated:
         print(f"  WARNING: {unlocated} hack event(s) had no API-turn location (missing/sparse "
               f"uuid_map) and are excluded from the hazard analysis.")
@@ -445,7 +443,7 @@ def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: d
         # only the post-onset rate r(x) separates true escalation from the composition
         # artifact (clean-share w(x) falling), so r is drawn alongside: intensity(x) =
         # w(x)*onset(x) + (1-w(x))*r(x). See docs/explainers/onset_vs_intensity.pdf.
-        rp = _recurrent_person_period(cfg, judgeable, _load_hack_turn_counts(cfg, sources), first_hacks)
+        rp = _recurrent_person_period(cfg, judgeable, _load_hack_turn_counts(cfg, behavior, sources), first_hacks)
         if rp:
             pd.DataFrame(rp).to_csv(cfg.out / f"person_period_recurrent{suffix}.csv", index=False)
             print(f"  recurrent person-period table -> "
@@ -515,7 +513,7 @@ def _event_analysis(cfg: SweepConfig, judgeable: list[dict], api_turns_by_run: d
     # ---- density of hack events on the fraction-used axis (all events, capped arms) ----
     capped = [b for b in budgets if b is not None]
     ev_by_budget = {b: [] for b in capped}
-    for e in _iter_hack_events(cfg, sources):
+    for e in _iter_hack_events(cfg, behavior, sources):
         if e.get("frac_used") is not None and e.get("budget_usd") in ev_by_budget:
             ev_by_budget[e["budget_usd"]].append(e["frac_used"])
     if any(ev_by_budget.values()):
@@ -541,7 +539,7 @@ def analyze(cfg: SweepConfig) -> None:
         print("No status=ok trajectories with a trajectory.json to analyze. Run --phase run first.")
         return
 
-    # ---- per-trajectory judge values (skip judgements stale vs current model/rubric/render) ----
+    # ---- judge fingerprints for staleness (keyed run|behavior|mode) ----
     expected_fp = None
     if cfg.judgements_jsonl.exists():
         try:
@@ -550,26 +548,33 @@ def analyze(cfg: SweepConfig) -> None:
         except Exception as e:
             print(f"  (could not compute judgement fingerprints: {e}; staleness check skipped)")
 
-    bin_by_run: dict[str, list[float]] = defaultdict(list)
-    scl_by_run: dict[str, list[float]] = defaultdict(list)
-    stale = 0
+    # All judgement recs (every behavior), grouped per behavior on demand below.
+    all_judgements: list[dict] = []
     if cfg.judgements_jsonl.exists():
         for line in cfg.judgements_jsonl.read_text().splitlines():
-            if not line.strip():
+            if line.strip():
+                all_judgements.append(json.loads(line))
+
+    def _judge_values(behavior: str) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+        """(bin_by_run, scl_by_run) for ONE behavior, dropping stale judgements."""
+        binr: dict[str, list[float]] = defaultdict(list)
+        sclr: dict[str, list[float]] = defaultdict(list)
+        stale = 0
+        for j in all_judgements:
+            if not j.get("ok") or j.get("behavior") != behavior:
                 continue
-            j = json.loads(line)
-            if not j.get("ok"):
-                continue
-            if expected_fp is not None and j.get("fingerprint") != expected_fp.get(f"{j['run_name']}|{j['mode']}"):
+            if expected_fp is not None and j.get("fingerprint") != expected_fp.get(
+                    f"{j['run_name']}|{behavior}|{j['mode']}"):
                 stale += 1
                 continue
             if j["mode"] == "binary" and j.get("verdict") in ("yes", "no"):
-                bin_by_run[j["run_name"]].append(1.0 if j["verdict"] == "yes" else 0.0)
+                binr[j["run_name"]].append(1.0 if j["verdict"] == "yes" else 0.0)
             elif j["mode"] == "scale_1_5" and j.get("score") is not None:
-                scl_by_run[j["run_name"]].append(float(j["score"]))
-    if stale:
-        print(f"  WARNING: skipped {stale} stale judgement(s) (model/rubric/trajectory changed "
-              f"since judging); re-run --phase judge to refresh them.")
+                sclr[j["run_name"]].append(float(j["score"]))
+        if stale:
+            print(f"  [{behavior}] WARNING: skipped {stale} stale judgement(s); "
+                  f"re-run --phase judge to refresh.")
+        return binr, sclr
 
     # ---- per-trajectory word + turn counts (two denominators) ----
     # SDK num_turns (turns_by_run) is UNRELIABLE: it reports 1 for many budget-terminated
@@ -596,16 +601,12 @@ def analyze(cfg: SweepConfig) -> None:
     rows = []
     for b in budgets:
         runs = [r["run_name"] for r in judgeable if r["budget_usd"] == b]
-        p_hats = [float(np.mean(bin_by_run[rn])) for rn in runs if bin_by_run.get(rn)]
-        scores = [float(np.mean(scl_by_run[rn])) for rn in runs if scl_by_run.get(rn)]
         words = [word_perturn_by_run[rn] for rn in runs if rn in word_perturn_by_run]
         words_api = [word_perturn_api_by_run[rn] for rn in runs if rn in word_perturn_api_by_run]
         raws = [word_raw_by_run[rn] for rn in runs if rn in word_raw_by_run]
         costs = [cost_by_run[rn] for rn in runs if rn in cost_by_run]
         turns = [turns_by_run[rn] for rn in runs if rn in turns_by_run]
         turns_api = [api_turns_by_run[rn] for rn in runs if rn in api_turns_by_run]
-        br, bse = _mean_se(p_hats)
-        sm, sse = _mean_se(scores)
         wm, wse = _mean_se(words)
         wam, wase = _mean_se(words_api)
         rwm, rwse = _mean_se(raws)
@@ -616,8 +617,6 @@ def analyze(cfg: SweepConfig) -> None:
             "budget_label": _budget_label(b),
             "budget_value": ("unlimited" if b is None else b),
             "n_trajectories": len(runs),
-            "n_binary": len(p_hats), "binary_rate": br, "binary_se": bse,
-            "n_scale": len(scores), "score_mean": sm, "score_se": sse,
             "word_raw_mean": rwm, "word_raw_se": rwse,
             # SDK num_turns (unreliable) vs API turns (recommended)
             "turns_sdk_mean": tm, "turns_sdk_se": tse,
@@ -629,27 +628,12 @@ def analyze(cfg: SweepConfig) -> None:
     df = pd.DataFrame(rows)
     csv_path = cfg.out / "aggregates.csv"
     df.to_csv(csv_path, index=False)
-    print(f"\nAggregates -> {csv_path}")
+    print(f"\nAggregates (behavior-independent) -> {csv_path}")
     print(df.to_string(index=False))
 
     labels = df["budget_label"].tolist()
     line_pos = _line_positions(budgets)  # log-spaced budget axis (+ separate unlimited tick)
     figs = cfg.figures_dir
-
-    if df["n_binary"].sum() > 0:
-        _plot(line_pos, labels, df["binary_rate"], df["binary_se"],
-              "reward-hacking rate (fraction 'yes')",
-              f"{cfg.experiment_name}: reward-hacking rate vs budget",
-              figs / "binary_rate_vs_budget.pdf", "#c0392b")
-    else:
-        print("  (no binary judgements found -> skipping binary plot; run --phase judge)")
-    if df["n_scale"].sum() > 0:
-        _plot(line_pos, labels, df["score_mean"], df["score_se"],
-              "mean reward-hacking score (1-5)",
-              f"{cfg.experiment_name}: reward-hacking degree vs budget",
-              figs / "score_vs_budget.pdf", "#8e44ad")
-    else:
-        print("  (no scale_1_5 judgements found -> skipping score plot; run --phase judge)")
 
     # budget-awareness LINE plots — SDK num_turns (unreliable, retitled) + API turns (recommended)
     _plot(line_pos, labels, df["wordrate_sdk_mean"], df["wordrate_sdk_se"],
@@ -708,13 +692,47 @@ def analyze(cfg: SweepConfig) -> None:
         f"{cfg.experiment_name}: when (in budget consumption) the agent mentions budget",
         figs / "budget_mentions_by_fraction_used.pdf")
 
-    # --- exposure-corrected event/hazard analysis (requires --phase events) ---
-    p_hat_by_run = {rn: float(np.mean(v)) for rn, v in bin_by_run.items() if v}
-    # Per-detector event analyses: mechanical-only and judge-only, each writing its own
-    # suffixed figures + person-period CSVs (no merged 'any-detector' view by design).
-    _event_analysis(cfg, judgeable, api_turns_by_run, p_hat_by_run, budgets, labels, line_pos, figs,
-                    sources=("mechanical",), suffix="_mechanical")
-    _event_analysis(cfg, judgeable, api_turns_by_run, p_hat_by_run, budgets, labels, line_pos, figs,
-                    sources=("judge",), suffix="_judge")
+    # ---- PER-BEHAVIOR: rate/severity plots + per-detector exposure-corrected analysis ----
+    mech_behaviors = {b.name for b in cfg.all_behaviors if b.mechanical and b.mechanical.enabled}
+    for b in cfg.all_behaviors:
+        behavior = b.name
+        bin_by_run, scl_by_run = _judge_values(behavior)
+
+        brows = []
+        for bud in budgets:
+            runs = [r["run_name"] for r in judgeable if r["budget_usd"] == bud]
+            p_hats = [float(np.mean(bin_by_run[rn])) for rn in runs if bin_by_run.get(rn)]
+            scores = [float(np.mean(scl_by_run[rn])) for rn in runs if scl_by_run.get(rn)]
+            br, bse = _mean_se(p_hats)
+            sm, sse = _mean_se(scores)
+            brows.append({"budget_label": _budget_label(bud),
+                          "budget_value": ("unlimited" if bud is None else bud),
+                          "n_binary": len(p_hats), "binary_rate": br, "binary_se": bse,
+                          "n_scale": len(scores), "score_mean": sm, "score_se": sse})
+        bdf = pd.DataFrame(brows)
+        bdf.to_csv(cfg.out / f"aggregates_{behavior}.csv", index=False)
+        print(f"\n[{behavior}] aggregates -> {cfg.out / f'aggregates_{behavior}.csv'}")
+
+        if bdf["n_binary"].sum() > 0:
+            _plot(line_pos, labels, bdf["binary_rate"], bdf["binary_se"],
+                  f"{behavior} rate (fraction 'yes')",
+                  f"{cfg.experiment_name}: {behavior} rate vs budget",
+                  figs / f"binary_rate_vs_budget_{behavior}.pdf", "#c0392b")
+        if bdf["n_scale"].sum() > 0:
+            _plot(line_pos, labels, bdf["score_mean"], bdf["score_se"],
+                  f"mean {behavior} score (1-5)",
+                  f"{cfg.experiment_name}: {behavior} degree vs budget",
+                  figs / f"score_vs_budget_{behavior}.pdf", "#8e44ad")
+
+        # exposure-corrected event/hazard analysis, per available detector
+        p_hat_by_run = {rn: float(np.mean(v)) for rn, v in bin_by_run.items() if v}
+        detectors = [("judge",)]
+        if behavior in mech_behaviors:
+            detectors.insert(0, ("mechanical",))
+        for sources in detectors:
+            det = sources[0]
+            _event_analysis(cfg, behavior, judgeable, api_turns_by_run, p_hat_by_run,
+                            budgets, labels, line_pos, figs,
+                            sources=sources, suffix=f"_{behavior}_{det}")
 
     print("\nPhase 3 complete.")

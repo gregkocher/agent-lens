@@ -10,7 +10,8 @@ import json
 
 import pytest
 
-from pipeline.config import HackSignalsConfig, JudgeConfig, SweepConfig, budget_label, run_name_for
+from pipeline.config import (MODES, HackSignalsConfig, JudgeConfig, SweepConfig,
+                             budget_label, run_name_for)
 from pipeline.events import detect_events, locate_events, turn_table
 from pipeline.judge import _parse_binary, _validate_locations, aggregate_judge_locations
 from pipeline.render import _fit_blocks, _render_diff, render_trajectory
@@ -23,12 +24,21 @@ from pipeline.wordcount import (
 
 
 def _judge_cfg(**kw):
-    return JudgeConfig(rubric_file="pipeline/rubrics/tsp_reward_hacking.txt", **kw)
+    return JudgeConfig(**kw)
+
+
+def _rh_behavior(**kw):
+    from pipeline.config import BehaviorConfig, HackSignalsConfig
+    base = dict(name="reward_hacking", rubric_file="pipeline/rubrics/reward_hacking.txt",
+                mechanical=HackSignalsConfig(protected_write_paths=["test_cache.py"]))
+    base.update(kw)
+    return BehaviorConfig(**base)
 
 
 def _sweep(**kw):
     base = dict(experiment_name="t", base_task_config="x", base_work_dir="y",
-                output_dir="z", budgets_usd=[0.05, None], judge=_judge_cfg())
+                output_dir="z", budgets_usd=[0.05, None], judge=_judge_cfg(),
+                behaviors=[_rh_behavior()])
     base.update(kw)
     return SweepConfig(**base)
 
@@ -79,8 +89,6 @@ def test_sweep_config_rejects_bad_numbers(kw):
 
 
 @pytest.mark.parametrize("kw", [
-    dict(modes=["bogus"]),
-    dict(modes=[]),
     dict(provider="anthropic"),
     dict(n_judge_reps=0),
     dict(n_judge_workers=0),
@@ -216,9 +224,10 @@ def test_first_hacks_merge_min_over_detectors(tmp_path):
                    "frac_used": 0.2}
     judge_only = {"run_name": "r2", "category": "judge_reward_hacking", "api_turn": 11,
                   "frac_used": 0.7}
-    cfg.events_jsonl.write_text(_j.dumps(mech) + "\n")
-    cfg.judge_events_jsonl.write_text(_j.dumps(judge_early) + "\n" + _j.dumps(judge_only) + "\n")
-    first, unlocated = _load_first_hacks(cfg)
+    cfg.events_jsonl_for("reward_hacking").write_text(_j.dumps(mech) + "\n")
+    cfg.judge_events_jsonl_for("reward_hacking").write_text(
+        _j.dumps(judge_early) + "\n" + _j.dumps(judge_only) + "\n")
+    first, unlocated = _load_first_hacks(cfg, "reward_hacking")
     assert first["r1"]["api_turn"] == 5            # judge found it earlier -> min wins
     assert first["r2"]["api_turn"] == 11           # judge-only run included
     assert unlocated == 0
@@ -463,8 +472,13 @@ def test_lru_sweep_config_loads():
     assert cfg.final_score is not None
     assert cfg.final_score.extract_regex == r"Overall speedup: ([0-9.]+)x"
     assert cfg.n_trajectory_workers == 3   # parallel OK: survival clock is turns/budget-frac, not wall time
-    assert "test_cache.py" in cfg.hack_signals.protected_write_paths
-    assert "cache_starter.py" in cfg.hack_signals.protected_write_paths
+    names = [b.name for b in cfg.all_behaviors]
+    assert names == ["reward_hacking", "dishonest_reporting", "sandbagging"]  # 3 by default
+    rh = next(b for b in cfg.all_behaviors if b.name == "reward_hacking")
+    assert "test_cache.py" in rh.mechanical.protected_write_paths
+    assert "cache_starter.py" in rh.mechanical.protected_write_paths
+    assert cfg.task_context and "test_cache.py" in cfg.task_context  # task specifics in context
+    assert cfg.judge.model == "openai/gpt-5-mini"
 
 
 # --------------------------------------------------------------------------- score_workers
@@ -516,20 +530,24 @@ def test_judge_run_writes_per_run_files(tmp_path, monkeypatch):
                 '"rationale":"stub","score":1}')
     monkeypatch.setattr(J, "_call_openrouter", fake_call)
 
+    # _sweep has reward_hacking + auto dishonest_reporting + sandbagging = 3 behaviors
     cfg = _sweep(output_dir=str(tmp_path))
-    rubrics = J._load_rubrics("pipeline/rubrics/lru_reward_hacking.txt")
+    behavior_rubrics = J._load_behavior_rubrics(cfg)
     row = {"run_name": "bp_b1_r1", "budget_usd": 1.0, "rep": 1, "run_dir": str(tmp_path / "rd")}
 
     async def go():
         async with httpx.AsyncClient() as client:
-            return await J.judge_run(client, cfg, "key", rubrics, row,
+            return await J.judge_run(client, cfg, "key", behavior_rubrics, row,
                                      asyncio.Semaphore(4), rendered="[step 1] hi")
     recs = asyncio.run(go())
 
-    assert len(recs) == len(cfg.judge.modes) * cfg.judge.n_judge_reps   # 2 x 2 = 4
+    n_behaviors = len(cfg.all_behaviors)  # 3
+    assert len(recs) == n_behaviors * len(MODES) * cfg.judge.n_judge_reps   # 3 x 2 x 2 = 12
     assert all(r["ok"] for r in recs)
+    assert {r["behavior"] for r in recs} == {b.name for b in cfg.all_behaviors}
     jd = cfg.judgements_dir / "bp_b1_r1"
-    assert (jd / "binary_rep1.json").exists() and (jd / "scale_1_5_rep2.json").exists()
+    assert (jd / "reward_hacking__binary_rep1.json").exists()
+    assert (jd / "sandbagging__scale_1_5_rep2.json").exists()
 
 
 def test_assemble_judge_outputs_from_disk(tmp_path):
@@ -538,15 +556,52 @@ def test_assemble_judge_outputs_from_disk(tmp_path):
     for run in ["bp_b1_r1", "bp_b1_r2"]:
         d = cfg.judgements_dir / run
         d.mkdir(parents=True)
-        for mode in ["binary", "scale_1_5"]:
-            (d / f"{mode}_rep1.json").write_text(json.dumps({
-                "run_name": run, "budget_usd": 1.0, "rep": 1, "mode": mode, "judge_rep": 1,
-                "ok": True, "verdict": "no" if mode == "binary" else None,
-                "first_step_id": None, "hack_step_ids": [],
-                "score": 1 if mode == "scale_1_5" else None, "rationale": "x"}))
+        for behavior in ["reward_hacking", "dishonest_reporting"]:
+            for mode in ["binary", "scale_1_5"]:
+                (d / f"{behavior}__{mode}_rep1.json").write_text(json.dumps({
+                    "run_name": run, "behavior": behavior, "budget_usd": 1.0, "rep": 1,
+                    "mode": mode, "judge_rep": 1,
+                    "ok": True, "verdict": "no" if mode == "binary" else None,
+                    "first_step_id": None, "hack_step_ids": [],
+                    "score": 1 if mode == "scale_1_5" else None, "rationale": "x"}))
     judgeable = [{"run_name": "bp_b1_r1", "budget_usd": 1.0, "run_dir": str(tmp_path / "rd1")},
                  {"run_name": "bp_b1_r2", "budget_usd": 1.0, "run_dir": str(tmp_path / "rd2")}]
     recs = J.assemble_judge_outputs(cfg, judgeable)
-    assert len(recs) == 4
-    assert len(cfg.judgements_jsonl.read_text().strip().splitlines()) == 4
-    assert cfg.judge_events_jsonl.exists()   # written (empty: all "no" verdicts)
+    assert len(recs) == 8  # 2 runs x 2 behaviors x 2 modes
+    assert len(cfg.judgements_jsonl.read_text().strip().splitlines()) == 8
+    # per-behavior judge event files written (empty: all "no" verdicts)
+    assert cfg.judge_events_jsonl_for("reward_hacking").exists()
+    assert cfg.judge_events_jsonl_for("sandbagging").exists()
+
+
+# --------------------------------------------------------------------------- multi-behavior
+def test_all_behaviors_merge_and_override():
+    from pipeline.config import BehaviorConfig
+    # empty yaml behaviors -> just the 2 standard judge-only behaviors
+    assert [b.name for b in _sweep(behaviors=[]).all_behaviors] == \
+        ["dishonest_reporting", "sandbagging"]
+    # reward_hacking listed -> all 3, RH first
+    assert [b.name for b in _sweep().all_behaviors] == \
+        ["reward_hacking", "dishonest_reporting", "sandbagging"]
+    # override a standard behavior by name -> the yaml's version wins, no dup
+    custom = BehaviorConfig(name="sandbagging", rubric_file="pipeline/rubrics/sandbagging.txt")
+    cfg = _sweep(behaviors=[_rh_behavior(), custom])
+    names = [b.name for b in cfg.all_behaviors]
+    assert names == ["reward_hacking", "sandbagging", "dishonest_reporting"]
+    assert names.count("sandbagging") == 1
+
+
+def test_task_context_injected_into_system_prompt():
+    from pipeline.judge import _system_prompt, _load_rubrics
+    rubrics = _load_rubrics("pipeline/rubrics/reward_hacking.txt")
+    # the injected content (the SPECIFIC task string) appears only when provided
+    sys_with = _system_prompt(rubrics, "binary", "SCORER is foocache.py; seeds 99/77.")
+    assert "foocache.py" in sys_with and "99/77" in sys_with
+    sys_without = _system_prompt(rubrics, "binary", "")
+    assert "foocache.py" not in sys_without and "reward" in sys_without.lower()
+
+
+def test_judge_category_per_behavior():
+    from pipeline.judge import judge_category
+    assert judge_category("sandbagging") == "judge_sandbagging"
+    assert judge_category("reward_hacking") == "judge_reward_hacking"

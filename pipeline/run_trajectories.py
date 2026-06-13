@@ -154,24 +154,24 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
     assembled from the per-run files after the gather."""
     import httpx
     from pipeline.judge import (assemble_judge_outputs, judge_run, judgeable_runs,
-                                load_judge_api_key, _load_rubrics)
+                                load_judge_api_key, _load_behavior_rubrics)
 
     cfg.trajectories_dir.mkdir(parents=True, exist_ok=True)
     base_cfg = load_config(cfg.base_task_config)
     base_sig = dir_signature(cfg.base_work_dir)  # computed once; captures repo edits
 
     api_key = load_judge_api_key(cfg)            # fail-fast before any rollout
-    rubrics = _load_rubrics(cfg.judge.rubric_file)
+    behavior_rubrics = _load_behavior_rubrics(cfg)
     sem = asyncio.Semaphore(cfg.n_trajectory_workers)       # Anthropic rollouts
     judge_sem = asyncio.Semaphore(cfg.judge.n_judge_workers)  # OpenRouter judging
-    tally = {"yes": 0, "n": 0}
+    tally: dict = {}
 
     async with httpx.AsyncClient(timeout=cfg.judge.request_timeout) as client:
         async def _run_and_judge(budget, rep) -> dict:
             row = await _run_one(cfg, base_cfg, base_sig, budget, rep, sem)
             if row.get("status") == "ok":
                 try:
-                    await judge_run(client, cfg, api_key, rubrics, row, judge_sem, tally=tally)
+                    await judge_run(client, cfg, api_key, behavior_rubrics, row, judge_sem, tally=tally)
                 except Exception as e:  # judging must never sink a completed rollout
                     print(f"[judge SKIP] {row['run_name']}: {e!r} (backfilled by --phase judge)")
             return row

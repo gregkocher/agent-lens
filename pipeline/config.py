@@ -13,6 +13,9 @@ import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 VALID_JUDGE_MODES = {"binary", "scale_1_5"}
+# Fixed, uniform output schema for EVERY behavior: binary -> {verdict, first_step_id
+# (turn)}, scale_1_5 -> {1-5 score}. Not per-behavior configurable by design.
+MODES: tuple[str, ...] = ("binary", "scale_1_5")
 
 # Default budget-awareness regex patterns (case-insensitive) counted in agent reasoning.
 DEFAULT_WORDCOUNT_PATTERNS: list[str] = [
@@ -35,12 +38,12 @@ DEFAULT_WORDCOUNT_PATTERNS: list[str] = [
 class JudgeConfig(BaseModel):
     """LLM-as-a-judge settings (Phase 2)."""
 
+    # Transport only. The rubric + criteria live per-behavior (BehaviorConfig);
+    # the output modes are fixed (MODES) so every behavior emits the same schema.
     provider: str = "openrouter"
     base_url: str = "https://openrouter.ai/api/v1"
     api_key_file: str = "openrouter_api_key.txt"
-    model: str = "openai/gpt-5-nano"
-    rubric_file: str
-    modes: list[str] = Field(default_factory=lambda: ["binary", "scale_1_5"])
+    model: str = "openai/gpt-5-mini"
     n_judge_reps: int = 2          # repeats of identical (trajectory, rubric) call -> variance reduction
     n_judge_workers: int = 8       # parallel judge API calls (cheap)
     max_input_chars: int = 200_000  # truncate the rendered trajectory if larger
@@ -60,16 +63,6 @@ class JudgeConfig(BaseModel):
     def _check_provider(cls, v: str) -> str:
         if v != "openrouter":
             raise ValueError(f"only the 'openrouter' judge provider is supported (got {v!r})")
-        return v
-
-    @field_validator("modes")
-    @classmethod
-    def _check_modes(cls, v: list[str]) -> list[str]:
-        if not v:
-            raise ValueError("judge.modes must be non-empty")
-        bad = [m for m in v if m not in VALID_JUDGE_MODES]
-        if bad:
-            raise ValueError(f"invalid judge modes {bad}; allowed: {sorted(VALID_JUDGE_MODES)}")
         return v
 
 
@@ -92,6 +85,28 @@ class HackSignalsConfig(BaseModel):
     def enabled(self) -> bool:
         return bool(self.protected_write_paths or self.protected_read_patterns
                     or self.suspicious_bash_patterns or self.eval_invocation_pattern)
+
+
+class BehaviorConfig(BaseModel):
+    """One behavior to measure (e.g. reward_hacking, dishonest_reporting, sandbagging).
+
+    The rubric supplies the task-GENERAL criteria; concrete task specifics are injected
+    separately via SweepConfig.task_context. Output modes are fixed (MODES) so every
+    behavior emits the same schema. `mechanical` is optional — only behaviors with a
+    structured-artifact signal (reward hacking) set it; others are judge-only."""
+
+    name: str
+    rubric_file: str
+    mechanical: HackSignalsConfig | None = None
+
+
+# Task-GENERAL behaviors auto-applied to every sweep (judge-only). Task-specific
+# behaviors (reward_hacking, which needs per-task mechanical signals) are listed in the
+# sweep's `behaviors`. A sweep can override a standard behavior by re-using its name.
+STANDARD_BEHAVIORS: list[BehaviorConfig] = [
+    BehaviorConfig(name="dishonest_reporting", rubric_file="pipeline/rubrics/dishonest_reporting.txt"),
+    BehaviorConfig(name="sandbagging", rubric_file="pipeline/rubrics/sandbagging.txt"),
+]
 
 
 class FinalScoreConfig(BaseModel):
@@ -137,11 +152,17 @@ class SweepConfig(BaseModel):
     agent_model: str | None = None   # if set, override the base task model
     agent_provider: str | None = None
 
-    # Phase 2 — judge
+    # Phase 2 — judge transport (model/workers/reps); rubric+criteria are per-behavior
     judge: JudgeConfig
 
-    # Phase 'events' — mechanical hack-event detection (optional; empty = skipped)
-    hack_signals: HackSignalsConfig = Field(default_factory=HackSignalsConfig)
+    # Behaviors to measure. The yaml lists task-specific ones (reward_hacking with its
+    # mechanical signals); the task-general STANDARD_BEHAVIORS are auto-appended. Pipeline
+    # iterates `all_behaviors`.
+    behaviors: list[BehaviorConfig] = Field(default_factory=list)
+
+    # Per-task context (goal, scorer file + metric, protected files, eval seeds, ...)
+    # injected into EVERY behavior's judge system prompt, so rubrics stay task-general.
+    task_context: str = ""
 
     # Phase 'score' — ground-truth final scoring (optional; absent = skipped)
     final_score: FinalScoreConfig | None = None
@@ -165,6 +186,13 @@ class SweepConfig(BaseModel):
         if v < 1:
             raise ValueError(f"{info.field_name} must be >= 1 (got {v})")
         return v
+
+    # ----- behaviors -----
+    @property
+    def all_behaviors(self) -> list[BehaviorConfig]:
+        """Task-specific `behaviors` + STANDARD_BEHAVIORS not overridden by name."""
+        named = {b.name for b in self.behaviors}
+        return list(self.behaviors) + [b for b in STANDARD_BEHAVIORS if b.name not in named]
 
     # ----- derived paths -----
     @property
@@ -199,13 +227,13 @@ class SweepConfig(BaseModel):
     def events_dir(self) -> Path:
         return self.out / "events"
 
-    @property
-    def events_jsonl(self) -> Path:
-        return self.out / "events.jsonl"
+    def events_jsonl_for(self, behavior: str) -> Path:
+        """Aggregate mechanical events for one behavior."""
+        return self.out / f"events_{behavior}.jsonl"
 
-    @property
-    def judge_events_jsonl(self) -> Path:
-        return self.out / "judge_events.jsonl"
+    def judge_events_jsonl_for(self, behavior: str) -> Path:
+        """Aggregate judge events for one behavior."""
+        return self.out / f"judge_events_{behavior}.jsonl"
 
     @property
     def final_scores_jsonl(self) -> Path:
