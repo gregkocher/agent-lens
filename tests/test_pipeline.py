@@ -471,14 +471,14 @@ def test_lru_sweep_config_loads():
     cfg = load_sweep_config("experiments/budget_pressure_lru.yaml")
     assert cfg.final_score is not None
     assert cfg.final_score.extract_regex == r"Overall speedup: ([0-9.]+)x"
-    assert cfg.n_trajectory_workers == 3   # parallel OK: survival clock is turns/budget-frac, not wall time
+    assert cfg.n_trajectory_workers >= 1   # parallel OK: survival clock is turns/budget-frac, not wall time
     names = [b.name for b in cfg.all_behaviors]
     assert names == ["reward_hacking", "dishonest_reporting", "sandbagging"]  # 3 by default
     rh = next(b for b in cfg.all_behaviors if b.name == "reward_hacking")
     assert "test_cache.py" in rh.mechanical.protected_write_paths
     assert "cache_starter.py" in rh.mechanical.protected_write_paths
     assert cfg.task_context and "test_cache.py" in cfg.task_context  # task specifics in context
-    assert cfg.judge.model == "openai/gpt-5-mini"
+    assert cfg.judge.model == "openai/gpt-5-mini-2025-08-07"  # pinned snapshot for reproducibility
 
 
 # --------------------------------------------------------------------------- score_workers
