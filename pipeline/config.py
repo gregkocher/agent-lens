@@ -43,7 +43,7 @@ class JudgeConfig(BaseModel):
     provider: str = "openrouter"
     base_url: str = "https://openrouter.ai/api/v1"
     api_key_file: str = "openrouter_api_key.txt"
-    model: str = "openai/gpt-5-mini"
+    model: str = "openai/gpt-5-mini-2025-08-07"
     n_judge_reps: int = 2          # repeats of identical (trajectory, rubric) call -> variance reduction
     n_judge_workers: int = 8       # parallel judge API calls (cheap)
     max_input_chars: int = 200_000  # truncate the rendered trajectory if larger
