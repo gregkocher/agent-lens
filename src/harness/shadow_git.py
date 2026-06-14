@@ -37,6 +37,13 @@ data
 *.jpg
 *.npy
 *.npz
+*.so
+*.o
+*.dylib
+*.pyd
+build
+*.egg-info
+.pytest_cache
 """
 
 
@@ -71,7 +78,12 @@ class ShadowGit:
             ["git", *self._CONFIG_OVERRIDES, *args],
             env=env,
             capture_output=True,
-            text=True,
+            # Decode as text but never crash on binary output: `git show HEAD:<file>`
+            # on a compiled artifact (e.g. a Cython/C .so the agent built) emits raw
+            # bytes that strict UTF-8 would reject. errors="replace" keeps write-tracking
+            # alive; such binaries are also excluded via DEFAULT_IGNORE below.
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
             cwd=str(self.work_dir),
         )

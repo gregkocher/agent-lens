@@ -273,3 +273,26 @@ class TestSessionLifecycle:
         diff = sg.get_session_diff(2, SessionMode.CHAINED)
         assert "b.txt" in diff
         assert "a.txt" not in diff
+
+
+class TestBinarySafety:
+    """Compiled artifacts (e.g. a Cython/C .so the agent builds) must not crash
+    write-tracking. Regression for `git show HEAD:<binary>` UnicodeDecodeError."""
+
+    def test_show_file_on_tracked_binary_does_not_crash(self, shadow_git, tmp_work_dir: Path):
+        # 0xcf at position 0 is exactly the byte that broke strict UTF-8 decoding.
+        (tmp_work_dir / "blob.bin").write_bytes(b"\xcf\x00\x01\x02fast\xff\xfe")
+        shadow_git.commit_baseline()
+        out = shadow_git.show_file("baseline", "blob.bin")   # must not raise
+        assert out is not None                                # decoded with errors="replace"
+
+    def test_compiled_so_is_ignored_and_snapshot_survives(self, shadow_git_with_baseline,
+                                                          tmp_work_dir: Path):
+        sg = shadow_git_with_baseline
+        # agent compiles an extension + writes its python wrapper
+        (tmp_work_dir / "cache_ext.so").write_bytes(b"\xcf\x7fELF\x00\x01binary\xff")
+        (tmp_work_dir / "cache.py").write_text("print('ok')\n")
+        sg.commit_snapshot("after")                          # must not raise on the binary
+        tree = sg._git("ls-tree", "-r", "--name-only", "after").stdout
+        assert "cache.py" in tree                            # source tracked
+        assert "cache_ext.so" not in tree                    # binary ignored, not tracked
