@@ -291,6 +291,53 @@ def test_km_curve_steps_and_censoring():
     assert s[4] == pytest.approx(2 / 3 * 0.0)    # last at-risk run has its event
 
 
+# ------------------------------------------------- state-dependence diagnostics (tests #1/#2)
+def test_event_time_hazard_aligns_on_onset():
+    from pipeline.analyze import _event_time_hazard
+    rp = [
+        {"run_name": "A", "turn": 5, "event": 1, "post_onset": 0},  # onset turn (tau=0, excluded)
+        {"run_name": "A", "turn": 6, "event": 1, "post_onset": 1},  # tau=1
+        {"run_name": "A", "turn": 7, "event": 0, "post_onset": 1},  # tau=2
+        {"run_name": "A", "turn": 8, "event": 1, "post_onset": 1},  # tau=3
+        {"run_name": "B", "turn": 3, "event": 1, "post_onset": 0},  # onset turn
+        {"run_name": "B", "turn": 4, "event": 1, "post_onset": 1},  # tau=1
+        {"run_name": "C", "turn": 1, "event": 0, "post_onset": 0},  # never transgressed -> ignored
+    ]
+    first = {"A": {"api_turn": 5}, "B": {"api_turn": 3}}
+    d = {t: (k, n) for t, k, n in _event_time_hazard(rp, first)}
+    assert d[1] == (2, 2)   # A turn6(1) + B turn4(1) at tau=1
+    assert d[2] == (0, 1) and d[3] == (1, 1)
+
+
+def test_fraction_matched_lift():
+    import numpy as np
+    from pipeline.analyze import _fraction_matched_lift
+    edges = np.linspace(0.0, 1.0, 11)
+    onset_h = [0.1] * 11  # flat onset hazard 0.1
+    rp = [
+        {"post_onset": 1, "frac_used": 0.25, "event": 1},
+        {"post_onset": 1, "frac_used": 0.65, "event": 1},
+        {"post_onset": 0, "frac_used": 0.5, "event": 1},   # pre-onset -> ignored
+        {"post_onset": 1, "frac_used": None, "event": 1},  # unlimited -> ignored
+    ]
+    obs, exp, lift = _fraction_matched_lift(rp, onset_h, edges)
+    assert obs == 2 and abs(exp - 0.2) < 1e-9 and abs(lift - 10.0) < 1e-9
+
+
+def test_onset_recurrence_points_frailty_shape():
+    from pipeline.analyze import _onset_recurrence_points
+    rp = [
+        {"run_name": "A", "post_onset": 1, "event": 1},
+        {"run_name": "A", "post_onset": 1, "event": 1},   # A: onset frac 0.2, rate 1.0
+        {"run_name": "B", "post_onset": 1, "event": 0},
+        {"run_name": "B", "post_onset": 1, "event": 0},   # B: onset frac 0.8, rate 0.0
+        {"run_name": "C", "post_onset": 1, "event": 1},   # C: unknown onset frac -> excluded
+    ]
+    first = {"A": {"frac_used": 0.2}, "B": {"frac_used": 0.8}, "C": {"frac_used": None}}
+    pts = {p[0]: p[1] for p in _onset_recurrence_points(rp, first)}
+    assert pts == {0.2: 1.0, 0.8: 0.0}   # early onset -> higher recurrence (frailty fingerprint)
+
+
 # --------------------------------------------------------------------------- events
 import json as _json  # noqa: E402
 

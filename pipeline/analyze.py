@@ -19,8 +19,16 @@ EXPOSURE-CORRECTED views (see plans/hack-localization-and-hazard-analysis.md):
                                        the composition artifact)
   - binary_rate_per_turn_vs_budget.pdf judge yes-rate / API turns (constant-hazard view)
   - hack_events_by_fraction_used.pdf   density of hack events on the fraction-used axis
-plus person_period.csv (onset format: rows truncated at first hack) and
-person_period_recurrent.csv (full exposure + n_hack_events) for external models.
+  - event_time_hazard_<b>_judge.pdf    recurrence hazard vs turns-since-onset, with the
+                                       fraction-matched onset baseline + lift (test #1)
+  - onset_timing_vs_recurrence_<b>_judge.pdf  onset-fraction vs post-onset rate per run,
+                                       Spearman ρ (frailty fingerprint; test #2)
+plus person_period.csv (onset format: rows truncated at first hack),
+person_period_recurrent.csv (full exposure + n_hack_events), and
+escalation_diagnostics.csv (one row per judge behavior: lift, ρ, p) for external models.
+These last two diagnostics probe whether elevated post-onset recurrence is caused by
+crossing the line (state-dependence) or by hack-prone runs (selection/frailty) — judge
+behaviors only. See docs/explainers/onset_vs_intensity.pdf.
 """
 
 from __future__ import annotations
@@ -354,6 +362,154 @@ def _recurrent_person_period(cfg: SweepConfig, judgeable: list[dict],
     return rows
 
 
+# ===================================================== state-dependence vs selection
+# Two within-run diagnostics that probe WHY the post-onset rate r(x) is elevated:
+# escalation caused by crossing the line (state-dependence) vs hack-prone runs that
+# were always hack-prone (selection/frailty). See the explainer in
+# docs/explainers/onset_vs_intensity.pdf and the "Escalation != state-dependence"
+# discussion. Judge-detector behaviors only.
+MIN_CORR_RUNS = 5      # need this many transgressing runs (w/ post-onset turns) to correlate
+MIN_POST_TURNS = 10    # need this many post-onset at-risk turns for the event-time curve
+
+
+def _event_time_hazard(rp: list[dict], first_hacks: dict[str, dict]) -> list[tuple[int, int, int]]:
+    """Recurrence hazard by turns-since-onset tau>=1, pooled over transgressing runs.
+    Returns [(tau, k_event_turns, n_at_risk_turns), ...] sorted by tau. Each run
+    contributes its own post-onset turns, so a run's latent propensity differences
+    cancel within the tau alignment (the within-run part)."""
+    k: dict[int, int] = defaultdict(int)
+    n: dict[int, int] = defaultdict(int)
+    for r in rp:
+        rn = r["run_name"]
+        if rn not in first_hacks:
+            continue
+        tau = r["turn"] - first_hacks[rn]["api_turn"]
+        if tau >= 1:  # strictly after onset (onset turn itself is tau=0)
+            n[tau] += 1
+            k[tau] += 1 if r["event"] else 0
+    return [(t, k[t], n[t]) for t in sorted(n)]
+
+
+def _fraction_matched_lift(rp: list[dict], onset_h_by_bin: list[float | None],
+                           edges: np.ndarray) -> tuple[float, float, float]:
+    """Observed post-onset recurrences vs expected if post-onset turns behaved like
+    still-clean turns AT THE SAME budget fraction. Returns (obs, exp, lift). lift>>1
+    means recurrence exceeds what budget-position alone predicts -> escalation beyond
+    the fraction trend (the part composition/fraction can't explain)."""
+    nb = len(onset_h_by_bin)
+    obs = exp = 0.0
+    for r in rp:
+        if not r["post_onset"] or r["frac_used"] is None:
+            continue
+        i = min(max(int(np.digitize(r["frac_used"], edges)) - 1, 0), nb - 1)
+        h = onset_h_by_bin[i]
+        if h is None or (isinstance(h, float) and np.isnan(h)):
+            continue
+        obs += 1 if r["event"] else 0
+        exp += h
+    return obs, exp, (obs / exp if exp > 0 else float("nan"))
+
+
+def _onset_recurrence_points(rp: list[dict], first_hacks: dict[str, dict]) -> list[tuple]:
+    """Per transgressing run with >=1 post-onset turn and a known onset fraction:
+    (onset_frac, post_onset_rate, post_events, post_turns). The selection fingerprint:
+    if early-onset (low frac) runs recur MORE, one latent trait drives both -> frailty."""
+    pk: dict[str, int] = defaultdict(int)
+    pn: dict[str, int] = defaultdict(int)
+    for r in rp:
+        if r["post_onset"]:
+            pn[r["run_name"]] += 1
+            pk[r["run_name"]] += 1 if r["event"] else 0
+    pts = []
+    for rn, n in pn.items():
+        if n <= 0 or rn not in first_hacks:
+            continue
+        of = first_hacks[rn].get("frac_used")
+        if of is None:
+            continue
+        pts.append((float(of), pk[rn] / n, pk[rn], n))
+    return pts
+
+
+def _state_dependence_analysis(cfg: SweepConfig, behavior: str, det_label: str, suffix: str,
+                               rp: list[dict], first_hacks: dict[str, dict],
+                               onset_h_by_bin: list[float | None], edges: np.ndarray,
+                               figs: Path) -> dict | None:
+    """Test #1 (event-time hazard + fraction-matched lift) and Test #2 (onset-timing vs
+    recurrence correlation). Writes two PDFs and returns a diagnostics row."""
+    from scipy.stats import spearmanr
+
+    diag = {"behavior": behavior, "detector": det_label}
+
+    # ---------- Test #1: event-time hazard curve + fraction-matched lift ----------
+    curve = _event_time_hazard(rp, first_hacks)
+    n_post = sum(n for _, _, n in curve)
+    obs, exp, lift = _fraction_matched_lift(rp, onset_h_by_bin, edges)
+    diag.update(n_post_onset_turns=int(n_post), post_onset_events=int(obs),
+                expected_events_fraction_matched=round(exp, 3), lift=round(lift, 3))
+    if n_post >= MIN_POST_TURNS and curve:
+        taus = [t for t, _, _ in curve]
+        hz = [k / n for _, k, n in curve]
+        ci = [_wilson(k, n) for _, k, n in curve]
+        baseline = exp / n_post if n_post else float("nan")  # avg fraction-matched onset hazard
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(taus, hz, "-o", color="#27ae60", lw=2,
+                label=f"recurrence hazard (post-onset turns, n={n_post})")
+        ax.fill_between(taus, [c[0] for c in ci], [c[1] for c in ci], color="#27ae60",
+                        alpha=0.15, linewidth=0)
+        ax.axhline(baseline, color="#c0392b", ls="--", lw=1.5,
+                   label=f"fraction-matched onset baseline ({baseline:.3f}); lift={lift:.1f}x")
+        ax.set_xlabel("turns since first transgression (τ)")
+        ax.set_ylabel("P(transgress this turn | already transgressed)")
+        ax.set_title(f"{cfg.experiment_name}: {behavior} recurrence vs time-since-onset ({det_label})")
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        figs.mkdir(parents=True, exist_ok=True)
+        fig.savefig(figs / f"event_time_hazard{suffix}.pdf")
+        plt.close(fig)
+        print(f"  figure: {figs / f'event_time_hazard{suffix}.pdf'}  (lift={lift:.2f}x over fraction-matched)")
+    else:
+        print(f"  ({behavior}/{det_label}: {n_post} post-onset turns < {MIN_POST_TURNS} "
+              f"-> skipping event-time hazard)")
+
+    # ---------- Test #2: onset-timing vs recurrence correlation (frailty fingerprint) ----------
+    pts = _onset_recurrence_points(rp, first_hacks)
+    diag["n_transgressors_corr"] = len(pts)
+    rho = pval = float("nan")
+    if len(pts) >= MIN_CORR_RUNS:
+        of = np.array([p[0] for p in pts])
+        rate = np.array([p[1] for p in pts])
+        if np.std(of) > 0 and np.std(rate) > 0:
+            res = spearmanr(of, rate)
+            rho, pval = float(res.statistic), float(res.pvalue)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sizes = [20 + 6 * p[3] for p in pts]  # size ~ # post-onset turns
+        ax.scatter(of, rate, s=sizes, color="#8e44ad", alpha=0.6, edgecolor="white", linewidth=0.5)
+        if len(pts) >= 2 and np.std(of) > 0:
+            m, b = np.polyfit(of, rate, 1)
+            xs = np.array([of.min(), of.max()])
+            ax.plot(xs, m * xs + b, color="#8e44ad", ls="--", lw=1.5, alpha=0.7)
+        ax.set_xlabel("onset fraction (budget used at FIRST transgression)")
+        ax.set_ylabel("post-onset recurrence rate")
+        ax.set_title(f"{cfg.experiment_name}: {behavior} onset-timing vs recurrence ({det_label})\n"
+                     f"Spearman ρ={rho:.2f}, p={pval:.3g}, n={len(pts)} "
+                     f"(negative ρ = frailty fingerprint)")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        figs.mkdir(parents=True, exist_ok=True)
+        fig.savefig(figs / f"onset_timing_vs_recurrence{suffix}.pdf")
+        plt.close(fig)
+        print(f"  figure: {figs / f'onset_timing_vs_recurrence{suffix}.pdf'}  "
+              f"(Spearman rho={rho:.2f}, p={pval:.3g}, n={len(pts)})")
+    else:
+        print(f"  ({behavior}/{det_label}: {len(pts)} transgressors < {MIN_CORR_RUNS} "
+              f"-> skipping onset-timing correlation)")
+    diag.update(onset_recurrence_rho=round(rho, 4), onset_recurrence_p=round(pval, 5))
+    return diag
+
+
 def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
                     api_turns_by_run: dict[str, int], p_hat_by_run: dict[str, float],
                     budgets: list, labels: list[str], line_pos: list[float], figs: Path,
@@ -362,11 +518,12 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
     (e.g. '_reward_hacking_judge') is appended to every figure + CSV so behavior x
     detector runs don't clobber each other."""
     det_label = "+".join(sources)
+    diag_out: dict | None = None  # state-dependence diagnostics row (judge only)
     paths = {"mechanical": cfg.events_jsonl_for(behavior), "judge": cfg.judge_events_jsonl_for(behavior)}
     present = [s for s in sources if paths[s].exists()]
     if not present:
         print(f"  ({behavior}/{det_label}: no events file -> skipping hazard/KM plots)")
-        return
+        return None
     print(f"  [{behavior}] hack-event detector(s): {', '.join(present)}")
     first_hacks, unlocated = _load_first_hacks(cfg, behavior, sources)
     if unlocated:
@@ -508,6 +665,13 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
             plt.close(fig)
             print(f"  figure: {figs / f'hack_intensity_vs_fraction_used{suffix}.pdf'}")
 
+            # ---- state-dependence vs selection diagnostics (judge behaviors only) ----
+            if "judge" in sources:
+                onset_h_by_bin = [(ks[i] / ns[i]) if ns[i] > 0 else None for i in range(len(ks))]
+                diag_out = _state_dependence_analysis(
+                    cfg, behavior, det_label, suffix, rp, first_hacks,
+                    onset_h_by_bin, edges, figs)
+
     # ---- judge yes-rate per API turn (constant-hazard approximation) ----
     # Built from the judge binary VERDICT probabilities (p_hat), not the events files, so
     # it is inherently judge-only. Suffixed PER BEHAVIOR so the 3 behaviors don't clobber
@@ -539,6 +703,8 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
             "probability density of hack events",
             f"{cfg.experiment_name}: when (in budget consumption) hack events occur ({det_label})",
             figs / f"hack_events_by_fraction_used{suffix}.pdf")
+
+    return diag_out
 
 
 def analyze(cfg: SweepConfig) -> None:
@@ -709,6 +875,7 @@ def analyze(cfg: SweepConfig) -> None:
 
     # ---- PER-BEHAVIOR: rate/severity plots + per-detector exposure-corrected analysis ----
     mech_behaviors = {b.name for b in cfg.all_behaviors if b.mechanical and b.mechanical.enabled}
+    escalation_diagnostics: list[dict] = []
     for b in cfg.all_behaviors:
         behavior = b.name
         bin_by_run, scl_by_run = _judge_values(behavior)
@@ -746,8 +913,17 @@ def analyze(cfg: SweepConfig) -> None:
             detectors.insert(0, ("mechanical",))
         for sources in detectors:
             det = sources[0]
-            _event_analysis(cfg, behavior, judgeable, api_turns_by_run, p_hat_by_run,
-                            budgets, labels, line_pos, figs,
-                            sources=sources, suffix=f"_{behavior}_{det}")
+            diag = _event_analysis(cfg, behavior, judgeable, api_turns_by_run, p_hat_by_run,
+                                   budgets, labels, line_pos, figs,
+                                   sources=sources, suffix=f"_{behavior}_{det}")
+            if diag is not None:
+                escalation_diagnostics.append(diag)
+
+    # Combined state-dependence vs selection summary (one row per judge behavior).
+    if escalation_diagnostics:
+        diag_path = cfg.out / "escalation_diagnostics.csv"
+        pd.DataFrame(escalation_diagnostics).to_csv(diag_path, index=False)
+        print(f"\nEscalation diagnostics -> {diag_path}")
+        print(pd.DataFrame(escalation_diagnostics).to_string(index=False))
 
     print("\nPhase 3 complete.")
