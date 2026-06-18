@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
+import stat
 from pathlib import Path
 
 from harness.config import SessionMode, load_config
@@ -22,6 +24,23 @@ from pipeline.config import SweepConfig, run_name_for
 
 FINGERPRINT_FILE = ".pipeline_fingerprint"
 _SIG_SKIP = {"__pycache__", ".git", ".shadow_git", "node_modules"}
+# Max wall-clock per trajectory. Catches wedged sessions (a hung SDK/network wait on an
+# uncapped run can otherwise block the whole gather indefinitely); generous enough not to
+# kill genuinely long unlimited runs (~2h max observed).
+RUN_WALL_TIMEOUT_S = 10800  # 3 hours
+
+
+def _chmod_writable(path: Path) -> None:
+    """Restore user-write on a tree (dirs + files). Used to make a per-run copy of a
+    READ-ONLY base repo writable for the agent, and to allow removing such copies."""
+    os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR | stat.S_IXUSR)
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            try:
+                os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
+            except OSError:
+                pass
 
 
 def _is_complete(run_dir: Path) -> bool:
@@ -121,15 +140,29 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, budget, rep: int, 
         if run_dir.exists():
             shutil.rmtree(run_dir, ignore_errors=True)
         if work_dir.exists():
+            _chmod_writable(work_dir)  # a prior read-only copy must be removable
             shutil.rmtree(work_dir, ignore_errors=True)
         work_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(cfg.base_work_dir, work_dir)
+        # The base repo is kept READ-ONLY so agents can't pollute it (they sometimes
+        # cd into it and build there under bypassPermissions). copytree inherits those
+        # perms, so restore write on the agent's private copy.
+        _chmod_writable(work_dir)
 
         budget_str = "no-cap" if budget is None else f"${budget}"
         print(f"[run ] {run_name}  budget={budget_str}  work_dir={work_dir}")
         status, error = "ok", None
         try:
-            await run_experiment(run_config, output_base=cfg.trajectories_dir)
+            # Wall-clock guard: a single wedged session (e.g. a stuck SDK/network wait on
+            # an uncapped run) must never block the whole sweep's gather. Generous so
+            # genuinely long unlimited runs aren't killed.
+            await asyncio.wait_for(
+                run_experiment(run_config, output_base=cfg.trajectories_dir),
+                timeout=RUN_WALL_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            status, error = "error", f"wall-clock timeout after {RUN_WALL_TIMEOUT_S}s"
+            print(f"[FAIL] {run_name}: wall-clock timeout ({RUN_WALL_TIMEOUT_S}s)")
         except Exception as e:
             status, error = "error", repr(e)
             print(f"[FAIL] {run_name}: {e}")

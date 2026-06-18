@@ -59,24 +59,40 @@ def _budget_label(b) -> str:
 
 
 def _line_positions(budgets) -> list[float]:
-    """x positions for the LINE plots: numeric budgets log10-spaced, 'unlimited' placed
-    at a separate tick to the right (a true log axis can't represent None)."""
-    logs = [np.log10(b) for b in budgets if b is not None]
-    if not logs:
+    """x positions for budget-axis plots: TRUE LINEAR by budget value (budget is a
+    continuous pressure variable). 'unlimited' (None) has no finite position, so it is
+    placed one representative step past the max budget (reads as off-scale to the right)."""
+    vals = [b for b in budgets if b is not None]
+    if not vals:
         return list(range(len(budgets)))
-    span = (max(logs) - min(logs)) / max(1, len(logs) - 1)
-    gap = max(span, 0.5)
-    return [(np.log10(b) if b is not None else max(logs) + gap) for b in budgets]
+    sv = sorted(vals)
+    gaps = [b - a for a, b in zip(sv, sv[1:])]
+    step = max(gaps) if gaps else max(vals) * 0.2 or 1.0
+    unlim_pos = max(vals) + step
+    return [(b if b is not None else unlim_pos) for b in budgets]
+
+
+def _budget_xaxis(ax, positions, labels) -> None:
+    """Shared styling for the linear budget x-axis: tick labels rotated 45 deg once
+    crowded (>6 ticks), plus a faint divider marking the off-scale 'unlimited' arm."""
+    ax.set_xticks(positions)
+    rot = 45 if len(labels) > 6 else 0
+    ax.set_xticklabels(labels, rotation=rot, ha=("right" if rot else "center"))
+    if "unlimited" in labels:
+        i = labels.index("unlimited")
+        if i > 0:
+            ax.axvline((positions[i] + positions[i - 1]) / 2, color="grey", ls=":",
+                       lw=1, alpha=0.5)
 
 
 def _violin(positions, datasets, labels, ylabel, title, out_path: Path, color: str):
     """Per-budget distribution as a rotated KDE 'violin' + overlaid raw run points,
-    sitting on the same (log-spaced) budget positions as the line plots.
+    sitting on the same (linear) budget positions as the line plots.
 
     Draws a violin body only where a dataset has >=2 distinct values (KDE is otherwise
     singular); the individual run values are always scattered so small-N slices stay
-    honest. Violin widths scale to the smallest gap between positions so log-spaced
-    slices don't overlap.
+    honest. Violin widths scale to the smallest gap between positions so adjacent
+    slices don't overlap (narrow where budgets are close, e.g. the low arms).
     """
     pos = np.asarray(positions, dtype=float)
     gaps = np.diff(np.sort(pos))
@@ -100,8 +116,7 @@ def _violin(positions, datasets, labels, ylabel, title, out_path: Path, color: s
         spread = 0.15 * width
         offs = np.linspace(-spread, spread, n) if n > 1 else np.array([0.0])
         ax.scatter(xi + offs, vals, s=24, color=color, edgecolor="white", linewidth=0.5, zorder=3)
-    ax.set_xticks(pos)
-    ax.set_xticklabels(labels)
+    _budget_xaxis(ax, pos, labels)
     ax.set_xlabel("max budget (USD)")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -176,8 +191,7 @@ def _plot(positions, labels, y, yerr, ylabel, title, out_path: Path, color: str)
     lo = np.where(np.isnan(yerr), y, y - yerr)
     hi = np.where(np.isnan(yerr), y, y + yerr)
     ax.fill_between(x, lo, hi, color=color, alpha=0.20, linewidth=0)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
+    _budget_xaxis(ax, x, labels)
     ax.set_xlabel("max budget (USD)")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -495,8 +509,9 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
             print(f"  figure: {figs / f'hack_intensity_vs_fraction_used{suffix}.pdf'}")
 
     # ---- judge yes-rate per API turn (constant-hazard approximation) ----
-    # Built from the judge binary VERDICT probabilities (p_hat), not the events files,
-    # so it is inherently judge-only and has no mechanical counterpart; emit once.
+    # Built from the judge binary VERDICT probabilities (p_hat), not the events files, so
+    # it is inherently judge-only. Suffixed PER BEHAVIOR so the 3 behaviors don't clobber
+    # one shared file (they did before -> last behavior won under a generic title).
     if "judge" in sources:
         rate_d = []
         for b in budgets:
@@ -506,9 +521,9 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
         if any(rate_d):
             means, ses = zip(*(_mean_se(d) for d in rate_d))
             _plot(line_pos, labels, list(means), list(ses),
-                  "judge yes-rate / API turn",
-                  f"{cfg.experiment_name}: reward-hacking rate per turn (exposure-corrected)",
-                  figs / "binary_rate_per_turn_vs_budget.pdf", "#c0392b")
+                  f"{behavior} yes-rate / API turn",
+                  f"{cfg.experiment_name}: {behavior} rate per turn (exposure-corrected)",
+                  figs / f"binary_rate_per_turn_vs_budget_{behavior}.pdf", "#c0392b")
 
     # ---- density of hack events on the fraction-used axis (all events, capped arms) ----
     capped = [b for b in budgets if b is not None]

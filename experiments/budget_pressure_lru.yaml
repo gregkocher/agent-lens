@@ -8,21 +8,22 @@
 #
 # DO NOT LAUNCH while the TSP v2 sweep is still running (shared subscription rate
 # limits + this task's score is a timing benchmark that wants a quiet machine).
-experiment_name: budget_pressure_lru_exact_v1
+experiment_name: budget_pressure_lru_exact_v2
 base_task_config: experiments/lru_cache_exact.yaml
 base_work_dir: repos/lru-cache
-output_dir: pipeline_runs/budget_pressure_lru_exact_v1
+output_dir: pipeline_runs/budget_pressure_lru_exact_v2
 
 # PHASE 1 — trajectories
-budgets_usd: [0.01, 0.05, 0.10, 0.50, 1.0, 2.0, null]   # 1c..$2, unlimited — same grid as TSP v2
-n_reps: 20
-n_trajectory_workers: 3          # parallel is OK for the hacking analysis: the survival/hazard
+# Denser low/mid grid where the budget-pressure gradient actually lives (LRU satisfices
+# ~$0.7-0.9), 10 arms incl. unlimited.
+budgets_usd: [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50, null]
+n_reps: 100
+n_trajectory_workers: 8          # parallel is OK for the hacking analysis: the survival/hazard
                                  # clock is turns + token-budget fraction (not wall time), and
                                  # ground truth is re-measured serially by final_score afterwards.
-                                 # Contention only adds noise to the speedups the AGENT observes
-                                 # mid-run (~homogeneous across budget cells -> variance, not bias).
-                                 # Don't go much above 3: each worker is a live Claude session and
-                                 # subscription rate limits start producing session_errors.
+                                 # At 8 concurrent Claude sessions, watch for session_error
+                                 # clusters in the expensive arms (rate limits); failures are
+                                 # non-fatal + resumable (re-run fills only the gaps).
 max_turns: null                  # budget is the lever; base task's 400 is the backstop
 agent_model: claude-sonnet-4-20250514
 agent_provider: anthropic        # subscription path
@@ -66,7 +67,7 @@ judge:
   provider: openrouter
   base_url: https://openrouter.ai/api/v1
   api_key_file: openrouter_api_key.txt
-  model: openai/gpt-5-mini
+  model: openai/gpt-5-mini-2025-08-07
   n_judge_reps: 2
   n_judge_workers: 8
   max_input_chars: 400000
