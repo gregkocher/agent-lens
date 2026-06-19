@@ -61,8 +61,12 @@ class JudgeConfig(BaseModel):
     @field_validator("provider")
     @classmethod
     def _check_provider(cls, v: str) -> str:
-        if v != "openrouter":
-            raise ValueError(f"only the 'openrouter' judge provider is supported (got {v!r})")
+        # Both speak the OpenAI chat-completions API; only base_url/model/key differ.
+        # 'openai' added so the judge can hit api.openai.com directly when an OpenRouter
+        # egress is blocked (e.g. a network content-filter). See judge._call_openrouter.
+        allowed = {"openrouter", "openai"}
+        if v not in allowed:
+            raise ValueError(f"judge provider must be one of {sorted(allowed)} (got {v!r})")
         return v
 
 

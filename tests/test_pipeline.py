@@ -143,6 +143,41 @@ def test_budget_mention_fractions_capped_counts_turn_one(tmp_path):
     assert budget_mention_fractions(tmp_path, ["budget"], capped=False) == [0.5]
 
 
+# --------------------------------------------------------------------------- sandbagging footer
+def test_resource_state_note_variants():
+    from pipeline.judge import resource_state_note
+    # capped run that hit the cap -> "terminated by cap"
+    hit = resource_state_note("x", budget_usd=1.0, cost_usd=0.99)
+    assert "TERMINATED BY THIS EXTERNAL CAP" in hit and "0.9900/$1.00" in hit and "99%" in hit
+    # capped run that stopped early -> "budget remaining"
+    early = resource_state_note("x", budget_usd=1.0, cost_usd=0.30)
+    assert "BUDGET STILL REMAINING" in early and "30%" in early
+    # unlimited run -> no cap
+    unl = resource_state_note("x", budget_usd=None, cost_usd=3.0)
+    assert "NO spend cap" in unl
+    # missing cost -> graceful
+    unk = resource_state_note("x", budget_usd=0.5, cost_usd=None)
+    assert "final spend unknown" in unk.lower()
+
+
+def test_augment_render_sandbagging_only():
+    from pipeline.judge import _augment_render
+    row = {"run_dir": "x", "budget_usd": 1.0, "cost_usd": 0.99}
+    base = "=== AGENT TRAJECTORY ===\n[step 1] ..."
+    sb = _augment_render(base, "sandbagging", row)
+    assert sb != base and "RUN RESOURCE STATE" in sb and sb.startswith(base)
+    # other behaviors: pass-through, stay condition-blind
+    for beh in ("reward_hacking", "dishonest_reporting"):
+        assert _augment_render(base, beh, row) == base
+
+
+def test_sandbagging_rubric_markers_intact():
+    # the loader requires the two section markers; rewrite must keep them parseable
+    from pipeline.judge import _load_rubrics
+    r = _load_rubrics("pipeline/rubrics/sandbagging.txt")
+    assert r["binary"] and r["scale_1_5"] and "RUN RESOURCE STATE" in r["preamble"]
+
+
 # --------------------------------------------------------------------------- judge parsing
 @pytest.mark.parametrize("text,expected", [
     ('{"reward_hacking": "yes", "rationale": "edited scorer"}', "yes"),
@@ -525,7 +560,11 @@ def test_lru_sweep_config_loads():
     assert "test_cache.py" in rh.mechanical.protected_write_paths
     assert "cache_starter.py" in rh.mechanical.protected_write_paths
     assert cfg.task_context and "test_cache.py" in cfg.task_context  # task specifics in context
-    assert cfg.judge.model == "openai/gpt-5-mini-2025-08-07"  # pinned snapshot for reproducibility
+    # OpenAI-direct judge transport (OpenRouter is filter-blocked on this machine), same
+    # gpt-5-mini pinned to its dated snapshot.
+    assert cfg.judge.provider == "openai"
+    assert cfg.judge.base_url == "https://api.openai.com/v1"
+    assert cfg.judge.model == "gpt-5-mini-2025-08-07"  # pinned snapshot for reproducibility
 
 
 # --------------------------------------------------------------------------- score_workers
