@@ -124,6 +124,11 @@ class EngineRunSpec:
     prompt: str | AsyncIterable[dict[str, Any]]
     model: str
     cwd: str
+    # Model provider (engine-specific meaning): for Codex, "openai" (default) or
+    # "openrouter" selects the model_providers block; for Claude Code, routing is
+    # handled via env (build_provider_env) instead.
+    provider: str | None = None
+    base_url: str | None = None
     system_prompt: str | None = None
     allowed_tools: list[str] = field(default_factory=list)
     max_turns: int = 50
@@ -137,6 +142,7 @@ class EngineRunSpec:
     resume_rollout_path: str | None = None
     fork: bool = False
     sandbox_mode: str | None = None
+    sandbox_workspace_network_access: bool | None = None
     # When set, the engine routes API traffic through this base URL (capture proxy).
     capture_base_url: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)

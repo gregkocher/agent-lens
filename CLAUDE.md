@@ -55,9 +55,12 @@ Required fields: `model`, `work_dir`, `sessions`
 ```yaml
 engine: claude_code                     # claude_code (default) | codex
 model: "claude-sonnet-4-20250514"      # engine-appropriate model name
-provider: anthropic                     # claude_code: anthropic|openrouter|bedrock|vertex (codex → openai)
+provider: anthropic                     # claude_code: anthropic|openrouter|bedrock|vertex; codex: openai|openrouter
 sandbox_mode: workspace-write           # codex only: read-only | workspace-write | danger-full-access
+sandbox_workspace_network_access: true  # codex only: override workspace-write network access (unset = Codex default)
 codex_multi_agent: false                # codex only: enable subagent spawning (features.multi_agent)
+codex_goal_token_budget: 30000          # codex only: ask Codex to create_goal with this budget first
+codex_goal_objective: "..."             # codex only: objective for the goal (default: session prompt)
 work_dir: "./repos/my_repo"            # Working directory (any directory, not just repos)
 session_mode: isolated                  # isolated | chained | forked
 system_prompt: "..."                    # Shared system prompt
@@ -70,6 +73,12 @@ tags: ["tag1"]
 memory_file: "MEMORY.md"               # Auto-seeded memory file (default: MEMORY.md)
 memory_seed: "# Notes\n"               # Initial content for memory file
 revert_work_dir: true                  # Reset working directory after run (default: false)
+
+pre_run_commands:                       # Shell hooks before sessions (optional)
+  - command: "docker compose up -d db"  # gets HARNESS_RUN_DIR / HARNESS_WORK_DIR in env
+post_run_commands:                      # Shell hooks after sessions, even on error (optional)
+  - command: "python grade.py"
+    check: false                        # cwd / timeout_seconds / check are per-command
 
 sessions:
   - session_index: 1
@@ -102,9 +111,12 @@ runs are always clearly labeled **Claude Code** or **Codex**.
 - **claude_code** (default): wraps the Claude Agent SDK. Routes through the
   Anthropic Messages API. Supports subagents, API capture, resample, and replay.
 - **codex**: wraps the Codex CLI's `codex exec --json`. Routes through the OpenAI
-  Responses API. Requires the `codex` CLI installed (>= 0.135). Supports
-  trajectories, diffs, change tracking, API capture, resample, turn-level replay
-  (via `experimental_resume`), and subagent capture.
+  Responses API by default, or OpenRouter with `provider: openrouter` (any
+  vendor-prefixed slug, e.g. `openai/gpt-5.3-codex`; AgentLens injects the
+  `model_providers` block with `wire_api=responses`). Requires the `codex` CLI
+  installed (>= 0.135). Supports trajectories, diffs, change tracking, API
+  capture, resample, turn-level replay (via `experimental_resume`), and subagent
+  capture.
 
 **Subagents.** The two engines have different subagent mechanisms:
 - *Claude Code* uses the `agents:` config block (Claude `AgentDefinition`s invoked
@@ -120,16 +132,20 @@ runs are always clearly labeled **Claude Code** or **Codex**.
   output shape as Claude subagents.
 
 **Codex auth.** Normal runs and replay use whatever `codex login` configured
-(ChatGPT subscription or API key). **API capture/resample additionally require
-`OPENAI_API_KEY` with active billing**, because the capture proxy routes Codex
-through a custom model provider that uses API-key auth (the built-in `openai`
-provider's base URL cannot be overridden). If you only need trajectories + replay,
-subscription auth is sufficient; set `capture_api_requests: false`.
+(ChatGPT subscription or API key). **API capture/resample additionally require an
+API key with active billing** — `OPENAI_API_KEY` for `provider: openai`, or
+`OPENROUTER_API_KEY` for `provider: openrouter` — because the capture proxy routes
+Codex through a custom model provider that uses API-key auth (the built-in
+providers' base URLs cannot be overridden). If you only need trajectories +
+replay, subscription auth is sufficient on the OpenAI path; set
+`capture_api_requests: false`.
 
-How capture works for Codex: the proxy targets `https://api.openai.com` and Codex
-is pointed at it via `-c model_providers.proxy.base_url=...` + `model_provider=proxy`.
-The proxy parses the OpenAI Responses SSE stream (vs Anthropic Messages SSE for
-claude_code), normalizing both onto one capture schema.
+How capture works for Codex: the proxy targets the resolved upstream
+(`https://api.openai.com/v1` or `https://openrouter.ai/api/v1`, via
+`codex_upstream()`) and Codex is pointed at it via `-c
+model_providers.proxy.base_url=...` + `model_provider=proxy`, forwarding the
+upstream API key. The proxy parses the OpenAI Responses SSE stream (vs Anthropic
+Messages SSE for claude_code), normalizing both onto one capture schema.
 
 Engines share the same normalized event model (`engines/base.py`), so shadow git,
 ATIF mapping, diffs, and state tracking are identical across engines. Add a new

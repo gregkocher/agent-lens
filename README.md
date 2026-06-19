@@ -67,7 +67,7 @@ The `engine` field selects the coding-agent runtime. Both engines share the same
 | Engine | Config value | Runtime | Auth | Notes |
 |--------|-------------|---------|------|-------|
 | Claude Code | `claude_code` (default) | [Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/) | `ANTHROPIC_API_KEY` or Claude Pro/Max subscription | Subagents via the `agents:` config block. Routes via the Anthropic Messages API. |
-| Codex | `codex` | [Codex CLI](https://developers.openai.com/codex) `codex exec --json` (>= 0.135) | `codex login` (subscription) or `OPENAI_API_KEY` | Subagents via Codex multi-agent (`codex_multi_agent: true`). Routes via the OpenAI Responses API. |
+| Codex | `codex` | [Codex CLI](https://developers.openai.com/codex) `codex exec --json` (>= 0.135) | `codex login` (subscription) or `OPENAI_API_KEY`; `OPENROUTER_API_KEY` for `provider: openrouter` | Subagents via Codex multi-agent (`codex_multi_agent: true`). Routes via the OpenAI Responses API, or OpenRouter with `provider: openrouter`. |
 
 **Subagents** are captured for both engines as separate, linked ATIF trajectories (a `SubagentTrajectoryRef` on the spawning step). They use different mechanisms: Claude Code via the `agents:` config block (Claude-only); Codex via its native multi-agent system — set `codex_multi_agent: true` to let Codex spawn agents (TOML agent definitions live in `~/.codex/agents/`), and AgentLens rebuilds each spawned thread's rollout into a linked subagent trajectory.
 
@@ -76,13 +76,20 @@ The `engine` field selects the coding-agent runtime. Both engines share the same
 engine: codex
 model: "gpt-5.4"
 sandbox_mode: workspace-write   # read-only | workspace-write | danger-full-access
+
+# Codex via OpenRouter — point Codex at any OpenRouter model:
+# engine: codex
+# provider: openrouter
+# model: "openai/gpt-5.3-codex"   # exact OpenRouter slug (vendor prefix required)
 ```
 
-**Codex auth & capture.** Normal runs and turn-level replay use whatever `codex login` configured. **API capture (`capture_api_requests: true`) and the resampling it enables additionally require `OPENAI_API_KEY` with active billing** — capture routes Codex through a proxy via a custom model provider that uses API-key auth (the built-in `openai` provider's base URL can't be overridden). For trajectories + replay only, subscription auth is enough; keep `capture_api_requests: false`. See [examples/codex.yaml](examples/codex.yaml).
+**Codex via OpenRouter.** Set `provider: openrouter` to route the Codex engine through OpenRouter, then export `OPENROUTER_API_KEY`. AgentLens injects the required Codex `model_providers` block automatically (`base_url=https://openrouter.ai/api/v1`, `wire_api=responses`). The `model` must be a full OpenRouter slug including the vendor prefix (e.g. `openai/gpt-5.3-codex`) — a bare slug is rejected at config load. For Codex, `provider` is either `openai` (default) or `openrouter`.
+
+**Codex auth & capture.** Normal runs and turn-level replay use whatever `codex login` configured. **API capture (`capture_api_requests: true`) and the resampling it enables additionally require an API key with active billing** — `OPENAI_API_KEY` for `provider: openai` or `OPENROUTER_API_KEY` for `provider: openrouter` — because capture routes Codex through a proxy via a custom model provider that uses API-key auth (the built-in providers' base URLs can't be overridden). For trajectories + replay only, subscription auth is enough on the OpenAI path; keep `capture_api_requests: false`. See [examples/codex.yaml](examples/codex.yaml).
 
 ## Providers
 
-For the `claude_code` engine, the `provider` field routes API calls. The Claude Agent SDK speaks the Anthropic Messages API protocol and **only runs Claude models**. (For the `codex` engine, `provider` is informational and defaults to `openai`.)
+For the `claude_code` engine, the `provider` field routes API calls. The Claude Agent SDK speaks the Anthropic Messages API protocol and **only runs Claude models**. (For the `codex` engine, `provider` selects the Codex model provider — `openai` (default) or `openrouter`; see [Engines](#engines).)
 
 | Provider | Config value | Env var | Notes |
 |----------|-------------|---------|-------|
@@ -289,15 +296,40 @@ judge:
 
 Verdicts are written to `session_NN/judge.jsonl`. Flagged sessions are recorded in `run_meta.json` (`judge_flagged` / `judge_early_exit` per session; `judge_flagged_sessions` / `judge_early_exits` totals) and shown by `harness inspect` with a `⚑ flagged` marker. The judge needs an API key for its backend (no subscription auth).
 
+### Lifecycle hooks
+
+`pre_run_commands` and `post_run_commands` run shell commands before and after the agent sessions — useful for starting local services, seeding fixtures, or running grading scripts. They are engine-independent. Each command receives `HARNESS_RUN_DIR` and `HARNESS_WORK_DIR` in its environment. `post_run_commands` run in a `finally` block, so they execute even if a session errors.
+
+```yaml
+pre_run_commands:
+  - command: "docker compose up -d db"
+    timeout_seconds: 60
+post_run_commands:
+  - command: "python grade.py --run-dir \"$HARNESS_RUN_DIR\""
+    check: false          # don't fail the run if the command exits non-zero
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `command` | yes | — | Shell command to execute |
+| `cwd` | no | harness process cwd | Working directory for the command |
+| `timeout_seconds` | no | `30` | Command timeout |
+| `check` | no | `true` | Whether a non-zero exit should fail the run |
+
 ### Config reference
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `engine` | no | `claude_code` | Coding-agent runtime: `claude_code` or `codex` |
 | `model` | yes | — | Model identifier. For `claude_code`, an Anthropic model name (e.g. `claude-sonnet-4-20250514`); for `codex`, a Codex model (e.g. `gpt-5.4`). |
-| `provider` | no | `anthropic` (`openai` for codex) | `claude_code` API routing: `anthropic`, `openrouter`, `bedrock`, `vertex`. Informational for `codex`. |
+| `provider` | no | `anthropic` (`openai` for codex) | `claude_code` API routing: `anthropic`, `openrouter`, `bedrock`, `vertex`. For `codex`: `openai` (default) or `openrouter`. |
 | `sandbox_mode` | no | `workspace-write` | Codex only: `read-only`, `workspace-write`, or `danger-full-access` |
+| `sandbox_workspace_network_access` | no | Codex default | Codex only: override `sandbox_workspace_write.network_access` for `workspace-write` runs |
 | `codex_multi_agent` | no | `false` | Codex only: enable `features.multi_agent` so Codex can spawn subagents (captured as linked trajectories) |
+| `codex_goal_token_budget` | no | — | Codex only: ask Codex to `create_goal` with this token budget before substantive work (also `--codex-goal-token-budget`) |
+| `codex_goal_objective` | no | session prompt | Codex only: objective text paired with `codex_goal_token_budget` |
+| `pre_run_commands` | no | `[]` | Shell commands run before the agent sessions (see [Lifecycle hooks](#lifecycle-hooks)) |
+| `post_run_commands` | no | `[]` | Shell commands run after the agent sessions, even if a session errors |
 | `base_url` | no | — | Custom API base URL (overrides provider default) |
 | `hypothesis` | no | — | One-sentence hypothesis this experiment tests. Shown in the web UI and saved to `run_meta.json`. |
 | `work_dir` | yes | — | Working directory the agent operates in (any directory, not just repos) |

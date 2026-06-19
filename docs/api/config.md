@@ -8,6 +8,8 @@ Configuration models for experiment runs. All models use Pydantic for validation
         - SessionMode
         - SessionConfig
         - AgentConfig
+        - JudgeConfig
+        - HookCommandConfig
         - RunConfig
         - load_config
         - build_provider_env

@@ -152,13 +152,17 @@ async def run_session(
     capture_base_url: str | None = None
     if run_config.capture_api_requests:
         if run_config.engine == "codex":
-            # Codex talks to the OpenAI Responses API; route it through the proxy
-            # via a custom provider. Requires OPENAI_API_KEY (API-key auth).
+            # Codex talks to a Responses API (OpenAI or OpenRouter); route it
+            # through the proxy via a custom provider. Requires an API key
+            # (OPENAI_API_KEY or OPENROUTER_API_KEY depending on provider).
+            from harness.engines.codex import codex_upstream
+
+            upstream_base, _, _ = codex_upstream(run_config.provider, run_config.base_url)
             proxy = CaptureProxy(raw_dump_count=9999)
-            port = await proxy.start(
-                "https://api.openai.com", session_dir / "api_captures.jsonl"
-            )
-            capture_base_url = f"http://127.0.0.1:{port}/v1"
+            port = await proxy.start(upstream_base, session_dir / "api_captures.jsonl")
+            # Codex appends `/responses` to its provider base_url; the proxy
+            # forwards that path onto the resolved upstream base.
+            capture_base_url = f"http://127.0.0.1:{port}"
         else:
             target_url = get_target_url(run_config.provider, run_config.base_url)
             proxy = CaptureProxy(raw_dump_count=9999)
@@ -168,11 +172,29 @@ async def run_session(
     prompt: str | AsyncIterable[dict[str, Any]] = (
         prompt_override if prompt_override is not None else session_config.prompt
     )
+    if (
+        isinstance(prompt, str)
+        and run_config.engine == "codex"
+        and run_config.codex_goal_token_budget is not None
+    ):
+        goal_objective = run_config.codex_goal_objective or session_config.prompt
+        prompt = (
+            "This run explicitly requests Codex goal tracking with a token budget.\n"
+            "Before starting substantive work, call create_goal with exactly:\n"
+            f"- objective: {goal_objective}\n"
+            f"- token_budget: {run_config.codex_goal_token_budget}\n"
+            "When the objective is fully complete, call update_goal with status "
+            "`complete` before your final response.\n\n"
+            "---\n\n"
+            f"{prompt}"
+        )
 
     spec = EngineRunSpec(
         prompt=prompt,
         model=run_config.model,
         cwd=cwd,
+        provider=run_config.provider,
+        base_url=run_config.base_url,
         system_prompt=system_prompt,
         allowed_tools=run_config.allowed_tools,
         max_turns=max_turns,
@@ -185,6 +207,7 @@ async def run_session(
         resume_rollout_path=resume_rollout_path,
         fork=fork,
         sandbox_mode=run_config.sandbox_mode,
+        sandbox_workspace_network_access=run_config.sandbox_workspace_network_access,
         capture_base_url=capture_base_url,
         extra={"codex_multi_agent": run_config.codex_multi_agent},
     )

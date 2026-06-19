@@ -38,6 +38,10 @@ def run(
     run_name: Annotated[Optional[str], typer.Option(help="Custom run name")] = None,
     runs_dir: Annotated[Path, typer.Option(help="Output directory")] = Path("runs"),
     no_capture: Annotated[bool, typer.Option(help="Disable API request capture (disables resampling)")] = False,
+    codex_goal_token_budget: Annotated[
+        Optional[int],
+        typer.Option(help="Ask Codex to create a goal with this token budget"),
+    ] = None,
 ) -> None:
     """Run a multi-session experiment from a config file."""
     config = load_config(config_path)
@@ -52,6 +56,8 @@ def run(
         config.run_name = run_name
     if no_capture:
         config.capture_api_requests = False
+    if codex_goal_token_budget is not None:
+        config.codex_goal_token_budget = codex_goal_token_budget
 
     from harness.experiment import run_experiment
 

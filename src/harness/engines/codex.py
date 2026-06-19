@@ -48,6 +48,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_SANDBOX = "workspace-write"
 
 
+def codex_upstream(provider: str | None, base_url: str | None) -> tuple[str, str, str]:
+    """Resolve the upstream model provider for a Codex run.
+
+    Returns ``(base_url, env_key, provider_id)`` where:
+
+    - ``base_url`` is the Responses API base Codex points its model provider at
+      (Codex appends ``/responses``). For capture, the proxy forwards traffic
+      here.
+    - ``env_key`` is the env var holding the API key Codex sends as a bearer
+      token (and which the capture proxy forwards upstream).
+    - ``provider_id`` is the ``model_providers`` block id; ``"openai"`` means use
+      Codex's built-in provider (no custom block needed for non-capture runs).
+    """
+    if provider == "openrouter":
+        return (base_url or "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openrouter")
+    # Default: OpenAI. The built-in `openai` provider is used for non-capture
+    # runs; base_url only matters when routing through the capture proxy.
+    return (base_url or "https://api.openai.com/v1", "OPENAI_API_KEY", "openai")
+
+
 class CodexEngine(Engine):
     name = "codex"
 
@@ -81,6 +101,16 @@ class CodexEngine(Engine):
             cwd=spec.cwd,
             env=self._proc_env(spec),
         )
+
+        # Drain stderr concurrently. Codex can emit very large stderr payloads
+        # (e.g. a ~500KB "failed to refresh available models" error when a custom
+        # provider like OpenRouter returns a models list Codex can't decode). If
+        # we only read stderr after the stdout loop, that output fills the OS pipe
+        # buffer (~64KB), Codex blocks writing stderr, stops producing stdout, and
+        # the stdout loop deadlocks. Reading stderr in a background task keeps the
+        # pipe drained so neither stream can stall the other.
+        assert proc.stderr is not None
+        stderr_task = asyncio.ensure_future(proc.stderr.read())
 
         thread_id: str | None = None
         usage_acc: dict[str, int] = {}
@@ -133,18 +163,25 @@ class CodexEngine(Engine):
                     continue
             completed = True
         finally:
-            # If the consumer stopped early (e.g. judge early-exit), the loop is
-            # interrupted at a yield and `completed` stays False — terminate the
-            # subprocess rather than leaving it running.
-            if not completed and proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except (asyncio.TimeoutError, ProcessLookupError):
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
+            if not completed:
+                # Consumer stopped early (e.g. judge early-exit / generator
+                # closed). Terminate the subprocess and drop the stderr drain so
+                # it isn't left pending when control doesn't return below.
+                if proc.returncode is None:
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except (asyncio.TimeoutError, ProcessLookupError):
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.kill()
+                stderr_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stderr_task
 
-        stderr = (await proc.stderr.read()).decode("utf-8", errors="replace") if proc.stderr else ""
+        try:
+            stderr = (await stderr_task).decode("utf-8", errors="replace")
+        except Exception:
+            stderr = ""
         rc = await proc.wait()
         if rc != 0 and not is_error:
             is_error = True
@@ -177,16 +214,32 @@ class CodexEngine(Engine):
         ]
         if spec.extra.get("codex_multi_agent"):
             common += ["-c", "features.multi_agent=true"]
+        if spec.sandbox_workspace_network_access is not None:
+            value = "true" if spec.sandbox_workspace_network_access else "false"
+            common += ["-c", f"sandbox_workspace_write.network_access={value}"]
+        _upstream_base, env_key, provider_id = codex_upstream(spec.provider, spec.base_url)
         if spec.capture_base_url:
-            # Route through the capture proxy via a custom model provider.
-            # The built-in `openai` provider cannot be overridden, so we define
-            # `proxy` and select it. Uses API-key auth (OPENAI_API_KEY).
+            # Route through the capture proxy via a custom model provider. The
+            # built-in providers cannot be overridden, so we define `proxy` and
+            # select it. Auth uses the upstream env key (OPENAI_API_KEY or
+            # OPENROUTER_API_KEY); the proxy forwards the Authorization header on.
             common += [
                 "-c", 'model_providers.proxy.name="proxy"',
                 "-c", f'model_providers.proxy.base_url="{spec.capture_base_url}"',
-                "-c", 'model_providers.proxy.env_key="OPENAI_API_KEY"',
+                "-c", f'model_providers.proxy.env_key="{env_key}"',
                 "-c", 'model_providers.proxy.wire_api="responses"',
                 "-c", 'model_provider="proxy"',
+            ]
+        elif provider_id == "openrouter":
+            # Define a custom OpenRouter provider and select it. wire_api must be
+            # "responses" — Codex's chat/completions path was removed in Feb 2026,
+            # and the reserved `openai` provider id cannot be repointed.
+            common += [
+                "-c", 'model_providers.openrouter.name="OpenRouter"',
+                "-c", f'model_providers.openrouter.base_url="{_upstream_base}"',
+                "-c", 'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
+                "-c", 'model_providers.openrouter.wire_api="responses"',
+                "-c", 'model_provider="openrouter"',
             ]
         if spec.resume_rollout_path:
             # Replay: resume from a specific (truncated) rollout file.

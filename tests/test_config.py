@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from harness.config import (
     AgentConfig,
+    HookCommandConfig,
     RunConfig,
     SessionConfig,
     SessionMode,
@@ -181,6 +182,67 @@ class TestRunConfigValidation:
         )
         assert len(rc.agents) == 1
         assert rc.agents[0].name == "explorer"
+
+    def test_with_lifecycle_hooks(self):
+        rc = RunConfig.model_validate(
+            _minimal(
+                pre_run_commands=[{"command": "echo pre", "cwd": "."}],
+                post_run_commands=[
+                    {"command": "echo post", "timeout_seconds": 5, "check": False}
+                ],
+            )
+        )
+        assert isinstance(rc.pre_run_commands[0], HookCommandConfig)
+        assert rc.pre_run_commands[0].command == "echo pre"
+        assert rc.post_run_commands[0].check is False
+
+    def test_with_codex_goal_token_budget(self):
+        rc = RunConfig.model_validate(
+            _minimal(
+                engine="codex",
+                model="gpt-5.4",
+                codex_goal_token_budget=6000,
+                codex_goal_objective="Find the scoped vulnerability.",
+            )
+        )
+        assert rc.codex_goal_token_budget == 6000
+        assert rc.codex_goal_objective == "Find the scoped vulnerability."
+
+    def test_codex_goal_token_budget_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            RunConfig.model_validate(_minimal(engine="codex", codex_goal_token_budget=0))
+
+    def test_with_workspace_network_access_override(self):
+        rc = RunConfig.model_validate(
+            _minimal(engine="codex", sandbox_workspace_network_access=True)
+        )
+        assert rc.sandbox_workspace_network_access is True
+
+    def test_codex_provider_defaults_to_openai(self):
+        rc = RunConfig.model_validate(_minimal(engine="codex", model="gpt-5.4"))
+        assert rc.provider == "openai"
+
+    def test_codex_openrouter_provider(self):
+        rc = RunConfig.model_validate(
+            _minimal(
+                engine="codex",
+                provider="openrouter",
+                model="openai/gpt-5.3-codex",
+            )
+        )
+        assert rc.provider == "openrouter"
+
+    def test_codex_openrouter_requires_slug_prefix(self):
+        with pytest.raises(ValidationError):
+            RunConfig.model_validate(
+                _minimal(engine="codex", provider="openrouter", model="gpt-5.3-codex")
+            )
+
+    def test_codex_rejects_unsupported_provider(self):
+        with pytest.raises(ValidationError):
+            RunConfig.model_validate(
+                _minimal(engine="codex", provider="anthropic", model="gpt-5.4")
+            )
 
 
 # ---------------------------------------------------------------------------

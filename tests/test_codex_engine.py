@@ -6,11 +6,18 @@ These are pure translation tests — no subprocess, no network.
 from __future__ import annotations
 
 from harness.atif_adapter import ATIFAdapter
-from harness.engines.codex import CodexEngine
+from harness.engines.base import EngineRunSpec
+from harness.engines.codex import CodexEngine, codex_upstream
 
 
 def _engine():
     return CodexEngine()
+
+
+def _spec(**overrides) -> EngineRunSpec:
+    base = {"prompt": "hi", "model": "gpt-5-codex", "cwd": "/w"}
+    base.update(overrides)
+    return EngineRunSpec(**base)
 
 
 class TestItemTranslation:
@@ -89,6 +96,57 @@ class TestSubagentSpawnTracking:
         assert "apple" in ev.inline_results[0].content
         # wait does not register a new spawn
         assert eng._spawns == []
+
+
+class TestUpstreamResolution:
+    def test_default_is_openai(self):
+        base, env_key, pid = codex_upstream(None, None)
+        assert base == "https://api.openai.com/v1"
+        assert env_key == "OPENAI_API_KEY"
+        assert pid == "openai"
+
+    def test_openrouter(self):
+        base, env_key, pid = codex_upstream("openrouter", None)
+        assert base == "https://openrouter.ai/api/v1"
+        assert env_key == "OPENROUTER_API_KEY"
+        assert pid == "openrouter"
+
+    def test_base_url_override(self):
+        base, _, _ = codex_upstream("openrouter", "https://example.test/v1")
+        assert base == "https://example.test/v1"
+
+
+class TestArgvConstruction:
+    def test_openrouter_provider_block(self):
+        argv = _engine()._build_argv(
+            _spec(provider="openrouter", model="openai/gpt-5.3-codex"), "do it"
+        )
+        joined = " ".join(argv)
+        assert 'model_provider="openrouter"' in joined
+        assert 'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"' in joined
+        assert 'model_providers.openrouter.env_key="OPENROUTER_API_KEY"' in joined
+        assert 'model_providers.openrouter.wire_api="responses"' in joined
+
+    def test_openai_has_no_custom_provider_block(self):
+        argv = _engine()._build_argv(_spec(provider="openai"), "do it")
+        joined = " ".join(argv)
+        assert "model_provider=" not in joined
+        assert "model_providers" not in joined
+
+    def test_capture_uses_openrouter_env_key(self):
+        argv = _engine()._build_argv(
+            _spec(
+                provider="openrouter",
+                model="openai/gpt-5.3-codex",
+                capture_base_url="http://127.0.0.1:9999",
+            ),
+            "do it",
+        )
+        joined = " ".join(argv)
+        # Capture routes through the proxy provider, not the openrouter block.
+        assert 'model_provider="proxy"' in joined
+        assert 'model_providers.proxy.env_key="OPENROUTER_API_KEY"' in joined
+        assert 'model_providers.openrouter' not in joined
 
 
 class TestUsageNormalization:
