@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.uuid_map import TurnMapping, build_uuid_map
+from harness.uuid_map import build_uuid_map
 
 
 def _write_jsonl(path: Path, entries: list[dict]) -> None:

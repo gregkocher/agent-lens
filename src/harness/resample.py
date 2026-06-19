@@ -57,13 +57,22 @@ def _load_headers(raw_dumps_dir: Path, request_index: int) -> dict:
 
 
 
+def _detect_format(target_url: str, request_data: dict) -> str:
+    """Classify a captured request as anthropic or openai_responses."""
+    if "/responses" in (target_url or ""):
+        return "openai_responses"
+    if "input" in request_data and "messages" not in request_data:
+        return "openai_responses"
+    return "anthropic"
+
+
 def _build_headers(
-    captured_headers: dict[str, str], api_key: str, target_url: str
+    captured_headers: dict[str, str], api_key: str, target_url: str, fmt: str = "anthropic"
 ) -> dict[str, str]:
     """Build replay headers from captured headers, replacing auth."""
     headers = {**captured_headers}
-    # Use the right auth header for the target
-    if "openrouter.ai" in target_url:
+    # Use the right auth header for the target/format
+    if fmt == "openai_responses" or "openrouter.ai" in target_url or "openai.com" in target_url:
         headers["Authorization"] = f"Bearer {api_key}"
         headers.pop("x-api-key", None)
     else:
@@ -100,11 +109,16 @@ def _resolve_api_config(raw_dumps_dir: Path, request_index: int) -> tuple[str, d
     return target_url, captured_headers
 
 
-def _resolve_api_key(target_url: str) -> str:
-    """Resolve the API key based on the target URL."""
+def _resolve_api_key(target_url: str, fmt: str = "anthropic") -> str:
+    """Resolve the API key based on the target URL / format."""
     import os
 
-    if "openrouter.ai" in target_url:
+    if fmt == "openai_responses" or "openai.com" in target_url:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            typer.echo("Error: OPENAI_API_KEY not set", err=True)
+            raise typer.Exit(1)
+    elif "openrouter.ai" in target_url:
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
             typer.echo("Error: OPENROUTER_API_KEY not set", err=True)
@@ -128,15 +142,29 @@ async def _call_api(url: str, headers: dict[str, str], request_data: dict) -> di
 def _prepare_request(
     request_data: dict,
     model_override: str | None = None,
+    fmt: str = "anthropic",
 ) -> dict:
     """Apply standard modifications to a request before resampling."""
     request_data["stream"] = False
-    # Remove SDK-specific fields that aren't part of the public API
-    for key in ("context_management", "metadata"):
-        request_data.pop(key, None)
+    if fmt == "anthropic":
+        # Remove SDK-specific fields that aren't part of the public API
+        for key in ("context_management", "metadata"):
+            request_data.pop(key, None)
     if model_override:
         request_data["model"] = model_override
     return request_data
+
+
+def _summarize_response(response: dict, fmt: str) -> tuple[list[str], object]:
+    """Return (block_types, output_token_count) for console output."""
+    usage = response.get("usage", {})
+    if fmt == "openai_responses":
+        block_types = [b.get("type", "?") for b in response.get("output", [])]
+        out_tokens = usage.get("output_tokens", "?")
+    else:
+        block_types = [b.get("type", "?") for b in response.get("content", [])]
+        out_tokens = usage.get("output_tokens", "?")
+    return block_types, out_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +202,10 @@ def list_requests(
             with open(req_path) as f:
                 data = json.load(f)
             model = data.get("model", "?")
-            messages = data.get("messages", [])
+            fmt = _detect_format("", data)
+            messages = data.get("input", []) if fmt == "openai_responses" else data.get("messages", [])
+            if not isinstance(messages, list):
+                messages = []
             msg_count = len(messages)
 
             # Summarize the last user message
@@ -240,7 +271,8 @@ def dump_request(
     session_dir = resolve_session_dir(run_dir, session_index, replicate)
     raw_dumps_dir = session_dir / "raw_dumps"
     request_data = _load_request(raw_dumps_dir, request_index)
-    return _prepare_request(request_data)
+    fmt = _detect_format("", request_data)
+    return _prepare_request(request_data, fmt=fmt)
 
 
 # ---------------------------------------------------------------------------
@@ -264,11 +296,12 @@ async def run_resample(
 
     request_data = _load_request(raw_dumps_dir, request_index)
     target_url, captured_headers = _resolve_api_config(raw_dumps_dir, request_index)
+    fmt = _detect_format(target_url, request_data)
 
-    _prepare_request(request_data, model_override)
+    _prepare_request(request_data, model_override, fmt)
 
-    api_key = _resolve_api_key(target_url)
-    headers = _build_headers(captured_headers, api_key, target_url)
+    api_key = _resolve_api_key(target_url, fmt)
+    headers = _build_headers(captured_headers, api_key, target_url, fmt)
 
     # Output directory
     resample_dir = session_dir / "resamples" / f"request_{request_index:03d}"
@@ -290,10 +323,7 @@ async def run_resample(
             with open(sample_path, "w") as f:
                 json.dump(response, f, indent=2)
 
-            content = response.get("content", [])
-            block_types = [b.get("type", "?") for b in content]
-            usage = response.get("usage", {})
-            out_tokens = usage.get("output_tokens", "?")
+            block_types, out_tokens = _summarize_response(response, fmt)
             typer.echo(f"  Sample {sample_num}... done ({out_tokens} tokens, blocks: {block_types})")
 
         except httpx.HTTPStatusError as e:
@@ -360,16 +390,18 @@ async def run_variant_resample(
 
     # Resolve API config from the original request headers
     target_url, captured_headers = _resolve_api_config(raw_dumps_dir, request_index)
+    fmt = _detect_format(target_url, edited_request)
 
     # Clean up edited request for API compatibility
-    for key in ("context_management", "metadata"):
-        edited_request.pop(key, None)
+    if fmt == "anthropic":
+        for key in ("context_management", "metadata"):
+            edited_request.pop(key, None)
     if model_override:
         edited_request["model"] = model_override
     edited_request["stream"] = False
 
-    api_key = _resolve_api_key(target_url)
-    headers = _build_headers(captured_headers, api_key, target_url)
+    api_key = _resolve_api_key(target_url, fmt)
+    headers = _build_headers(captured_headers, api_key, target_url, fmt)
 
     # Create variant directory
     variant_id = _next_variant_id(session_dir, request_index)
@@ -403,10 +435,7 @@ async def run_variant_resample(
             with open(sample_path, "w") as f:
                 json.dump(response, f, indent=2)
 
-            content = response.get("content", [])
-            block_types = [b.get("type", "?") for b in content]
-            usage = response.get("usage", {})
-            out_tokens = usage.get("output_tokens", "?")
+            block_types, out_tokens = _summarize_response(response, fmt)
             typer.echo(f"  Sample {sample_num}... done ({out_tokens} tokens, blocks: {block_types})")
 
         except httpx.HTTPStatusError as e:

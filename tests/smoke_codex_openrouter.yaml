@@ -1,0 +1,21 @@
+engine: codex
+provider: openrouter
+model: "qwen/qwen3-coder"       # non-OpenAI model via OpenRouter (exact slug)
+sandbox_mode: workspace-write
+work_dir: "./repos/codex_or_test"
+session_mode: isolated
+tags: ["smoke-test", "codex", "openrouter", "qwen"]
+
+system_prompt: |
+  You are exploring a small Python project. Use MEMORY.md to keep notes.
+
+max_turns: 8
+permission_mode: bypassPermissions
+memory_seed: "# Project Notes\n"
+
+# Exercise the OpenRouter capture path (proxy forwards OPENROUTER_API_KEY upstream).
+capture_api_requests: true
+
+sessions:
+  - session_index: 1
+    prompt: "Read main.py, then write a one-paragraph summary of what it does to MEMORY.md."

@@ -18,6 +18,7 @@ harness run <config.yaml> [OPTIONS]
 | `--run-name TEXT` | Custom name for the run directory |
 | `--runs-dir PATH` | Output directory (default: `runs`) |
 | `--no-capture` | Disable API request capture (disables resampling) |
+| `--codex-goal-token-budget INT` | Codex only: ask Codex to `create_goal` with this token budget before substantive work |
 
 **Examples:**
 

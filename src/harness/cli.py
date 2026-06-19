@@ -38,6 +38,10 @@ def run(
     run_name: Annotated[Optional[str], typer.Option(help="Custom run name")] = None,
     runs_dir: Annotated[Path, typer.Option(help="Output directory")] = Path("runs"),
     no_capture: Annotated[bool, typer.Option(help="Disable API request capture (disables resampling)")] = False,
+    codex_goal_token_budget: Annotated[
+        Optional[int],
+        typer.Option(help="Ask Codex to create a goal with this token budget"),
+    ] = None,
 ) -> None:
     """Run a multi-session experiment from a config file."""
     config = load_config(config_path)
@@ -52,6 +56,8 @@ def run(
         config.run_name = run_name
     if no_capture:
         config.capture_api_requests = False
+    if codex_goal_token_budget is not None:
+        config.codex_goal_token_budget = codex_goal_token_budget
 
     from harness.experiment import run_experiment
 
@@ -95,6 +101,7 @@ def list_runs(
             if output_json:
                 json_entries.append({
                     "run_name": d.name,
+                    "engine": meta.get("engine", "claude_code"),
                     "model": meta.get("model"),
                     "session_mode": meta.get("session_mode"),
                     "session_count": meta.get("session_count"),
@@ -106,6 +113,7 @@ def list_runs(
             else:
                 sessions = meta.get("session_count", "?")
                 mode = meta.get("session_mode", "?")
+                engine = meta.get("engine", "claude_code")
                 model_name = meta.get("model", "?")
                 steps = meta.get("total_steps", "?")
                 cost = meta.get("total_cost_usd")
@@ -113,7 +121,7 @@ def list_runs(
                 errors = len(meta.get("errors", []))
                 err_str = f" [{errors} errors]" if errors else ""
                 typer.echo(
-                    f"  {d.name}  |  {model_name}  |  {mode}  |  "
+                    f"  {d.name}  |  {engine}  |  {model_name}  |  {mode}  |  "
                     f"{sessions} sessions, {steps} steps  |  {cost_str}{err_str}"
                 )
         elif not output_json:
@@ -157,6 +165,7 @@ def inspect(
         return
 
     typer.echo(f"Run: {meta['run_name']}")
+    typer.echo(f"Engine: {meta.get('engine', 'claude_code')}")
     typer.echo(f"Model: {meta['model']} ({meta.get('provider', 'unknown')})")
     typer.echo(f"Mode: {meta['session_mode']}")
     typer.echo(f"Tags: {', '.join(meta.get('tags', []))}")
@@ -174,6 +183,12 @@ def inspect(
     if subagents:
         typer.echo(f"Subagent invocations: {subagents}")
 
+    flagged = meta.get("judge_flagged_sessions", 0)
+    if flagged:
+        early = meta.get("judge_early_exits", 0)
+        early_str = f", {early} early exit{'s' if early != 1 else ''}" if early else ""
+        typer.echo(f"Judge flagged: {flagged} session{'s' if flagged != 1 else ''}{early_str}")
+
     typer.echo(f"File writes: {meta['total_file_writes']}")
     typer.echo("")
 
@@ -190,10 +205,13 @@ def inspect(
         err_str = f"  ERROR: {error[:80]}" if error else ""
         sub_count = s.get("subagent_count", 0)
         sub_str = f", {sub_count} subagents" if sub_count else ""
+        judge_str = ""
+        if s.get("judge_flagged"):
+            judge_str = " ⚑ flagged" + (" (early exit)" if s.get("judge_early_exit") else "")
 
         typer.echo(
             f"  Session {idx}: {steps} steps, {tools} tool calls"
-            f"{cost_str}{sub_str}{resume_str}{err_str}"
+            f"{cost_str}{sub_str}{judge_str}{resume_str}{err_str}"
         )
 
     if changelog_events:
@@ -335,7 +353,6 @@ def replay(
         harness replay runs/my-run --session 1 --turn 5 --prompt "Try a different approach"
     """
     from harness.replay import run_replay
-    from harness.transcript import list_turns as _list_turns
 
     if list_turns:
         # Load transcript and uuid_map for turn listing
@@ -351,7 +368,14 @@ def replay(
             with open(uuid_map_path) as f:
                 uuid_map = json.load(f)
 
-        summaries = _list_turns(transcript_path, uuid_map)
+        # Dispatch to the engine-appropriate transcript parser.
+        engine = _run_engine(run_dir)
+        if engine == "codex":
+            from harness.transcript_codex import list_codex_turns
+            summaries = list_codex_turns(transcript_path, uuid_map)
+        else:
+            from harness.transcript import list_turns as _list_turns
+            summaries = _list_turns(transcript_path, uuid_map)
         typer.echo(f"Turns in session {session} ({len(summaries)} total):\n")
         for s in summaries:
             tools = ", ".join(s.tool_names[:5]) if s.tool_names else "(no tools)"
@@ -366,7 +390,7 @@ def replay(
         typer.echo("Error: --turn is required (use --list-turns to see available turns)", err=True)
         raise typer.Exit(1)
 
-    new_dirs = asyncio.run(run_replay(
+    asyncio.run(run_replay(
         source_run_dir=run_dir,
         session_index=session,
         turn_index=turn,
@@ -375,6 +399,18 @@ def replay(
         continue_sessions=continue_sessions,
         output_base=runs_dir,
     ))
+
+
+def _run_engine(run_dir: Path) -> str:
+    """Read the engine for a run from run_meta.json (default claude_code)."""
+    meta_path = run_dir / "run_meta.json"
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                return json.load(f).get("engine", "claude_code")
+        except Exception:
+            pass
+    return "claude_code"
 
 
 def _find_replay_session_dir(run_dir: Path, session_index: int, replicate: int | None = None) -> Path:

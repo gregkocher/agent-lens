@@ -10,18 +10,58 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
 from datetime import datetime, timezone
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
 import yaml
 
-from harness.config import RunConfig, SessionMode
+from harness.config import HookCommandConfig, RunConfig, SessionMode
 from harness.runner import SessionResult, run_session
 from harness.shadow_git import ShadowGit
 from harness.state import StateManager
 
 logger = logging.getLogger(__name__)
+
+
+def _run_hook_commands(
+    commands: list[HookCommandConfig],
+    *,
+    run_dir: Path,
+    work_dir: Path,
+    phase: str,
+) -> None:
+    """Run configured shell hooks with run/work directory env variables."""
+    if not commands:
+        return
+
+    env = {
+        **os.environ,
+        "HARNESS_RUN_DIR": str(run_dir.resolve()),
+        "HARNESS_WORK_DIR": str(work_dir.resolve()),
+    }
+    for index, hook in enumerate(commands, 1):
+        cwd = Path(hook.cwd).resolve() if hook.cwd else Path.cwd()
+        print(f"[{phase} {index}/{len(commands)}] {hook.command}")
+        try:
+            subprocess.run(
+                hook.command,
+                cwd=cwd,
+                env=env,
+                shell=True,
+                check=hook.check,
+                timeout=hook.timeout_seconds,
+            )
+        except subprocess.CalledProcessError:
+            if hook.check:
+                raise
+            logger.exception("%s hook failed but check=false", phase)
+        except subprocess.TimeoutExpired:
+            if hook.check:
+                raise
+            logger.exception("%s hook timed out but check=false", phase)
 
 
 async def run_experiment(config: RunConfig, output_base: Path | None = None) -> Path:
@@ -30,9 +70,13 @@ async def run_experiment(config: RunConfig, output_base: Path | None = None) -> 
     Returns:
         Path to the run directory.
     """
+    from harness.runner import install_quiet_exception_handler
+
+    install_quiet_exception_handler()
+
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
     model_slug = config.model.replace("/", "_").replace(":", "_")
-    run_name = config.run_name or f"{timestamp}_{model_slug}"
+    run_name = config.run_name or f"{timestamp}_{config.engine}_{model_slug}"
 
     base = output_base or Path("runs")
     run_dir = base / run_name
@@ -59,6 +103,13 @@ async def run_experiment(config: RunConfig, output_base: Path | None = None) -> 
     # Commit baseline (captures full working directory state)
     shadow_git.commit_baseline()
 
+    _run_hook_commands(
+        config.pre_run_commands,
+        run_dir=run_dir,
+        work_dir=work_dir,
+        phase="pre-run",
+    )
+
     # Run sessions
     results: list[SessionResult] = []
     # Track session_id by index for fork_from lookups
@@ -66,131 +117,143 @@ async def run_experiment(config: RunConfig, output_base: Path | None = None) -> 
     # Track how many sessions have forked from each fork point (for reset logic)
     fork_counts: dict[int | None, int] = {}
 
-    for sc in sorted(config.sessions, key=lambda s: s.session_index):
-        replicates = sc.count or 1
+    try:
+        for sc in sorted(config.sessions, key=lambda s: s.session_index):
+            replicates = sc.count or 1
 
-        for rep in range(1, replicates + 1):
-            # Directory naming: _rNN suffix only when count > 1
-            if replicates == 1:
-                session_dir = run_dir / f"session_{sc.session_index:02d}"
-            else:
-                session_dir = run_dir / f"session_{sc.session_index:02d}_r{rep:02d}"
+            for rep in range(1, replicates + 1):
+                # Directory naming: _rNN suffix only when count > 1
+                if replicates == 1:
+                    session_dir = run_dir / f"session_{sc.session_index:02d}"
+                else:
+                    session_dir = run_dir / f"session_{sc.session_index:02d}_r{rep:02d}"
 
-            # Determine resume behavior
-            resume_id: str | None = None
-            fork = False
-            fork_from = sc.fork_from
+                # Determine resume behavior
+                resume_id: str | None = None
+                fork = False
+                fork_from = sc.fork_from
 
-            if fork_from is not None:
-                # Explicit fork_from overrides session_mode
-                resume_id = session_ids.get(fork_from)
-                fork = True
-                if not resume_id:
-                    logger.warning(
-                        "Cannot fork session %d from %d: no session_id available. "
-                        "Running isolated.",
-                        sc.session_index,
-                        fork_from,
-                    )
-                    fork = False
-            elif config.session_mode == SessionMode.CHAINED and results:
-                resume_id = results[-1].session_id
-                if resume_id is None:
-                    logger.warning(
-                        "Cannot chain session %d: previous session returned no session_id. "
-                        "Falling back to isolated.",
-                        sc.session_index,
-                    )
-            elif config.session_mode == SessionMode.FORKED and session_ids.get(1):
-                resume_id = session_ids[1]
-                fork = True
+                if fork_from is not None:
+                    # Explicit fork_from overrides session_mode
+                    resume_id = session_ids.get(fork_from)
+                    fork = True
+                    if not resume_id:
+                        logger.warning(
+                            "Cannot fork session %d from %d: no session_id available. "
+                            "Running isolated.",
+                            sc.session_index,
+                            fork_from,
+                        )
+                        fork = False
+                elif config.session_mode == SessionMode.CHAINED and results:
+                    resume_id = results[-1].session_id
+                    if resume_id is None:
+                        logger.warning(
+                            "Cannot chain session %d: previous session returned no session_id. "
+                            "Falling back to isolated.",
+                            sc.session_index,
+                        )
+                elif config.session_mode == SessionMode.FORKED and session_ids.get(1):
+                    resume_id = session_ids[1]
+                    fork = True
 
-            # Determine if we need to reset the working directory.
-            # Only needed for forked sessions when a sibling has already run
-            # and modified the working directory since the fork point.
-            effective_fork_from = fork_from
-            if effective_fork_from is None and config.session_mode == SessionMode.FORKED:
-                effective_fork_from = 1  # default fork point
-            needs_reset = False
-            if fork or config.session_mode == SessionMode.FORKED:
-                fork_key = effective_fork_from
-                fork_counts[fork_key] = fork_counts.get(fork_key, 0) + 1
-                if fork_counts[fork_key] > 1 or rep > 1:
-                    needs_reset = True
+                # Determine if we need to reset the working directory.
+                # Only needed for forked sessions when a sibling has already run
+                # and modified the working directory since the fork point.
+                effective_fork_from = fork_from
+                if effective_fork_from is None and config.session_mode == SessionMode.FORKED:
+                    effective_fork_from = 1  # default fork point
+                needs_reset = False
+                if fork or config.session_mode == SessionMode.FORKED:
+                    fork_key = effective_fork_from
+                    fork_counts[fork_key] = fork_counts.get(fork_key, 0) + 1
+                    if fork_counts[fork_key] > 1 or rep > 1:
+                        needs_reset = True
 
-            shadow_git.begin_session(
-                sc.session_index,
-                config.session_mode,
-                fork_from=effective_fork_from,
-                needs_reset=needs_reset,
-            )
-
-            # Log
-            mode_desc = config.session_mode.value
-            resume_desc = f", resume={resume_id}" if resume_id else ""
-            fork_desc = ", fork=True" if fork else ""
-            rep_desc = f" r{rep}/{replicates}" if replicates > 1 else ""
-            fork_from_desc = f", fork_from={fork_from}" if fork_from is not None else ""
-            print(
-                f"[session {sc.session_index}{rep_desc}] starting "
-                f"(mode={mode_desc}{fork_from_desc}{resume_desc}{fork_desc})..."
-            )
-
-            try:
-                result = await run_session(
-                    session_config=sc,
-                    run_config=config,
-                    session_dir=session_dir,
-                    state_manager=state,
-                    resume_session_id=resume_id,
-                    fork=fork,
-                )
-            except Exception as e:
-                logger.exception("Session %d crashed", sc.session_index)
-                result = SessionResult(
-                    session_index=sc.session_index,
-                    error=f"CRASHED: {e}",
-                    started_at=datetime.now(timezone.utc).isoformat(),
-                    finished_at=datetime.now(timezone.utc).isoformat(),
+                shadow_git.begin_session(
+                    sc.session_index,
+                    config.session_mode,
+                    fork_from=effective_fork_from,
+                    needs_reset=needs_reset,
                 )
 
-            # Finalize session in shadow git (commit + tag)
-            replicate_num = rep if replicates > 1 else None
-            shadow_git.end_session(sc.session_index, replicate=replicate_num)
+                # Log
+                mode_desc = config.session_mode.value
+                resume_desc = f", resume={resume_id}" if resume_id else ""
+                fork_desc = ", fork=True" if fork else ""
+                rep_desc = f" r{rep}/{replicates}" if replicates > 1 else ""
+                fork_from_desc = f", fork_from={fork_from}" if fork_from is not None else ""
+                print(
+                    f"[session {sc.session_index}{rep_desc}] starting "
+                    f"(mode={mode_desc}{fork_from_desc}{resume_desc}{fork_desc})..."
+                )
 
-            # Save session diff as artifact
-            session_diff = shadow_git.get_session_diff(
-                sc.session_index, config.session_mode, fork_from=fork_from
-            )
-            (session_dir / "session_diff.patch").write_text(session_diff or "# No changes\n")
+                try:
+                    result = await run_session(
+                        session_config=sc,
+                        run_config=config,
+                        session_dir=session_dir,
+                        state_manager=state,
+                        resume_session_id=resume_id,
+                        fork=fork,
+                    )
+                except Exception as e:
+                    logger.exception("Session %d crashed", sc.session_index)
+                    result = SessionResult(
+                        session_index=sc.session_index,
+                        error=f"CRASHED: {e}",
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        finished_at=datetime.now(timezone.utc).isoformat(),
+                    )
 
-            # Attach fork/replicate metadata
-            result.fork_from = fork_from
-            if replicates > 1:
-                result.replicate = rep
-                result.replicate_count = replicates
+                # Finalize session in shadow git (commit + tag)
+                replicate_num = rep if replicates > 1 else None
+                shadow_git.end_session(sc.session_index, replicate=replicate_num)
 
-            results.append(result)
+                # Save session diff as artifact
+                session_diff = shadow_git.get_session_diff(
+                    sc.session_index, config.session_mode, fork_from=fork_from
+                )
+                (session_dir / "session_diff.patch").write_text(session_diff or "# No changes\n")
 
-            # Store session_id from first replicate for downstream fork_from references
-            if rep == 1 and result.session_id:
-                session_ids[sc.session_index] = result.session_id
+                # Attach fork/replicate metadata
+                result.fork_from = fork_from
+                if replicates > 1:
+                    result.replicate = rep
+                    result.replicate_count = replicates
 
-            status = "ERROR" if result.error else "done"
-            cost_str = f", ${result.total_cost_usd:.4f}" if result.total_cost_usd is not None else ""
-            compact_str = (
-                f", {result.compaction_count} compactions" if result.compaction_count else ""
-            )
-            subagent_str = (
-                f", {result.subagent_count} subagents" if result.subagent_count else ""
-            )
-            print(
-                f"[session {sc.session_index}{rep_desc}] {status} -- "
-                f"{result.step_count} steps, {result.tool_call_count} tool calls"
-                f"{cost_str}{compact_str}{subagent_str}"
-            )
-            if result.error:
-                print(f"  error: {result.error[:200]}")
+                results.append(result)
+
+                # Store session_id from first replicate for downstream fork_from references
+                if rep == 1 and result.session_id:
+                    session_ids[sc.session_index] = result.session_id
+
+                status = "ERROR" if result.error else "done"
+                cost_str = (
+                    f", ${result.total_cost_usd:.4f}"
+                    if result.total_cost_usd is not None
+                    else ""
+                )
+                compact_str = (
+                    f", {result.compaction_count} compactions" if result.compaction_count else ""
+                )
+                subagent_str = (
+                    f", {result.subagent_count} subagents" if result.subagent_count else ""
+                )
+                print(
+                    f"[session {sc.session_index}{rep_desc}] {status} -- "
+                    f"{result.step_count} steps, {result.tool_call_count} tool calls"
+                    f"{cost_str}{compact_str}{subagent_str}"
+                )
+                if result.error:
+                    print(f"  error: {result.error[:200]}")
+    finally:
+        _run_hook_commands(
+            config.post_run_commands,
+            run_dir=run_dir,
+            work_dir=work_dir,
+            phase="post-run",
+        )
 
     # Save full diff (baseline → final state)
     full_diff = shadow_git.diff_from_ref("baseline")
@@ -228,6 +291,7 @@ def _build_run_meta(
     return {
         "run_name": run_name,
         "hypothesis": config.hypothesis,
+        "engine": config.engine,
         "model": config.model,
         "provider": config.provider,
         "sdk_version": _get_version("claude-agent-sdk"),
@@ -251,6 +315,9 @@ def _build_run_meta(
                 "total_cost_usd": r.total_cost_usd,
                 "compaction_count": r.compaction_count,
                 "subagent_count": r.subagent_count,
+                **({"judge_flagged": r.judge_flagged} if r.judge_verdict_count else {}),
+                **({"judge_early_exit": r.judge_early_exit} if r.judge_early_exit else {}),
+                **({"judge_verdict_count": r.judge_verdict_count} if r.judge_verdict_count else {}),
                 "error": r.error,
                 "started_at": r.started_at,
                 "finished_at": r.finished_at,
@@ -269,5 +336,7 @@ def _build_run_meta(
         "total_file_writes": len(state.write_log),
         "total_compaction_events": sum(r.compaction_count for r in results),
         "total_subagent_invocations": sum(r.subagent_count for r in results),
+        "judge_flagged_sessions": sum(1 for r in results if r.judge_flagged),
+        "judge_early_exits": sum(1 for r in results if r.judge_early_exit),
         "errors": [r.error for r in results if r.error],
     }

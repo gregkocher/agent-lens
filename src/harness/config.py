@@ -15,6 +15,8 @@ __all__ = [
     "SessionMode",
     "SessionConfig",
     "AgentConfig",
+    "JudgeConfig",
+    "HookCommandConfig",
     "RunConfig",
     "load_config",
     "build_provider_env",
@@ -48,6 +50,45 @@ class AgentConfig(BaseModel):
     model: Literal["sonnet", "opus", "haiku", "inherit"] | None = None
 
 
+class JudgeConfig(BaseModel):
+    """Auto-judge: an LLM that evaluates the running trajectory against a rubric.
+
+    The judge runs every ``every_n_turns`` agent turns, sees the trajectory so
+    far, and returns a structured verdict (flagged + reason + confidence). If a
+    verdict is flagged and ``early_exit`` is set, the session stops after the
+    current turn. The judge runs independently of the agent engine, so it can
+    judge both Claude Code and Codex runs.
+    """
+
+    model: str
+    rubric: str  # what to flag — the judge's instructions/criteria
+
+    # backend (configurable: anthropic | openai | openrouter, or a custom
+    # OpenAI-/Anthropic-compatible endpoint via base_url + api_key_env)
+    provider: Literal["anthropic", "openai", "openrouter"] = "anthropic"
+    base_url: str | None = None
+    api_key_env: str | None = None  # override the env var holding the API key
+
+    # cadence + behavior
+    every_n_turns: int = Field(default=5, ge=1)
+    early_exit: bool = False
+
+    # rendering / sampling
+    name: str = "judge"
+    include_reasoning: bool = True  # show the agent's thinking to the judge
+    max_tokens: int = 1024
+    temperature: float = 0.0
+
+
+class HookCommandConfig(BaseModel):
+    """Shell command run before or after an experiment."""
+
+    command: str
+    cwd: str | None = None
+    timeout_seconds: int | None = Field(default=30, ge=1)
+    check: bool = True
+
+
 class RunConfig(BaseModel):
     """Top-level run configuration."""
 
@@ -56,10 +97,28 @@ class RunConfig(BaseModel):
     hypothesis: str | None = None
     tags: list[str] = []
 
+    # engine (which coding-agent runtime executes the session)
+    engine: Literal["claude_code", "codex"] = "claude_code"
+
     # model
     model: str
     provider: str = "anthropic"
     base_url: str | None = None
+
+    # codex sandbox policy (codex engine only)
+    sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] = (
+        "workspace-write"
+    )
+    # Codex workspace-write network access. Leave unset to use Codex defaults.
+    sandbox_workspace_network_access: bool | None = None
+    # codex multi-agent: enable `features.multi_agent` so Codex can spawn
+    # subagents; AgentLens then captures each as a linked subagent trajectory.
+    codex_multi_agent: bool = False
+    # codex goals: when set, AgentLens asks Codex to call create_goal with this
+    # token budget before substantive work. The Codex CLI does not expose this
+    # as an exec flag; the budget lives on the create_goal tool.
+    codex_goal_token_budget: int | None = Field(default=None, gt=0)
+    codex_goal_objective: str | None = None
 
     # working directory
     work_dir: str
@@ -69,6 +128,10 @@ class RunConfig(BaseModel):
     sessions: list[SessionConfig]
     session_mode: SessionMode = SessionMode.ISOLATED
     system_prompt: str | None = None
+
+    # experiment lifecycle hooks
+    pre_run_commands: list[HookCommandConfig] = []
+    post_run_commands: list[HookCommandConfig] = []
 
     # agent options
     allowed_tools: list[str] = Field(
@@ -84,6 +147,9 @@ class RunConfig(BaseModel):
     # subagents
     agents: list[AgentConfig] = []
     capture_subagent_trajectories: bool = True
+
+    # auto-judge (optional)
+    judge: JudgeConfig | None = None
 
     # capture (required for resampling turns)
     capture_api_requests: bool = True
@@ -119,6 +185,33 @@ class RunConfig(BaseModel):
                         f"Session {s.session_index} has fork_from={s.fork_from}, "
                         f"but fork_from must reference an earlier session."
                     )
+
+        # `provider` is a Claude-routing concept; for Codex it selects the model
+        # provider block. The meaningful default is OpenAI; OpenRouter is the
+        # other supported option. Only override when the user didn't set it.
+        if self.engine == "codex":
+            if "provider" not in self.model_fields_set:
+                self.provider = "openai"
+            elif self.provider not in ("openai", "openrouter"):
+                raise ValueError(
+                    "With engine: codex, provider must be 'openai' (default) or "
+                    f"'openrouter'. Got '{self.provider}'."
+                )
+            # OpenRouter requires the exact slug including the vendor prefix
+            # (e.g. 'openai/gpt-5.3-codex'); a bare model id 404s.
+            if self.provider == "openrouter" and "/" not in self.model:
+                raise ValueError(
+                    "With provider: openrouter, model must be a full OpenRouter "
+                    "slug including the vendor prefix (e.g. 'openai/gpt-5.3-codex'). "
+                    f"Got '{self.model}'."
+                )
+
+        # Subagents are a Claude Code feature; Codex has no equivalent.
+        if self.engine == "codex" and self.agents:
+            raise ValueError(
+                "Subagents (`agents:`) are only supported by the claude_code engine. "
+                "Remove `agents:` to run with the codex engine."
+            )
         return self
 
 
@@ -130,10 +223,15 @@ def load_config(path: str | Path) -> RunConfig:
 
 
 def build_provider_env(config: RunConfig) -> dict[str, str]:
-    """Build environment variable dict for ClaudeAgentOptions.env.
+    """Build environment variable dict passed to the engine.
 
     Returns a dict — does NOT mutate os.environ.
     """
+    # Codex authenticates via ~/.codex/auth.json (or OPENAI_API_KEY inherited
+    # from the process env) and does not use the Anthropic provider plumbing.
+    if config.engine == "codex":
+        return {}
+
     env: dict[str, str] = {
         # Unset CLAUDECODE to allow launching from within a Claude Code session
         "CLAUDECODE": "",

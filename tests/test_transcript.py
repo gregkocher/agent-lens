@@ -8,8 +8,6 @@ from pathlib import Path
 import pytest
 
 from harness.transcript import (
-    Turn,
-    TurnSummary,
     get_project_dir,
     list_turns,
     parse_turns,

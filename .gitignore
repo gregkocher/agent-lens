@@ -2,6 +2,7 @@
 /runs_old/
 /repos/
 /experiments/
+/fixtures/
 __pycache__/
 *.pyc
 .venv/

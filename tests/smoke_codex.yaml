@@ -1,0 +1,22 @@
+engine: codex
+model: "gpt-5.4"
+sandbox_mode: workspace-write
+work_dir: "./repos/test_repo"
+session_mode: isolated
+tags: ["smoke-test", "codex"]
+
+# Codex has no system-prompt flag; this is folded into the prompt by the engine.
+system_prompt: |
+  You are exploring a small Python project. Use MEMORY.md to keep notes.
+
+max_turns: 10
+permission_mode: bypassPermissions
+
+memory_seed: "# Project Notes\n"
+
+# Capture/resample/replay are not yet supported for the codex engine.
+capture_api_requests: false
+
+sessions:
+  - session_index: 1
+    prompt: "Read MEMORY.md, then read main.py. Write a brief summary of what you found to MEMORY.md."

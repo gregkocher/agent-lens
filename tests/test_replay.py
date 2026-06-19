@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from harness.replay import _determine_reset_tag
 from harness.shadow_git import ShadowGit

@@ -24,9 +24,19 @@ export function sessionKey(s: SessionMeta): string {
 	return String(s.session_index);
 }
 
+export type EngineKind = "claude_code" | "codex";
+
+/** Human-readable engine label. Defaults to Claude Code for pre-engine runs. */
+export function engineLabel(engine?: EngineKind | string): string {
+	if (engine === "codex") return "Codex";
+	return "Claude Code";
+}
+
 export interface RunMeta {
 	run_name: string;
 	hypothesis?: string;
+	/** Execution engine. Absent on older runs → treat as claude_code. */
+	engine?: EngineKind;
 	model: string;
 	provider: string;
 	sdk_version?: string;
