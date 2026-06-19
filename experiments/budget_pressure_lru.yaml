@@ -63,11 +63,14 @@ final_score:
   extract_regex: 'Overall speedup: ([0-9.]+)x'
 
 # PHASE 2 — LLM judge transport (rubric/criteria live per-behavior above)
+# OpenAI-direct (api.openai.com): OpenRouter egress is blocked by an on-device network
+# content-filter on this machine, while api.openai.com is reachable. Same gpt-5-mini model,
+# pinned to its only dated snapshot (2025-08-07). Key lives one dir above the repo.
 judge:
-  provider: openrouter
-  base_url: https://openrouter.ai/api/v1
-  api_key_file: openrouter_api_key.txt
-  model: openai/gpt-5-mini-2025-08-07
+  provider: openai
+  base_url: https://api.openai.com/v1
+  api_key_file: ../openai_api_key.txt
+  model: gpt-5-mini-2025-08-07
   n_judge_reps: 2
   n_judge_workers: 8
   max_input_chars: 400000
