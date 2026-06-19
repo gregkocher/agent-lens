@@ -64,7 +64,6 @@ def _parse_sse_response(body: bytes) -> dict:
                 result["response_model"] = msg["model"]
 
         elif event_type == "message_delta":
-            delta = data.get("delta", {})
             usage = data.get("usage")
             if usage:
                 result["usage_delta"] = usage
@@ -75,8 +74,55 @@ def _parse_sse_response(body: bytes) -> dict:
     return result
 
 
+def _parse_openai_responses_sse(body: bytes) -> dict:
+    """Parse SSE events from an OpenAI Responses API streaming response.
+
+    Extracts model + usage from the terminal ``response.completed`` (and
+    ``response.incomplete``) events, whose ``response`` object carries the
+    final ``usage`` block.
+    """
+    result: dict = {}
+    text = body.decode("utf-8", errors="replace")
+
+    for block in text.split("\n\n"):
+        data_str = None
+        for line in block.strip().split("\n"):
+            if line.startswith("data: "):
+                data_str = line[6:]
+        if not data_str or data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        etype = data.get("type", "")
+        if etype in ("response.completed", "response.incomplete"):
+            resp = data.get("response", {})
+            if resp.get("model"):
+                result["response_model"] = resp["model"]
+            usage = resp.get("usage")
+            if usage:
+                result["openai_usage"] = usage
+
+    return result
+
+
+def _detect_api_format(path: str) -> str | None:
+    """Classify an API request path. Returns the format key or None."""
+    if "/messages" in path:
+        return "anthropic"
+    if "/responses" in path:
+        return "openai_responses"
+    return None
+
+
 class CaptureProxy:
-    """Reverse proxy that logs API request/response metadata to JSONL."""
+    """Reverse proxy that logs API request/response metadata to JSONL.
+
+    Supports both the Anthropic Messages API (Claude Code engine) and the
+    OpenAI Responses API (Codex engine), detected per-request by path.
+    """
 
     def __init__(self, raw_dump_count: int = 0) -> None:
         self._target_url: str = ""
@@ -128,8 +174,11 @@ class CaptureProxy:
         target = f"{self._target_url}/{request.match_info['path']}"
         body = await request.read()
 
-        # Detect Messages API requests
-        is_messages = request.method == "POST" and "/messages" in request.path
+        # Detect capturable API requests (Anthropic Messages or OpenAI Responses)
+        api_format = (
+            _detect_api_format(request.path) if request.method == "POST" else None
+        )
+        is_api = api_format is not None
 
         # Parse request body (but don't log yet — wait for response)
         request_data: dict | None = None
@@ -137,7 +186,7 @@ class CaptureProxy:
         # concurrent request while we await the response stream below, and the
         # request_NNN/response_NNN pairing must use this request's own index.
         request_index: int | None = None
-        if is_messages and body:
+        if is_api and body:
             try:
                 request_data = json.loads(body)
                 self._request_index += 1
@@ -172,11 +221,11 @@ class CaptureProxy:
                         response.headers[k] = v
                 await response.prepare(request)
 
-                # Stream response body; collect for Messages API requests
+                # Stream response body; collect for capturable API requests
                 response_chunks: list[bytes] = []
                 async for chunk in resp.content.iter_any():
                     await response.write(chunk)
-                    if is_messages:
+                    if is_api:
                         response_chunks.append(chunk)
 
                 await response.write_eof()
@@ -185,8 +234,13 @@ class CaptureProxy:
                 if request_data is not None:
                     try:
                         resp_body = b"".join(response_chunks)
-                        response_meta = _parse_sse_response(resp_body)
-                        self._log_exchange(request_data, response_meta, request_index)
+                        if api_format == "openai_responses":
+                            response_meta = _parse_openai_responses_sse(resp_body)
+                        else:
+                            response_meta = _parse_sse_response(resp_body)
+                        self._log_exchange(
+                            request_data, response_meta, api_format, request_index
+                        )
                     except Exception:
                         logger.exception("Failed to log API exchange")
 
@@ -228,17 +282,34 @@ class CaptureProxy:
 
                 return response
 
-    def _log_exchange(self, request_data: dict, response_meta: dict,
-                      request_index: int | None = None) -> None:
-        """Log combined request + response metadata to JSONL."""
+    def _log_exchange(
+        self,
+        request_data: dict,
+        response_meta: dict,
+        api_format: str | None = None,
+        request_index: int | None = None,
+    ) -> None:
+        """Log combined request + response metadata to JSONL.
+
+        Normalizes both the Anthropic Messages API and the OpenAI Responses API
+        onto a common entry schema (system_prompt, tools, messages, usage).
+        """
         if not self._log_path:
             return
         if request_index is None:
             request_index = self._request_index
 
-        system = request_data.get("system")
-        tools = request_data.get("tools")
-        messages = request_data.get("messages", [])
+        if api_format == "openai_responses":
+            # OpenAI Responses API field names differ from Anthropic's.
+            system = request_data.get("instructions")
+            tools = request_data.get("tools")
+            messages = request_data.get("input", [])
+        else:
+            system = request_data.get("system")
+            tools = request_data.get("tools")
+            messages = request_data.get("messages", [])
+        if not isinstance(messages, list):
+            messages = []
         message_count = len(messages)
 
         system_hash = _hash(system) if system else None
@@ -271,10 +342,13 @@ class CaptureProxy:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "request_index": request_index,
             "agent_context": agent_context,
+            "api_format": api_format or "anthropic",
             "model": request_data.get("model"),
             "sampling_params": {
                 k: request_data.get(k)
-                for k in ("temperature", "max_tokens", "top_p", "top_k")
+                for k in (
+                    "temperature", "max_tokens", "max_output_tokens", "top_p", "top_k"
+                )
                 if request_data.get(k) is not None
             },
             "message_count": message_count,
@@ -315,17 +389,30 @@ class CaptureProxy:
                 )
 
         # Per-request token usage from response
-        usage_start = response_meta.get("usage_start", {})
-        usage_delta = response_meta.get("usage_delta", {})
-        if usage_start or usage_delta:
+        openai_usage = response_meta.get("openai_usage")
+        if openai_usage:
             entry["usage"] = {
-                "input_tokens": usage_start.get("input_tokens"),
-                "output_tokens": usage_delta.get("output_tokens"),
-                "cache_creation_input_tokens": usage_start.get("cache_creation_input_tokens"),
-                "cache_read_input_tokens": usage_start.get("cache_read_input_tokens"),
-                "cache_creation": usage_start.get("cache_creation"),
-                "service_tier": usage_start.get("service_tier"),
+                "input_tokens": openai_usage.get("input_tokens"),
+                "output_tokens": openai_usage.get("output_tokens"),
+                "cache_read_input_tokens": (
+                    (openai_usage.get("input_tokens_details") or {}).get("cached_tokens")
+                ),
+                "reasoning_output_tokens": (
+                    (openai_usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+                ),
             }
+        else:
+            usage_start = response_meta.get("usage_start", {})
+            usage_delta = response_meta.get("usage_delta", {})
+            if usage_start or usage_delta:
+                entry["usage"] = {
+                    "input_tokens": usage_start.get("input_tokens"),
+                    "output_tokens": usage_delta.get("output_tokens"),
+                    "cache_creation_input_tokens": usage_start.get("cache_creation_input_tokens"),
+                    "cache_read_input_tokens": usage_start.get("cache_read_input_tokens"),
+                    "cache_creation": usage_start.get("cache_creation"),
+                    "service_tier": usage_start.get("service_tier"),
+                }
 
         # Append to JSONL
         self._log_path.parent.mkdir(parents=True, exist_ok=True)

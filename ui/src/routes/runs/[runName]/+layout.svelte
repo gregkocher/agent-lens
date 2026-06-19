@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from "$app/state";
 	import { formatCost, formatDuration } from "$lib/utils/format";
-	import { sessionKey } from "$lib/types/run";
+	import { sessionKey, engineLabel } from "$lib/types/run";
 
 	let { data, children } = $props();
 	let meta = $derived(data.meta);
@@ -30,6 +30,10 @@
 
 	<!-- Run metadata line -->
 	<div style="display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; font-size: 12px; color: var(--muted-foreground);">
+		<span
+			class="meta-pill"
+			style="font-weight: 600; {meta.engine === 'codex' ? 'color: #10a37f;' : 'color: #6366f1;'}"
+		>{engineLabel(meta.engine)}</span>
 		<span class="meta-pill" style="color: var(--foreground);">{meta.model}</span>
 		<span class="meta-pill">{meta.provider}</span>
 		<span class="meta-pill">{meta.session_mode}</span>

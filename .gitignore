@@ -3,6 +3,7 @@
 /repos/
 /pipeline_runs/
 openrouter_api_key.txt
+/fixtures/
 # experiment configs are local by default...
 /experiments/*
 # ...but the budget-pressure pipeline configs are part of the committed deliverable:

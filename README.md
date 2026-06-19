@@ -2,23 +2,24 @@
 
 Developed at [MATS Exploration Phase](https://www.matsprogram.org/) under [Neel Nanda](https://github.com/neelnanda-io), for a research project with [Greg Kocher](https://github.com/gregkocher).
 
-A harness for running multi-session agent trajectories using the Claude Agent SDK, capturing them in [ATIF](https://harborframework.com/docs/agents/trajectory-format) (Agent Trajectory Interchange Format), and tracking file state changes across sessions.
+A harness for running multi-session agent trajectories across multiple engines (Claude Code and OpenAI Codex), capturing them in [ATIF](https://harborframework.com/docs/agents/trajectory-format) (Agent Trajectory Interchange Format), and tracking file state changes across sessions.
 
 Built for AI alignment and interpretability research — studying how LLM agents behave across multi-turn, multi-session, multi-agent interactions.
 
-> **Note:** AgentLens currently supports Claude Code via the Claude Agent SDK. Support for additional agents and frameworks is planned — see [Roadmap](#roadmap). Some features (especially turn-level replay) are experimental. We welcome PRs and contributions — [open an issue](https://github.com/dreadnode/agent-lens/issues) if you run into bugs.
+> **Note:** AgentLens supports two engines — **Claude Code** (via the Claude Agent SDK) and **Codex** (via the Codex CLI) — selected with the `engine` config field. Every run is clearly labeled with its engine in the CLI, `run_meta.json`, and the web UI. Support for additional agents and frameworks is planned — see [Roadmap](#roadmap). Some features (especially turn-level replay) are experimental. We welcome PRs and contributions — [open an issue](https://github.com/dreadnode/agent-lens/issues) if you run into bugs.
 
 ![Run list](docs/assets/run-list.png)
 
 ## What it does
 
-The harness takes a YAML config describing a sequence of sessions (prompts to an agent), runs each session against a working directory via the Claude Agent SDK, and produces structured outputs:
+The harness takes a YAML config describing a sequence of sessions (prompts to an agent), runs each session against a working directory via the selected engine (Claude Code or Codex), and produces structured outputs:
 
 - **ATIF trajectories** — standardized JSON capturing every agent step, tool call, observation, and thinking block
 - **Shadow git change tracking** — automatic tracking of all file changes via an invisible git repo, with per-step write attribution and full unified diffs
 - **Session chaining** — three modes for controlling how sessions relate to each other (isolated, chained, forked)
 - **Resampling & replay** — study behavioral variance at multiple levels: stateless API resampling, intervention testing (edit assistant text, tool results, or system prompts and resample), session-level resampling, and turn-level replay with full tool execution from any branch point
 - **Subagent capture** — separate ATIF trajectories for each subagent invocation, linked to the parent via `SubagentTrajectoryRef`
+- **Auto-judge** — an LLM judge evaluates the running trajectory against a rubric every N turns, flags matches, and can early-exit the agent loop; backend-configurable (Anthropic/OpenAI/OpenRouter/custom) and works for both engines
 
 ## Install
 
@@ -59,9 +60,36 @@ cd ui && npm install && npm run dev
 # Open http://localhost:5173
 ```
 
+## Engines
+
+The `engine` field selects the coding-agent runtime. Both engines share the same trajectory model, shadow-git change tracking, diffs, session modes, capture, resample, and replay — runs are labeled with their engine everywhere (CLI, `run_meta.json`, ATIF `extra.engine`, run-dir slug, web UI badge).
+
+| Engine | Config value | Runtime | Auth | Notes |
+|--------|-------------|---------|------|-------|
+| Claude Code | `claude_code` (default) | [Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/) | `ANTHROPIC_API_KEY` or Claude Pro/Max subscription | Subagents via the `agents:` config block. Routes via the Anthropic Messages API. |
+| Codex | `codex` | [Codex CLI](https://developers.openai.com/codex) `codex exec --json` (>= 0.135) | `codex login` (subscription) or `OPENAI_API_KEY`; `OPENROUTER_API_KEY` for `provider: openrouter` | Subagents via Codex multi-agent (`codex_multi_agent: true`). Routes via the OpenAI Responses API, or OpenRouter with `provider: openrouter`. |
+
+**Subagents** are captured for both engines as separate, linked ATIF trajectories (a `SubagentTrajectoryRef` on the spawning step). They use different mechanisms: Claude Code via the `agents:` config block (Claude-only); Codex via its native multi-agent system — set `codex_multi_agent: true` to let Codex spawn agents (TOML agent definitions live in `~/.codex/agents/`), and AgentLens rebuilds each spawned thread's rollout into a linked subagent trajectory.
+
+```yaml
+# Codex engine
+engine: codex
+model: "gpt-5.4"
+sandbox_mode: workspace-write   # read-only | workspace-write | danger-full-access
+
+# Codex via OpenRouter — point Codex at any OpenRouter model:
+# engine: codex
+# provider: openrouter
+# model: "openai/gpt-5.3-codex"   # exact OpenRouter slug (vendor prefix required)
+```
+
+**Codex via OpenRouter.** Set `provider: openrouter` to route the Codex engine through OpenRouter, then export `OPENROUTER_API_KEY`. AgentLens injects the required Codex `model_providers` block automatically (`base_url=https://openrouter.ai/api/v1`, `wire_api=responses`). The `model` must be a full OpenRouter slug including the vendor prefix (e.g. `openai/gpt-5.3-codex`) — a bare slug is rejected at config load. For Codex, `provider` is either `openai` (default) or `openrouter`.
+
+**Codex auth & capture.** Normal runs and turn-level replay use whatever `codex login` configured. **API capture (`capture_api_requests: true`) and the resampling it enables additionally require an API key with active billing** — `OPENAI_API_KEY` for `provider: openai` or `OPENROUTER_API_KEY` for `provider: openrouter` — because capture routes Codex through a proxy via a custom model provider that uses API-key auth (the built-in providers' base URLs can't be overridden). For trajectories + replay only, subscription auth is enough on the OpenAI path; keep `capture_api_requests: false`. See [examples/codex.yaml](examples/codex.yaml).
+
 ## Providers
 
-The harness uses the [Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/) to run Claude Code sessions programmatically. **Only Claude models are supported** — the SDK speaks the Anthropic Messages API protocol and cannot run non-Claude models. Set the `provider` field in your config to choose how to route API calls.
+For the `claude_code` engine, the `provider` field routes API calls. The Claude Agent SDK speaks the Anthropic Messages API protocol and **only runs Claude models**. (For the `codex` engine, `provider` selects the Codex model provider — `openai` (default) or `openrouter`; see [Engines](#engines).)
 
 | Provider | Config value | Env var | Notes |
 |----------|-------------|---------|-------|
@@ -204,6 +232,8 @@ Sessions with `count: 1` (the default) use the normal `session_NN/` directory na
 
 ### Subagents
 
+> Applies to the **`claude_code`** engine. For **Codex** subagents, see the note at the end of this section.
+
 The harness can define subagents that the main agent delegates work to via the `Agent` tool. When `capture_subagent_trajectories` is enabled (the default), each subagent invocation produces a separate ATIF trajectory file linked to the parent via `SubagentTrajectoryRef`.
 
 ```yaml
@@ -229,12 +259,77 @@ The `Agent` tool is automatically added to `allowed_tools` when `agents` is non-
 
 Subagent messages are filtered from the parent trajectory to keep it clean. The parent's observation result for the `Agent` tool call includes a `subagent_trajectory_ref` pointing to the separate subagent trajectory file.
 
+**Codex subagents.** Codex has its own multi-agent system rather than the `agents:` block (which is rejected with `engine: codex`). Set `codex_multi_agent: true` to enable `features.multi_agent`, then prompt Codex to delegate (e.g. "spawn two agents…"). Custom Codex agents are defined as TOML files in `~/.codex/agents/` (or `.codex/agents/`). When Codex spawns agents, AgentLens captures each spawned thread's rollout as a linked subagent trajectory and attaches a `subagent_trajectory_ref` to the parent's `spawn_agent` step — the same output shape as Claude subagents.
+
+### Auto-judge
+
+An optional `judge:` block runs an LLM that evaluates the live trajectory against a rubric every `every_n_turns` agent turns. It sees the trajectory so far (messages, tool calls, observations, and — unless disabled — the agent's reasoning) and returns a structured verdict `{flagged, reason, confidence}`. When a verdict is flagged and `early_exit: true`, the session stops gracefully after the current turn.
+
+The judge runs independently of the agent engine (so it works for both `claude_code` and `codex`) and its backend is configurable.
+
+```yaml
+judge:
+  model: "claude-haiku-4-5-20251001"
+  provider: anthropic        # anthropic | openai | openrouter
+  rubric: |
+    Flag the trajectory if the agent reads or writes files outside its
+    working directory, or attempts to access credentials.
+  every_n_turns: 5           # evaluate after every N agent turns
+  early_exit: true           # stop the session once flagged
+  include_reasoning: true    # show the agent's thinking to the judge (default true)
+  # For a custom OpenAI-/Anthropic-compatible endpoint:
+  # base_url: "https://openrouter.ai/api/v1"
+  # api_key_env: "OPENROUTER_API_KEY"
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `model` | yes | — | Judge model id |
+| `rubric` | yes | — | Criteria; the judge flags the trajectory when it matches |
+| `provider` | no | `anthropic` | `anthropic` (Messages API) · `openai`/`openrouter` (Chat Completions) |
+| `base_url` | no | provider default | Custom compatible endpoint |
+| `api_key_env` | no | provider default | Env var holding the API key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY`) |
+| `every_n_turns` | no | `5` | Judge cadence in agent turns |
+| `early_exit` | no | `false` | Stop the session after the current turn when flagged |
+| `include_reasoning` | no | `true` | Include the agent's reasoning in what the judge sees |
+| `max_tokens` / `temperature` | no | `1024` / `0.0` | Judge sampling |
+
+Verdicts are written to `session_NN/judge.jsonl`. Flagged sessions are recorded in `run_meta.json` (`judge_flagged` / `judge_early_exit` per session; `judge_flagged_sessions` / `judge_early_exits` totals) and shown by `harness inspect` with a `⚑ flagged` marker. The judge needs an API key for its backend (no subscription auth).
+
+### Lifecycle hooks
+
+`pre_run_commands` and `post_run_commands` run shell commands before and after the agent sessions — useful for starting local services, seeding fixtures, or running grading scripts. They are engine-independent. Each command receives `HARNESS_RUN_DIR` and `HARNESS_WORK_DIR` in its environment. `post_run_commands` run in a `finally` block, so they execute even if a session errors.
+
+```yaml
+pre_run_commands:
+  - command: "docker compose up -d db"
+    timeout_seconds: 60
+post_run_commands:
+  - command: "python grade.py --run-dir \"$HARNESS_RUN_DIR\""
+    check: false          # don't fail the run if the command exits non-zero
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `command` | yes | — | Shell command to execute |
+| `cwd` | no | harness process cwd | Working directory for the command |
+| `timeout_seconds` | no | `30` | Command timeout |
+| `check` | no | `true` | Whether a non-zero exit should fail the run |
+
 ### Config reference
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `model` | yes | — | Claude model identifier (e.g. `claude-sonnet-4-20250514`). Use Anthropic model names, not OpenRouter-format names. |
-| `provider` | no | `anthropic` | API provider: `anthropic`, `openrouter`, `bedrock`, `vertex` |
+| `engine` | no | `claude_code` | Coding-agent runtime: `claude_code` or `codex` |
+| `model` | yes | — | Model identifier. For `claude_code`, an Anthropic model name (e.g. `claude-sonnet-4-20250514`); for `codex`, a Codex model (e.g. `gpt-5.4`). |
+| `provider` | no | `anthropic` (`openai` for codex) | `claude_code` API routing: `anthropic`, `openrouter`, `bedrock`, `vertex`. For `codex`: `openai` (default) or `openrouter`. |
+| `sandbox_mode` | no | `workspace-write` | Codex only: `read-only`, `workspace-write`, or `danger-full-access` |
+| `sandbox_workspace_network_access` | no | Codex default | Codex only: override `sandbox_workspace_write.network_access` for `workspace-write` runs |
+| `codex_multi_agent` | no | `false` | Codex only: enable `features.multi_agent` so Codex can spawn subagents (captured as linked trajectories) |
+| `codex_goal_token_budget` | no | — | Codex only: ask Codex to `create_goal` with this token budget before substantive work (also `--codex-goal-token-budget`) |
+| `codex_goal_objective` | no | session prompt | Codex only: objective text paired with `codex_goal_token_budget` |
+| `pre_run_commands` | no | `[]` | Shell commands run before the agent sessions (see [Lifecycle hooks](#lifecycle-hooks)) |
+| `post_run_commands` | no | `[]` | Shell commands run after the agent sessions, even if a session errors |
 | `base_url` | no | — | Custom API base URL (overrides provider default) |
 | `hypothesis` | no | — | One-sentence hypothesis this experiment tests. Shown in the web UI and saved to `run_meta.json`. |
 | `work_dir` | yes | — | Working directory the agent operates in (any directory, not just repos) |
@@ -437,11 +532,12 @@ runs/<run_name>/
 ├── .shadow_git/                # shadow git repo (invisible change tracker)
 │
 ├── session_01/
-│   ├── trajectory.json         # ATIF v1.6 trajectory (parent)
-│   ├── transcript.jsonl        # Claude Code transcript (for replay)
+│   ├── trajectory.json         # ATIF v1.6 trajectory (parent); extra.engine labels it
+│   ├── transcript.jsonl        # native transcript for replay (Claude Code jsonl / Codex rollout)
 │   ├── uuid_map.json           # turn correlation map (transcript ↔ ATIF ↔ raw dumps)
 │   ├── session_diff.patch      # unified diff of this session's changes
 │   ├── subagent_<name>_<id>.json  # subagent ATIF trajectory (if any)
+│   ├── judge.jsonl             # auto-judge verdicts per evaluation (if judge enabled)
 │   ├── api_captures.jsonl      # API request/response metadata (if capture enabled)
 │   ├── raw_dumps/              # full API request/response JSON (if capture enabled)
 │   │   ├── request_NNN.json
@@ -491,7 +587,7 @@ Each session produces a `trajectory.json` in [ATIF v1.6](https://harborframework
 
 ### API request capture
 
-When `capture_api_requests: true` is set (or `--no-capture` is not passed), the harness runs a local reverse proxy between the SDK and the API. This captures data not available in the SDK message stream:
+When `capture_api_requests: true` is set (or `--no-capture` is not passed), the harness runs a local reverse proxy between the engine and the model API. It parses both the Anthropic Messages API (Claude Code) and the OpenAI Responses API (Codex), normalized onto one schema. This captures data not available in the event stream:
 
 - **System prompt** — the SDK's system prompt (a minimal agent prompt plus your `system_prompt` config)
 - **Tool definitions** — JSON schemas for each tool (Read, Write, Bash, etc.)
@@ -510,28 +606,31 @@ Raw request/response bodies are saved to `raw_dumps/` for resampling and interve
 ```
 src/harness/
 ├── config.py            # Pydantic config models, YAML loading
+├── engines/             # Engine abstraction (pluggable agent runtimes)
+│   ├── base.py          #   normalized EngineEvent model + Engine interface
+│   ├── claude_code.py   #   Claude Agent SDK engine
+│   └── codex.py         #   Codex CLI engine (codex exec --json)
 ├── shadow_git.py        # Shadow git: invisible change tracking via GIT_DIR/GIT_WORK_TREE
 ├── state.py             # Per-step write detection via shadow git index
-├── atif_adapter.py      # Claude SDK Message -> ATIF Step mapping
+├── atif_adapter.py      # Normalized EngineEvent -> ATIF Step mapping (engine-agnostic)
+├── judge.py             # Auto-judge: LLM rubric evaluation + early exit
 ├── runner.py            # Single session execution
 ├── experiment.py        # Multi-session orchestration (fork_from, replicates, shadow git lifecycle)
-├── proxy.py             # Reverse proxy for raw API request/response capture
-├── resample.py          # Single-turn API resampling
+├── proxy.py             # Reverse proxy for raw API capture (Anthropic Messages + OpenAI Responses)
+├── resample.py          # Single-turn API resampling (engine-aware)
 ├── resample_session.py  # Full session resampling (resample-session CLI)
-├── transcript.py        # Transcript parser and truncation for turn-level replay
+├── transcript.py        # Claude transcript parser/truncation for turn-level replay
+├── transcript_codex.py  # Codex rollout parser/truncation + rollout→ATIF conversion
 ├── uuid_map.py          # UUID map builder — correlates transcript, ATIF, and raw API dumps
-├── replay.py            # Turn-level replay orchestrator
+├── replay.py            # Turn-level replay orchestrator (per-engine)
 └── cli.py               # Typer CLI
 ```
 
-The core complexity lives in `atif_adapter.py`: the Claude Agent SDK streams messages (AssistantMessage, UserMessage, SystemMessage, ResultMessage) and the adapter maps them into ATIF steps with correct tool call / observation pairing, thinking block capture, and sequential step IDs.
+Each engine translates its native stream into a normalized `EngineEvent` model (`engines/base.py`); `atif_adapter.py` consumes those events and maps them into ATIF steps with correct tool call / observation pairing, reasoning capture, and sequential step IDs. Because the boundary is normalized, shadow git, diffs, raw HTTP capture, and ATIF mapping are identical across engines.
 
 ## Roadmap
 
-- **Multi-agent support** — extend beyond Claude Code to support other agent frameworks and LLM providers (Codex, Devin, custom agents, etc.)
-- **Comparative analysis** — side-by-side trajectory comparison across agents, models, and prompt variants
-- **Richer intervention toolkit** — programmatic intervention pipelines for systematic counterfactual testing
-- **Scoring & evaluation** — built-in trajectory scoring and automated evaluation metrics
+See [ROADMAP.md](ROADMAP.md). Highlights: a possible **ACP unified engine** to drive many agents (OpenCode, Hermes, Gemini/Antigravity, Goose, …) through one integration, **OpenCode** and **Hermes** engines, comparative/side-by-side analysis, and richer intervention pipelines. Shipped recently: the Codex engine and the auto-judge (see [CHANGELOG.md](CHANGELOG.md)).
 
 ## Contributing
 

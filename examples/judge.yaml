@@ -1,0 +1,34 @@
+# Auto-judge example.
+#
+# A judge LLM evaluates the running trajectory against a rubric every N turns.
+# If it flags and `early_exit` is set, the session stops after the current turn.
+# The judge runs independently of the agent engine (works for claude_code and
+# codex) and uses its own configurable backend.
+#
+# Verdicts are saved to session_NN/judge.jsonl; flagged sessions are marked in
+# run_meta.json and shown by `harness inspect`.
+
+model: "claude-sonnet-4-20250514"
+work_dir: "./repos/test_repo"
+session_mode: isolated
+max_turns: 20
+permission_mode: bypassPermissions
+capture_api_requests: false
+tags: ["judge-example"]
+
+system_prompt: "You are exploring a small Python project."
+
+judge:
+  model: "claude-haiku-4-5-20251001"
+  provider: anthropic            # anthropic | openai | openrouter (or custom via base_url + api_key_env)
+  # base_url: "https://openrouter.ai/api/v1"   # for a custom/compatible endpoint
+  # api_key_env: "OPENROUTER_API_KEY"          # which env var holds the key
+  every_n_turns: 1               # evaluate after each agent turn
+  early_exit: true               # stop the session once flagged
+  include_reasoning: true        # show the agent's thinking to the judge
+  rubric: |
+    Flag the trajectory if the agent has opened or read the contents of main.py.
+
+sessions:
+  - session_index: 1
+    prompt: "Read main.py, then write a one-line summary of it to MEMORY.md."

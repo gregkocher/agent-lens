@@ -1,0 +1,31 @@
+# Codex subagent capture example.
+#
+# `codex_multi_agent: true` enables Codex's native multi-agent system
+# (`features.multi_agent`). When the prompt asks Codex to delegate, it spawns
+# subagents; AgentLens captures each spawned thread as a linked subagent
+# trajectory (subagent_*.json + a subagent_trajectory_ref on the spawn step),
+# the same output shape as Claude Code subagents.
+#
+# Note: `agents:` (Claude AgentDefinitions) is NOT used here — that block is
+# Claude-Code-only. Custom Codex agents are defined as TOML files in
+# ~/.codex/agents/ instead.
+
+engine: codex
+model: "gpt-5.4"
+sandbox_mode: read-only
+codex_multi_agent: true
+
+work_dir: "./repos/test_repo"
+session_mode: isolated
+tags: ["codex", "subagents"]
+
+max_turns: 20
+permission_mode: bypassPermissions
+capture_api_requests: false
+
+sessions:
+  - session_index: 1
+    prompt: >
+      Spawn two agents in parallel: one reads main.py and summarizes it in one
+      line, the other reads MEMORY.md and summarizes it in one line. Then combine
+      their findings into a short summary.

@@ -1,8 +1,12 @@
-"""SDK message -> ATIF Step mapping.
+"""Normalized engine event -> harbor ATIF Step mapping.
 
-Core responsibility: convert a stream of claude_agent_sdk Message objects
-into a list of harbor ATIF Steps, maintaining correct step_id sequencing,
-tool_call/observation pairing, and agent-only field constraints.
+Core responsibility: convert a stream of :class:`~harness.engines.base.EngineEvent`
+objects (produced by any engine) into a list of harbor ATIF Steps, maintaining
+correct step_id sequencing, tool_call/observation pairing, and agent-only field
+constraints.
+
+This adapter is engine-agnostic: it never imports an SDK. Engines are
+responsible for translating their native message streams into ``EngineEvent``s.
 """
 
 from __future__ import annotations
@@ -11,16 +15,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ResultMessage,
-    SystemMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
 from harbor.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -32,22 +26,32 @@ from harbor.models.trajectories import (
     Trajectory,
 )
 
+from harness.engines.base import (
+    AgentMessageEvent,
+    EngineEvent,
+    EngineToolCall,
+    ResultEvent,
+    SystemEvent,
+    ToolResultEvent,
+    UserMessageEvent,
+)
+
 logger = logging.getLogger(__name__)
 
 
 class ATIFAdapter:
-    """Converts a stream of SDK messages into an ATIF Trajectory.
+    """Converts a stream of normalized EngineEvents into an ATIF Trajectory.
 
     Usage:
         adapter = ATIFAdapter(...)
-        async for msg in query(prompt=..., options=...):
-            adapter.process_message(msg)
+        async for event in engine.run(spec):
+            adapter.process_event(event)
         trajectory = adapter.build_trajectory()
 
     Key invariants:
     - step_ids are sequential from 1
-    - Tool result UserMessages attach as Observation on the previous agent
-      step, NOT as new steps
+    - ToolResultEvents attach as Observation on the issuing agent step,
+      NOT as new steps
     - agent-only fields never appear on source="user" steps
     - message field is always a non-None string
     """
@@ -72,8 +76,8 @@ class ATIFAdapter:
         # Map tool_call_id -> step index for correct observation attachment
         self._tool_call_to_step: dict[str, int] = {}
 
-        # Accumulated data from ResultMessage
-        self._result_message: ResultMessage | None = None
+        # Accumulated data from ResultEvent
+        self._result_event: ResultEvent | None = None
 
         # Compaction events
         self.compaction_events: list[dict[str, Any]] = []
@@ -87,96 +91,78 @@ class ATIFAdapter:
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def process_message(self, msg: Any, extra: dict[str, Any] | None = None) -> Step | None:
-        """Process a single SDK message. Returns the ATIF Step if one was created.
+    def process_event(self, event: EngineEvent, extra: dict[str, Any] | None = None) -> Step | None:
+        """Process a single normalized engine event.
 
-        Tool-result UserMessages do NOT create new steps; they attach to the
-        previous agent step. Returns None in that case.
-
-        Messages with parent_tool_use_id matching a known subagent are routed
-        to the child adapter (if capturing) and excluded from the parent trajectory.
+        Returns the ATIF Step if one was created. ToolResultEvents attach to the
+        issuing agent step and return None. Events belonging to a captured
+        subagent are routed to the child adapter and excluded from the parent.
         """
-        # Route subagent-internal messages away from parent trajectory.
-        # Exception: UserMessages with tool_use_result set are the subagent's
-        # RETURN value — these should be processed by the parent as observations.
-        parent_id = getattr(msg, "parent_tool_use_id", None)
+        # Route subagent-internal events away from the parent trajectory.
+        # Exception: a ToolResultEvent whose parent is the Agent call is the
+        # subagent's RETURN value — the parent processes it as an observation.
+        parent_id = getattr(event, "parent_tool_use_id", None)
         if parent_id and parent_id in self._subagent_tool_ids:
-            is_subagent_return = (
-                isinstance(msg, UserMessage) and msg.tool_use_result is not None
-            )
+            is_subagent_return = isinstance(event, ToolResultEvent)
             if not is_subagent_return:
                 if self._capture_subagents and parent_id in self._subagent_adapters:
-                    self._subagent_adapters[parent_id].process_message(msg, extra)
+                    self._subagent_adapters[parent_id].process_event(event, extra)
                 return None
 
-        if isinstance(msg, AssistantMessage):
-            return self._process_assistant(msg, extra)
-        elif isinstance(msg, UserMessage):
-            return self._process_user(msg, extra)
-        elif isinstance(msg, SystemMessage):
-            return self._process_system(msg)
-        elif isinstance(msg, ResultMessage):
-            self._result_message = msg
+        if isinstance(event, AgentMessageEvent):
+            return self._process_agent(event, extra)
+        if isinstance(event, ToolResultEvent):
+            self._attach_tool_results(event)
             return None
-        else:
-            # StreamEvent or unknown — skip
+        if isinstance(event, UserMessageEvent):
+            return self._process_user(event, extra)
+        if isinstance(event, SystemEvent):
+            return self._process_system(event)
+        if isinstance(event, ResultEvent):
+            self._result_event = event
             return None
+        return None
 
-    def _process_assistant(self, msg: AssistantMessage, extra: dict[str, Any] | None) -> Step:
-        """Map AssistantMessage -> Step(source="agent")."""
+    # Backwards-compatible alias.
+    process_message = process_event
+
+    def _process_agent(self, event: AgentMessageEvent, extra: dict[str, Any] | None) -> Step:
+        """Map AgentMessageEvent -> Step(source="agent")."""
         self._step_counter += 1
 
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        thinking_signatures: list[str] = []
-        tool_calls: list[ToolCall] = []
-        observation_results: list[ObservationResult] = []
+        tool_calls: list[ToolCall] = [
+            ToolCall(
+                tool_call_id=tc.id,
+                function_name=tc.name,
+                arguments=tc.arguments,
+            )
+            for tc in event.tool_calls
+        ]
 
-        for block in msg.content:
-            if isinstance(block, TextBlock):
-                text_parts.append(block.text)
-            elif isinstance(block, ThinkingBlock):
-                thinking_parts.append(block.thinking)
-                thinking_signatures.append(block.signature)
-            elif isinstance(block, ToolUseBlock):
-                tool_calls.append(
-                    ToolCall(
-                        tool_call_id=block.id,
-                        function_name=block.name,
-                        arguments=block.input,
-                    )
-                )
-            elif isinstance(block, ToolResultBlock):
-                # Inline tool results within AssistantMessage
-                content_str = str(block.content) if block.content is not None else ""
-                observation_results.append(
-                    ObservationResult(
-                        source_call_id=block.tool_use_id,
-                        content=content_str,
-                    )
-                )
-
-        message = "\n".join(text_parts) if text_parts else ""
+        observation_results: list[ObservationResult] = [
+            ObservationResult(source_call_id=r.tool_call_id, content=r.content)
+            for r in event.inline_results
+        ]
 
         step_extra: dict[str, Any] = {}
         if extra:
             step_extra.update(extra)
-        if thinking_signatures:
-            step_extra["thinking_signatures"] = thinking_signatures
-        if msg.model:
-            step_extra["sdk_model"] = msg.model
-        if msg.error:
-            step_extra["sdk_error"] = msg.error
-        if msg.parent_tool_use_id:
-            step_extra["parent_tool_use_id"] = msg.parent_tool_use_id
+        if event.reasoning_signatures:
+            step_extra["thinking_signatures"] = event.reasoning_signatures
+        if event.model:
+            step_extra["sdk_model"] = event.model
+        if event.error:
+            step_extra["sdk_error"] = event.error
+        if event.parent_tool_use_id:
+            step_extra["parent_tool_use_id"] = event.parent_tool_use_id
 
         step = Step(
             step_id=self._step_counter,
             timestamp=self._now_iso(),
             source="agent",
-            model_name=msg.model or None,
-            message=message,
-            reasoning_content="\n".join(thinking_parts) if thinking_parts else None,
+            model_name=event.model or None,
+            message=event.text or "",
+            reasoning_content=event.reasoning or None,
             tool_calls=tool_calls if tool_calls else None,
             observation=(
                 Observation(results=observation_results) if observation_results else None
@@ -187,86 +173,40 @@ class ATIFAdapter:
         self.steps.append(step)
         step_index = len(self.steps) - 1
         # Register tool_call_ids for observation attachment lookup
-        for tc in tool_calls:
-            self._tool_call_to_step[tc.tool_call_id] = step_index
-            # Detect Agent tool calls and register subagent
-            if tc.function_name == "Agent":
+        for tc in event.tool_calls:
+            self._tool_call_to_step[tc.id] = step_index
+            if tc.name == "Agent":
                 self._register_subagent(tc)
         return step
 
-    def _process_user(self, msg: UserMessage, extra: dict[str, Any] | None) -> Step | None:
-        """Map UserMessage to either an Observation attachment or a new user Step."""
-        if msg.tool_use_result is not None:
-            self._attach_tool_result(msg)
-            return None
-
-        # Regular user message -> new step
+    def _process_user(self, event: UserMessageEvent, extra: dict[str, Any] | None) -> Step:
+        """Map a genuine user message to a new user Step."""
         self._step_counter += 1
-
-        if isinstance(msg.content, str):
-            message_text = msg.content
-        elif isinstance(msg.content, list):
-            parts = []
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    parts.append(block.text)
-                else:
-                    parts.append(str(block))
-            message_text = "\n".join(parts) if parts else ""
-        else:
-            message_text = str(msg.content)
 
         step_extra: dict[str, Any] = {}
         if extra:
             step_extra.update(extra)
-        if msg.uuid:
-            step_extra["uuid"] = msg.uuid
+        if event.uuid:
+            step_extra["uuid"] = event.uuid
 
         step = Step(
             step_id=self._step_counter,
             timestamp=self._now_iso(),
             source="user",
-            message=message_text,
+            message=event.text or "",
             extra=step_extra if step_extra else None,
         )
 
         self.steps.append(step)
         return step
 
-    def _attach_tool_result(self, msg: UserMessage) -> None:
-        """Attach a tool result as ObservationResult on the correct agent step.
-
-        The SDK sends tool results as UserMessage with tool_use_result set.
-        The actual content and tool_use_id are in ToolResultBlock objects
-        within msg.content. We look up the step that made the tool call
-        by tool_use_id to satisfy ATIF's same-step reference constraint.
-        """
-        # Extract all ToolResultBlocks from msg.content
-        found = False
-        if isinstance(msg.content, list):
-            for block in msg.content:
-                if isinstance(block, ToolResultBlock):
-                    self._attach_observation(
-                        tool_use_id=block.tool_use_id,
-                        content=str(block.content) if block.content is not None else "",
-                    )
-                    found = True
-
-        if found:
-            return
-
-        # Fallback: use parent_tool_use_id
-        tool_use_id = msg.parent_tool_use_id
-        result_data = msg.tool_use_result
-        if isinstance(result_data, dict):
-            content = str(result_data.get("content", ""))
-        else:
-            content = str(result_data) if result_data else ""
-        self._attach_observation(tool_use_id=tool_use_id, content=content)
+    def _attach_tool_results(self, event: ToolResultEvent) -> None:
+        """Attach each tool result to the step that issued the matching call."""
+        for result in event.results:
+            self._attach_observation(result.tool_call_id, result.content)
 
     def _attach_observation(self, tool_use_id: str | None, content: str) -> None:
         """Attach an ObservationResult to the step that issued the tool call."""
-        # Look up the step by tool_call_id
         step_index = self._tool_call_to_step.get(tool_use_id) if tool_use_id else None
 
         if step_index is None:
@@ -286,22 +226,18 @@ class ATIFAdapter:
         else:
             step.observation = Observation(results=[obs_result])
 
-    def _process_system(self, msg: SystemMessage) -> Step | None:
-        """Process SystemMessage — no ATIF step, just log for compaction detection."""
-        logger.debug(
-            "SystemMessage subtype=%s data_keys=%s",
-            msg.subtype,
-            list(msg.data.keys()) if msg.data else [],
-        )
+    def _process_system(self, event: SystemEvent) -> Step | None:
+        """Process a SystemEvent — no ATIF step, just compaction detection."""
+        logger.debug("SystemEvent subtype=%s", event.subtype)
 
-        subtype_lower = msg.subtype.lower() if msg.subtype else ""
+        subtype_lower = event.subtype.lower() if event.subtype else ""
         if "compact" in subtype_lower or "summary" in subtype_lower:
             self.compaction_events.append(
                 {
                     "timestamp": self._now_iso(),
                     "after_step_id": self._step_counter,
-                    "subtype": msg.subtype,
-                    "data": msg.data,
+                    "subtype": event.subtype,
+                    "data": event.data,
                 }
             )
 
@@ -322,9 +258,9 @@ class ATIFAdapter:
             }
         )
 
-    def _register_subagent(self, tc: ToolCall) -> None:
-        """Register an Agent tool call for subagent message routing."""
-        tool_id = tc.tool_call_id
+    def _register_subagent(self, tc: EngineToolCall) -> None:
+        """Register an Agent tool call for subagent event routing."""
+        tool_id = tc.id
         self._subagent_tool_ids.add(tool_id)
 
         # Extract agent name from arguments
@@ -361,18 +297,23 @@ class ATIFAdapter:
             result[tool_id] = traj
         return result
 
-    def attach_subagent_refs(self, ref_map: dict[str, SubagentTrajectoryRef]) -> None:
-        """Attach SubagentTrajectoryRef to observation results for Agent tool calls.
+    def attach_subagent_refs(
+        self,
+        ref_map: dict[str, SubagentTrajectoryRef | list[SubagentTrajectoryRef]],
+    ) -> None:
+        """Attach SubagentTrajectoryRef(s) to observation results for spawn calls.
 
         Args:
-            ref_map: dict mapping tool_use_id -> SubagentTrajectoryRef to attach.
+            ref_map: maps a tool_call_id -> a single ref or list of refs (a Codex
+                ``spawn_agent`` may fan out to multiple child threads).
         """
         for step in self.steps:
             if not step.observation:
                 continue
             for obs_result in step.observation.results:
                 if obs_result.source_call_id and obs_result.source_call_id in ref_map:
-                    obs_result.subagent_trajectory_ref = [ref_map[obs_result.source_call_id]]
+                    val = ref_map[obs_result.source_call_id]
+                    obs_result.subagent_trajectory_ref = val if isinstance(val, list) else [val]
 
     def build_trajectory(self) -> Trajectory:
         """Build the final ATIF Trajectory from accumulated steps."""
@@ -406,9 +347,9 @@ class ATIFAdapter:
         total_completion: int | None = None
         total_cached: int | None = None
 
-        if self._result_message:
-            total_cost = self._result_message.total_cost_usd
-            usage = self._result_message.usage
+        if self._result_event:
+            total_cost = self._result_event.total_cost_usd
+            usage = self._result_event.usage
             if usage:
                 total_prompt = usage.get("input_tokens")
                 total_completion = usage.get("output_tokens")

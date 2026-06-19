@@ -30,7 +30,6 @@ from harness.shadow_git import ShadowGit
 from harness.state import StateManager
 from harness.transcript import (
     get_project_dir,
-    list_turns,
     parse_turns,
     truncate_for_replay,
     write_truncated_transcript,
@@ -65,8 +64,25 @@ async def run_replay(
     Returns:
         List of new run directory paths created.
     """
+    from harness.runner import install_quiet_exception_handler
+
+    install_quiet_exception_handler()
+
     # Load source config and metadata
     config = load_config(source_run_dir / "config.yaml")
+
+    # Codex uses a different transcript/resume model — dispatch to its own path.
+    if config.engine == "codex":
+        return await _run_codex_replay(
+            source_run_dir=source_run_dir,
+            config=config,
+            session_index=session_index,
+            turn_index=turn_index,
+            count=count,
+            prompt_override=prompt_override,
+            output_base=output_base,
+        )
+
     meta_path = source_run_dir / "run_meta.json"
     if not meta_path.exists():
         typer.echo(f"Error: No run_meta.json in {source_run_dir}", err=True)
@@ -453,6 +469,7 @@ async def _run_single_replicate(
     # Save run_meta.json
     run_meta = {
         "run_name": run_name,
+        "engine": config.engine,
         "model": config.model,
         "provider": config.provider,
         "session_mode": config.session_mode.value,
@@ -507,6 +524,197 @@ async def _run_single_replicate(
         )
 
     return replay_run_dir, result, truncated_path
+
+
+async def _run_codex_replay(
+    source_run_dir: Path,
+    config: RunConfig,
+    session_index: int,
+    turn_index: int,
+    count: int,
+    prompt_override: str | None,
+    output_base: Path,
+) -> list[Path]:
+    """Replay a Codex session from a turn.
+
+    Resets the filesystem via a shadow-git worktree (engine-agnostic), truncates
+    the rollout to the branch point, and resumes Codex from the truncated rollout
+    (`-c experimental_resume=...`) so it regenerates the turn. Turn 1 re-runs from
+    the original prompt.
+    """
+    from harness.transcript_codex import (
+        parse_codex_turns,
+        truncate_codex_rollout,
+        write_truncated_rollout,
+    )
+
+    source_session_dir = _find_session_dir(source_run_dir, session_index)
+    if not source_session_dir:
+        typer.echo(f"Error: No session {session_index} directory in {source_run_dir}", err=True)
+        raise typer.Exit(1)
+
+    transcript_path = source_session_dir / "transcript.jsonl"
+    if not transcript_path.exists():
+        typer.echo(f"Error: No transcript.jsonl (rollout) in {source_session_dir}", err=True)
+        raise typer.Exit(1)
+
+    _, turns = parse_codex_turns(transcript_path)
+    if turn_index < 1 or turn_index > len(turns):
+        typer.echo(f"Error: turn_index {turn_index} out of range (1..{len(turns)})", err=True)
+        raise typer.Exit(1)
+
+    session_config = next((sc for sc in config.sessions if sc.session_index == session_index), None)
+    if not session_config:
+        typer.echo(f"Error: No session config for index {session_index}", err=True)
+        raise typer.Exit(1)
+
+    # uuid_map → shadow-git reset tag (reused, engine-agnostic)
+    uuid_map = None
+    uuid_map_path = source_session_dir / "uuid_map.json"
+    if uuid_map_path.exists():
+        uuid_map = json.loads(uuid_map_path.read_text())
+    reset_tag = _determine_reset_tag(uuid_map, turn_index, session_index)
+
+    source_shadow_git_dir = source_run_dir / ".shadow_git"
+    if not source_shadow_git_dir.exists():
+        typer.echo(f"Error: No .shadow_git in {source_run_dir}. Cannot reset filesystem.", err=True)
+        raise typer.Exit(1)
+    source_shadow_git = ShadowGit(
+        work_dir=Path(config.work_dir).resolve(), git_dir=source_shadow_git_dir
+    )
+
+    sessions_root = Path.home() / ".codex" / "sessions"
+    source_name = source_run_dir.name
+    typer.echo(
+        f"Replaying codex session {session_index} from turn {turn_index} "
+        f"({count} replicate{'s' if count > 1 else ''}, reset to {reset_tag})..."
+    )
+
+    worktree_base = output_base / "_worktrees" / f"creplay_{source_name}_s{session_index}_t{turn_index}"
+    worktree_base.mkdir(parents=True, exist_ok=True)
+    new_dirs: list[Path] = []
+
+    try:
+        for rep in range(1, count + 1):
+            wt = worktree_base / f"rep_{rep:02d}"
+            source_shadow_git.add_worktree(wt, reset_tag)
+            try:
+                replay_dir = await _run_codex_replicate(
+                    rep=rep, worktree_dir=wt, source_run_dir=source_run_dir,
+                    source_name=source_name, config=config, session_config=session_config,
+                    session_index=session_index, turn_index=turn_index, count=count,
+                    transcript_path=transcript_path, sessions_root=sessions_root,
+                    prompt_override=prompt_override, output_base=output_base, reset_tag=reset_tag,
+                    truncate_fn=truncate_codex_rollout, write_fn=write_truncated_rollout,
+                )
+                new_dirs.append(replay_dir)
+            finally:
+                try:
+                    source_shadow_git.remove_worktree(wt)
+                except Exception:
+                    logger.warning("Failed to remove worktree: %s", wt)
+    finally:
+        shutil.rmtree(worktree_base, ignore_errors=True)
+        try:
+            worktree_base.parent.rmdir()
+        except OSError:
+            pass
+
+    typer.echo(f"\n{len(new_dirs)} codex replay run(s) created.")
+    for d in new_dirs:
+        typer.echo(f"  {d}")
+    return new_dirs
+
+
+async def _run_codex_replicate(
+    rep, worktree_dir, source_run_dir, source_name, config, session_config,
+    session_index, turn_index, count, transcript_path, sessions_root,
+    prompt_override, output_base, reset_tag, truncate_fn, write_fn,
+) -> Path:
+    """Run one Codex replay replicate in an isolated worktree."""
+    new_session_id = str(uuid_mod.uuid4())
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+    run_name = f"replay_{source_name}_s{session_index}_t{turn_index}_r{rep:02d}_{timestamp}"
+    replay_run_dir = output_base / run_name
+    replay_session_dir = replay_run_dir / f"session_{session_index:02d}"
+    replay_session_dir.mkdir(parents=True)
+
+    resume_rollout_path: str | None = None
+    if turn_index == 1:
+        prompt = (
+            f"{session_config.prompt}\n\n{prompt_override}" if prompt_override else session_config.prompt
+        )
+    else:
+        truncated = truncate_fn(transcript_path, turn_index)
+        date_path = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+        rollout = write_fn(truncated, new_session_id, sessions_root, date_path)
+        resume_rollout_path = str(rollout)
+        _save_truncated_copy(truncated, replay_session_dir / "source_rollout_truncated.jsonl")
+        # Codex resume requires a continuation prompt; default to a neutral nudge.
+        prompt = prompt_override or "Continue from where the previous session left off."
+
+    replay_shadow_git = ShadowGit(work_dir=worktree_dir, git_dir=replay_run_dir / ".shadow_git")
+    replay_shadow_git.init()
+    replay_shadow_git.commit_baseline()
+    state = StateManager(work_dir=worktree_dir, shadow_git=replay_shadow_git)
+
+    try:
+        result = await run_session(
+            session_config=session_config, run_config=config, session_dir=replay_session_dir,
+            state_manager=state, prompt_override=prompt, cwd_override=str(worktree_dir),
+            resume_rollout_path=resume_rollout_path,
+        )
+    except Exception as e:
+        logger.exception("Codex replay replicate %d crashed", rep)
+        result = SessionResult(
+            session_index=session_index, error=f"CRASHED: {e}",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    replay_shadow_git.end_session(session_index)
+    diff = replay_shadow_git.diff_from_ref("baseline")
+    (replay_session_dir / "session_diff.patch").write_text(diff or "# No changes\n")
+    (replay_run_dir / "full_diff.patch").write_text(diff or "# No changes\n")
+    state.save_changelog(replay_run_dir / "state_changelog.jsonl")
+
+    replay_meta = {
+        "source_run": source_name, "source_run_dir": str(source_run_dir.resolve()),
+        "source_session_index": session_index, "replay_turn_index": turn_index,
+        "replay_count": count, "replay_number": rep, "prompt_override": prompt_override,
+        "new_session_id": new_session_id, "shadow_git_reset_tag": reset_tag,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (replay_run_dir / "replay_meta.json").write_text(json.dumps(replay_meta, indent=2))
+
+    run_meta = {
+        "run_name": run_name, "engine": config.engine, "model": config.model,
+        "provider": config.provider, "session_mode": config.session_mode.value,
+        "work_dir": config.work_dir, "tags": [*config.tags, "replay"],
+        "replay_source": source_name, "replay_turn": turn_index, "session_count": 1,
+        "sessions": [{
+            "session_index": result.session_index, "session_id": result.session_id,
+            "replay_source": source_name, "replay_turn": turn_index,
+            "step_count": result.step_count, "tool_call_count": result.tool_call_count,
+            "num_turns": result.num_turns, "total_cost_usd": result.total_cost_usd,
+            "compaction_count": result.compaction_count, "subagent_count": result.subagent_count,
+            "error": result.error, "started_at": result.started_at, "finished_at": result.finished_at,
+        }],
+        "started_at": result.started_at, "finished_at": result.finished_at,
+        "total_steps": result.step_count, "total_tool_calls": result.tool_call_count,
+        "total_cost_usd": result.total_cost_usd, "total_file_writes": len(state.write_log),
+        "total_compaction_events": result.compaction_count,
+        "total_subagent_invocations": result.subagent_count,
+        "errors": [result.error] if result.error else [],
+    }
+    (replay_run_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2, default=str))
+    with open(replay_run_dir / "config.yaml", "w") as f:
+        yaml.dump(config.model_dump(mode="json"), f, default_flow_style=False, sort_keys=False)
+
+    status = "ERROR" if result.error else "done"
+    rep_desc = f" r{rep}/{count}" if count > 1 else ""
+    typer.echo(f"  Replicate{rep_desc}... {status} ({result.step_count} steps, {result.tool_call_count} tool calls)")
+    return replay_run_dir
 
 
 def _find_session_dir(run_dir: Path, session_index: int) -> Path | None:

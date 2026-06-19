@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
-from harness.shadow_git import ShadowGit
-from harness.state import StateManager, WriteEvent, _safe_read_text
+from harness.state import StateManager, _safe_read_text
 
 
 class TestSafeReadText:
