@@ -13,12 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
 from pathlib import Path
 
 from pipeline.analyze import analyze
-from pipeline.config import load_sweep_config
+from pipeline.config import load_sweep_config, run_name_for
 from pipeline.events import detect_all
 from pipeline.judge import judge_all
 from pipeline.run_trajectories import _is_complete, _manifest_row
@@ -30,17 +29,16 @@ def main() -> None:
     interim = cfg.model_copy(update={"output_dir": cfg.output_dir + "_interim"})
     interim.out.mkdir(parents=True, exist_ok=True)
 
+    # Match the REAL completed run dirs against the sweep's known (value, rep) grid —
+    # engine/pressure-agnostic, no run-name parsing.
+    pvar = cfg.pressure.var
     rows = []
-    for run_dir in sorted(real_traj.iterdir()):
-        if not run_dir.is_dir() or not _is_complete(run_dir):
-            continue
-        m = re.match(r"bp_b(.+)_r(\d+)$", run_dir.name)
-        if not m:
-            continue
-        label, rep = m.group(1), int(m.group(2))
-        budget = None if label == "NONE" else float(label.replace("p", "."))
-        # run_dir points at the REAL completed trajectory (read-only here).
-        rows.append(_manifest_row(interim, budget, rep, run_dir.name, run_dir, "ok", None))
+    for value in cfg.pressure.values:
+        for rep in range(1, cfg.n_reps + 1):
+            run_dir = real_traj / run_name_for(pvar, value, rep)
+            if not run_dir.is_dir() or not _is_complete(run_dir):
+                continue
+            rows.append(_manifest_row(interim, value, rep, run_dir.name, run_dir, "ok", None))
     interim.manifest_path.write_text(json.dumps(rows, indent=2))
     ok = sum(1 for r in rows if r["status"] == "ok")
     print(f"interim manifest: {len(rows)} completed runs ({ok} ok) -> {interim.manifest_path}")

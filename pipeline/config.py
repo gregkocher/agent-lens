@@ -7,6 +7,7 @@ base AgentLens task config and overrides max_budget_usd / run_name / work_dir pe
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -140,6 +141,96 @@ class FinalScoreConfig(BaseModel):
         return self
 
 
+# --------------------------------------------------------------------------- pressure
+@dataclass(frozen=True)
+class PressureVar:
+    """One sweepable x-axis ('pressure') variable: how it is applied to an AgentLens
+    RunConfig, which engines support it, and how to read/label it. Registry-driven, so
+    adding an axis = one entry in PRESSURE_VARS (+ values in the sweep yaml)."""
+
+    name: str
+    runconfig_field: str   # RunConfig field set per run to apply the pressure
+    engines: frozenset     # engines that support this pressure variable
+    realized_metric: str   # run_meta/session key holding the ACHIEVED value (diagnostic)
+    axis_label: str        # x-axis label for the across-run plots
+    tag: str               # short run-name tag; keeps run_names stable & distinct per axis
+    short: str             # token used in plot filenames + "vs X" titles (e.g. "budget"/"turns")
+    fractional: bool       # True if "fraction of total consumed so far" is a meaningful
+                           # continuum for this pressure (budget, turn count) -> enables the
+                           # frac-used hazard/density analyses. False for non-continuum
+                           # pressures (e.g. how urgent the user's wording sounds).
+    fraction_axis_label: str  # x-axis label for the fraction-used analyses (when fractional)
+    tick_prefix: str          # axis-tick / arm-label unit prefix ("$" for USD, "" for counts)
+
+    def label(self, value) -> str:
+        """Filesystem-safe value label: 0.05 -> '0p05', 10 -> '10', None -> 'NONE'."""
+        if value is None:
+            return "NONE"
+        return ("%g" % value).replace(".", "p").replace("-", "neg")
+
+    def tick_label(self, value) -> str:
+        """Human axis-tick / arm label carrying the pressure's unit: 0.05 -> '$0.05'
+        (budget), 10 -> '10' (turns), None -> 'unlimited'."""
+        if value is None:
+            return "unlimited"
+        return f"{self.tick_prefix}{value:g}"
+
+
+PRESSURE_VARS: dict[str, PressureVar] = {
+    "budget_usd": PressureVar(
+        name="budget_usd", runconfig_field="max_budget_usd",
+        engines=frozenset({"claude_code"}), realized_metric="total_cost_usd",
+        axis_label="max budget (USD)", tag="b", short="budget", fractional=True,
+        fraction_axis_label="fraction of budget used (cost so far / set budget)",
+        tick_prefix="$"),
+    "max_turns": PressureVar(
+        name="max_turns", runconfig_field="max_turns",
+        engines=frozenset({"claude_code", "codex"}), realized_metric="num_turns",
+        axis_label="turn limit (max_turns)", tag="t", short="turns", fractional=True,
+        fraction_axis_label="fraction of turn limit used (turns so far / max_turns)",
+        tick_prefix=""),
+}
+
+
+class PressureConfig(BaseModel):
+    """The swept x-axis: which knob applies pressure, at what values (None = no cap)."""
+
+    variable: str
+    values: list[float | int | None]
+
+    @field_validator("variable")
+    @classmethod
+    def _check_variable(cls, v: str) -> str:
+        if v not in PRESSURE_VARS:
+            raise ValueError(
+                f"pressure.variable must be one of {sorted(PRESSURE_VARS)} (got {v!r})")
+        return v
+
+    @field_validator("values")
+    @classmethod
+    def _check_values(cls, v):
+        if not v:
+            raise ValueError("pressure.values must be non-empty")
+        bad = [x for x in v if x is not None and x <= 0]
+        if bad:
+            raise ValueError(f"pressure.values must be > 0 or null (got {bad})")
+        return v
+
+    @property
+    def var(self) -> PressureVar:
+        return PRESSURE_VARS[self.variable]
+
+
+def check_pressure_engine_compat(pressure: PressureConfig, engine: str) -> None:
+    """Raise if the sweep's pressure variable cannot be applied to `engine`."""
+    pvar = pressure.var
+    if engine not in pvar.engines:
+        raise ValueError(
+            f"pressure.variable '{pvar.name}' is not supported by engine '{engine}' "
+            f"(supported engines: {sorted(pvar.engines)}). "
+            f"For the codex engine, use pressure.variable: max_turns.")
+
+
 class SweepConfig(BaseModel):
     """Top-level meta-config for one budget-pressure experiment."""
 
@@ -149,7 +240,7 @@ class SweepConfig(BaseModel):
     output_dir: str                # all pipeline outputs live here
 
     # Phase 1 — trajectories
-    budgets_usd: list[float | None]  # None entry == no budget cap
+    pressure: PressureConfig         # the swept x-axis (variable + values; None = no cap)
     n_reps: int = 3
     n_trajectory_workers: int = 2
     max_turns: int | None = None     # if None, do NOT override the base task's max_turns
@@ -174,15 +265,15 @@ class SweepConfig(BaseModel):
     # Phase 3 — analysis
     wordcount_patterns: list[str] = Field(default_factory=lambda: list(DEFAULT_WORDCOUNT_PATTERNS))
 
-    @field_validator("budgets_usd")
-    @classmethod
-    def _check_budgets(cls, v):
-        if not v:
-            raise ValueError("budgets_usd must be non-empty")
-        bad = [b for b in v if b is not None and b <= 0]
-        if bad:
-            raise ValueError(f"budgets must be > 0 or null (got {bad})")
-        return v
+    @model_validator(mode="after")
+    def _check_pressure_vs_max_turns(self) -> "SweepConfig":
+        # max_turns is both a sweepable axis AND a global per-run override; sweeping it
+        # while ALSO pinning it globally is ambiguous, so forbid setting both.
+        if self.pressure.variable == "max_turns" and self.max_turns is not None:
+            raise ValueError(
+                "pressure.variable is 'max_turns' but a global `max_turns` override is "
+                "also set; remove the override (the sweep values control max_turns).")
+        return self
 
     @field_validator("n_reps", "n_trajectory_workers")
     @classmethod
@@ -244,15 +335,11 @@ class SweepConfig(BaseModel):
         return self.out / "final_scores.jsonl"
 
 
-def budget_label(budget: float | None) -> str:
-    """Filesystem-safe label for a budget value. 0.05 -> '0p05', 1.0 -> '1p0', None -> 'NONE'."""
-    if budget is None:
-        return "NONE"
-    return ("%g" % budget).replace(".", "p").replace("-", "neg")
-
-
-def run_name_for(budget: float | None, rep: int) -> str:
-    return f"bp_b{budget_label(budget)}_r{rep}"
+def run_name_for(pvar: PressureVar, value, rep: int) -> str:
+    """Stable per-axis run name, e.g. budget 0.05 rep 1 -> 'bp_b0p05_r1', turns 10 rep 1
+    -> 'bp_t10_r1'. Budget run-names are byte-identical to the pre-generalization scheme,
+    so existing trajectory/judgement caches keep matching."""
+    return f"bp_{pvar.tag}{pvar.label(value)}_r{rep}"
 
 
 def load_sweep_config(path: str | Path) -> SweepConfig:

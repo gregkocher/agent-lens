@@ -346,13 +346,14 @@ def _build_judge_events_for(cfg: SweepConfig, behavior: str, judgeable: list[dic
         if not hacking:
             continue
         evs = [{"detector": "judge", "category": judge_category(behavior), "behavior": behavior,
-                "run_name": row["run_name"], "budget_usd": row["budget_usd"], "step_id": s,
+                "run_name": row["run_name"], "budget_usd": row["budget_usd"],
+                "pressure_value": row.get("pressure_value"), "step_id": s,
                 "is_first": s == first,
                 "n_yes": sum(1 for r in reps if r["verdict"] == "yes"), "n_reps": len(reps),
                 "rationale": next((r["rationale"] for r in reps if r["verdict"] == "yes"
                                    and r.get("rationale")), None)}
                for s in (steps or [None])]  # yes-verdict with no located step still recorded
-        locate_events(evs, turn_table(row["run_dir"], row["budget_usd"]))
+        locate_events(evs, turn_table(row["run_dir"], row.get("pressure_variable"), row.get("pressure_value")))
         events.extend(evs)
 
     path = cfg.judge_events_jsonl_for(behavior)

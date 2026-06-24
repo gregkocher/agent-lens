@@ -1,10 +1,10 @@
-"""Phase 1 — run the budget sweep of AgentLens trajectories.
+"""Phase 1 — run the pressure sweep of AgentLens trajectories.
 
-For each (budget, rep): copy the base repo to an isolated per-run work_dir, run the
-AgentLens task with max_budget_usd set to that budget, record a manifest row, then
-delete the work_dir copy (the full_diff.patch + raw_dumps are saved in the run dir).
-Runs are concurrency-capped by n_trajectory_workers and are resumable (completed runs
-are skipped).
+For each (pressure value, rep): copy the base repo to an isolated per-run work_dir, run
+the AgentLens task with the swept pressure variable (e.g. max_budget_usd or max_turns)
+set to that value, record a manifest row, then delete the work_dir copy (the
+full_diff.patch + raw_dumps are saved in the run dir). Runs are concurrency-capped by
+n_trajectory_workers and are resumable (completed runs are skipped).
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ from pathlib import Path
 from harness.config import SessionMode, load_config
 from harness.experiment import run_experiment
 
-from pipeline.config import SweepConfig, run_name_for
+from pipeline.config import (SweepConfig, check_pressure_engine_compat,
+                             run_name_for)
 
 FINGERPRINT_FILE = ".pipeline_fingerprint"
 _SIG_SKIP = {"__pycache__", ".git", ".shadow_git", "node_modules"}
@@ -74,28 +75,41 @@ def _fingerprint_config(run_config, base_sig: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _build_run_config(cfg: SweepConfig, base_cfg, budget, rep: int, work_dir: Path):
+def _build_run_config(cfg: SweepConfig, base_cfg, value, rep: int, work_dir: Path):
+    pvar = cfg.pressure.var
     run_config = base_cfg.model_copy(deep=True)
-    run_config.run_name = run_name_for(budget, rep)
-    run_config.max_budget_usd = budget
+    run_config.run_name = run_name_for(pvar, value, rep)
+    setattr(run_config, pvar.runconfig_field, value)   # apply the swept pressure
     run_config.work_dir = str(work_dir)
     run_config.session_mode = SessionMode.ISOLATED  # pipeline always runs isolated
     run_config.capture_api_requests = True
     run_config.revert_work_dir = False
-    if cfg.max_turns is not None:
+    if cfg.max_turns is not None:                      # global cap (only when not the axis)
         run_config.max_turns = cfg.max_turns
     if cfg.agent_model:
         run_config.model = cfg.agent_model
     if cfg.agent_provider:
         run_config.provider = cfg.agent_provider
+    # agent_provider override bypasses RunConfig validation (model_copy doesn't
+    # re-validate); re-check the one cross-field constraint that matters for routing.
+    if run_config.engine == "codex" and run_config.provider not in ("openai", "openrouter"):
+        raise ValueError(
+            f"engine 'codex' requires provider 'openai' or 'openrouter', got "
+            f"{run_config.provider!r} (check agent_provider in the sweep config).")
     return run_config
 
 
-def _manifest_row(cfg: SweepConfig, budget, rep: int, run_name: str, run_dir: Path,
+def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Path,
                   status: str, error: str | None) -> dict:
+    variable = cfg.pressure.variable
     row = {
         "run_name": run_name,
-        "budget_usd": budget,
+        "pressure_variable": variable,
+        "pressure_value": value,
+        # budget_usd kept as a budget-SEMANTIC alias for the within-run budget-fraction
+        # machinery (turn_table / hazard); None for non-budget sweeps.
+        "budget_usd": value if variable == "budget_usd" else None,
+        "engine": None,
         "rep": rep,
         "run_dir": str(run_dir),
         "status": status,
@@ -108,6 +122,7 @@ def _manifest_row(cfg: SweepConfig, budget, rep: int, run_name: str, run_dir: Pa
     if meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text())
+            row["engine"] = meta.get("engine")
             row["cost_usd"] = meta.get("total_cost_usd")
             row["steps"] = meta.get("total_steps")
             sessions = meta.get("sessions") or []
@@ -121,19 +136,19 @@ def _manifest_row(cfg: SweepConfig, budget, rep: int, run_name: str, run_dir: Pa
     return row
 
 
-async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, budget, rep: int, sem: asyncio.Semaphore) -> dict:
-    run_name = run_name_for(budget, rep)
+async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, sem: asyncio.Semaphore) -> dict:
+    run_name = run_name_for(cfg.pressure.var, value, rep)
     run_dir = cfg.trajectories_dir / run_name
     work_dir = (cfg.work_dirs_dir / run_name).resolve()
 
-    run_config = _build_run_config(cfg, base_cfg, budget, rep, work_dir)
+    run_config = _build_run_config(cfg, base_cfg, value, rep, work_dir)
     fp = _fingerprint_config(run_config, base_sig)
     fp_path = run_dir / FINGERPRINT_FILE
 
     # Resume only when complete AND the effective config is unchanged.
     if _is_complete(run_dir) and fp_path.exists() and fp_path.read_text().strip() == fp:
         print(f"[skip] {run_name} already complete (config unchanged)")
-        return _manifest_row(cfg, budget, rep, run_name, run_dir, "ok", None)
+        return _manifest_row(cfg, value, rep, run_name, run_dir, "ok", None)
 
     async with sem:
         # Stale/incomplete run dir from a prior config -> remove and redo.
@@ -149,8 +164,8 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, budget, rep: int, 
         # perms, so restore write on the agent's private copy.
         _chmod_writable(work_dir)
 
-        budget_str = "no-cap" if budget is None else f"${budget}"
-        print(f"[run ] {run_name}  budget={budget_str}  work_dir={work_dir}")
+        val_str = "uncapped" if value is None else str(value)
+        print(f"[run ] {run_name}  {cfg.pressure.variable}={val_str}  work_dir={work_dir}")
         status, error = "ok", None
         try:
             # Wall-clock guard: a single wedged session (e.g. a stuck SDK/network wait on
@@ -170,7 +185,7 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, budget, rep: int, 
             # work_dir copy is disposable — outputs are saved under run_dir.
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    row = _manifest_row(cfg, budget, rep, run_name, run_dir, status, error)
+    row = _manifest_row(cfg, value, rep, run_name, run_dir, status, error)
     if row["status"] == "ok" and run_dir.exists():
         fp_path.write_text(fp)  # stamp only successful, complete runs
     print(f"[done] {run_name}  status={row['status']}  cost={row['cost_usd']}  steps={row['steps']}")
@@ -178,7 +193,7 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, budget, rep: int, 
 
 
 async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
-    """Roll out every (budget, rep) trajectory AND judge each one as it completes.
+    """Roll out every (pressure value, rep) trajectory AND judge each one as it completes.
 
     Rollout (Anthropic) and judging (OpenRouter) use separate semaphores and APIs, so
     trajectory B rolls out while trajectory A is judged — no rate-limit contention.
@@ -191,6 +206,7 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
 
     cfg.trajectories_dir.mkdir(parents=True, exist_ok=True)
     base_cfg = load_config(cfg.base_task_config)
+    check_pressure_engine_compat(cfg.pressure, base_cfg.engine)  # fail-fast on bad combo
     base_sig = dir_signature(cfg.base_work_dir)  # computed once; captures repo edits
 
     api_key = load_judge_api_key(cfg)            # fail-fast before any rollout
@@ -200,8 +216,8 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
     tally: dict = {}
 
     async with httpx.AsyncClient(timeout=cfg.judge.request_timeout) as client:
-        async def _run_and_judge(budget, rep) -> dict:
-            row = await _run_one(cfg, base_cfg, base_sig, budget, rep, sem)
+        async def _run_and_judge(value, rep) -> dict:
+            row = await _run_one(cfg, base_cfg, base_sig, value, rep, sem)
             if row.get("status") == "ok":
                 try:
                     await judge_run(client, cfg, api_key, behavior_rubrics, row, judge_sem, tally=tally)
@@ -210,8 +226,8 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
             return row
 
         rows = await asyncio.gather(*(
-            _run_and_judge(budget, rep)
-            for budget in cfg.budgets_usd
+            _run_and_judge(value, rep)
+            for value in cfg.pressure.values
             for rep in range(1, cfg.n_reps + 1)
         ))
 

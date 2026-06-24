@@ -10,8 +10,8 @@ import json
 
 import pytest
 
-from pipeline.config import (MODES, HackSignalsConfig, JudgeConfig, SweepConfig,
-                             budget_label, run_name_for)
+from pipeline.config import (MODES, PRESSURE_VARS, HackSignalsConfig, JudgeConfig,
+                             SweepConfig, check_pressure_engine_compat, run_name_for)
 from pipeline.events import detect_events, locate_events, turn_table
 from pipeline.judge import _parse_binary, _validate_locations, aggregate_judge_locations
 from pipeline.render import _fit_blocks, _render_diff, render_trajectory
@@ -37,8 +37,8 @@ def _rh_behavior(**kw):
 
 def _sweep(**kw):
     base = dict(experiment_name="t", base_task_config="x", base_work_dir="y",
-                output_dir="z", budgets_usd=[0.05, None], judge=_judge_cfg(),
-                behaviors=[_rh_behavior()])
+                output_dir="z", pressure={"variable": "budget_usd", "values": [0.05, None]},
+                judge=_judge_cfg(), behaviors=[_rh_behavior()])
     base.update(kw)
     return SweepConfig(**base)
 
@@ -66,20 +66,40 @@ def test_render_diff_short_passthrough():
 
 
 # --------------------------------------------------------------------------- labels
-def test_budget_label_and_run_name():
-    assert budget_label(0.05) == "0p05"
-    assert budget_label(1.0) == "1"       # "%g" drops the trailing .0
-    assert budget_label(1.5) == "1p5"
-    assert budget_label(None) == "NONE"
-    assert run_name_for(0.05, 2) == "bp_b0p05_r2"
-    assert run_name_for(None, 1) == "bp_bNONE_r1"
+def test_pressure_label_and_run_name():
+    b = PRESSURE_VARS["budget_usd"]
+    assert b.label(0.05) == "0p05"
+    assert b.label(1.0) == "1"       # "%g" drops the trailing .0
+    assert b.label(1.5) == "1p5"
+    assert b.label(None) == "NONE"
+    assert run_name_for(b, 0.05, 2) == "bp_b0p05_r2"   # budget run-names unchanged (cache-safe)
+    assert run_name_for(b, None, 1) == "bp_bNONE_r1"
+    t = PRESSURE_VARS["max_turns"]
+    assert run_name_for(t, 10, 1) == "bp_t10_r1"        # turn axis: distinct 't' tag
+
+
+def test_pressure_engine_compat():
+    sweep = _sweep()  # budget_usd
+    check_pressure_engine_compat(sweep.pressure, "claude_code")   # ok
+    with pytest.raises(ValueError):
+        check_pressure_engine_compat(sweep.pressure, "codex")     # monetary not on codex
+    turns = _sweep(pressure={"variable": "max_turns", "values": [10, 20]})
+    check_pressure_engine_compat(turns.pressure, "codex")         # turn limit ok on codex
+    check_pressure_engine_compat(turns.pressure, "claude_code")
+
+
+def test_max_turns_pressure_rejects_global_override():
+    with pytest.raises(Exception):     # ambiguous: max_turns swept AND globally pinned
+        _sweep(pressure={"variable": "max_turns", "values": [10, 20]}, max_turns=30)
+    _sweep(pressure={"variable": "budget_usd", "values": [0.05]}, max_turns=30)  # fine
 
 
 # --------------------------------------------------------------------------- config validation
 @pytest.mark.parametrize("kw", [
-    dict(budgets_usd=[0.0, 1.0]),     # non-positive budget
-    dict(budgets_usd=[-1.0]),         # negative budget
-    dict(budgets_usd=[]),             # empty
+    dict(pressure={"variable": "budget_usd", "values": [0.0, 1.0]}),  # non-positive value
+    dict(pressure={"variable": "budget_usd", "values": [-1.0]}),      # negative value
+    dict(pressure={"variable": "budget_usd", "values": []}),          # empty
+    dict(pressure={"variable": "bogus", "values": [1.0]}),            # unknown variable
     dict(n_reps=0),                   # zero reps
     dict(n_trajectory_workers=0),     # zero workers
 ])
@@ -452,7 +472,7 @@ def test_turn_table_and_locate(tmp_path):
         captures=[{"request_index": 1, "usage": {"output_tokens": 100}},
                   {"request_index": 2, "usage": {"output_tokens": 50}}],
     )
-    turns = turn_table(run, budget_usd=0.5)
+    turns = turn_table(run, "budget_usd", 0.5)
     assert [t["turn_index"] for t in turns] == [1, 2]
     assert turns[0]["frac_used"] == 0.0          # capped run, reminder not injected yet
     assert turns[1]["frac_used"] == pytest.approx(0.2)
@@ -463,7 +483,22 @@ def test_turn_table_and_locate(tmp_path):
     assert events[0]["api_turn"] == 2 and events[0]["frac_used"] == pytest.approx(0.2)
 
     # unlimited run: no reminder -> frac stays None
-    assert turn_table(run, budget_usd=None)[0]["frac_used"] is None
+    assert turn_table(run, "budget_usd", None)[0]["frac_used"] is None
+
+
+def test_turn_table_turn_fraction(tmp_path):
+    # max_turns pressure: frac_used = (1-based turn ordinal) / cap, no reminder needed.
+    sd = tmp_path / "session_01"
+    sd.mkdir()
+    (sd / "uuid_map.json").write_text(json.dumps({"turns": [
+        {"turn_index": 1, "atif_step_ids": [1], "request_file": "request_001.json"},
+        {"turn_index": 2, "atif_step_ids": [2], "request_file": "request_002.json"},
+    ]}))
+    rows = turn_table(tmp_path, "max_turns", 4)
+    assert [r["frac_used"] for r in rows] == [0.25, 0.5]   # 1/4, 2/4
+    assert rows[0]["pressure_value"] == 4 and rows[0]["budget_usd"] is None
+    # uncapped turn sweep (value None) -> no fraction
+    assert turn_table(tmp_path, "max_turns", None)[0]["frac_used"] is None
 
 
 # --------------------------------------------------------------------------- final_score

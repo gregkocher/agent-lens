@@ -16,7 +16,9 @@ output_dir: pipeline_runs/budget_pressure_lru_exact_v2
 # PHASE 1 — trajectories
 # Denser low/mid grid where the budget-pressure gradient actually lives (LRU satisfices
 # ~$0.7-0.9), 10 arms incl. unlimited.
-budgets_usd: [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50, null]
+pressure:
+  variable: budget_usd
+  values: [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50, null]
 n_reps: 100
 n_trajectory_workers: 8          # parallel is OK for the hacking analysis: the survival/hazard
                                  # clock is turns + token-budget fraction (not wall time), and

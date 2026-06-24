@@ -44,9 +44,19 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from pipeline.config import SweepConfig
+from pipeline.config import PRESSURE_VARS, SweepConfig
 from pipeline.events import HACK_CATEGORIES
 from pipeline.wordcount import agent_turns_from_dumps, budget_mention_fractions, count_budget_words
+
+
+# Pressure-aware plot labels, set per-sweep by analyze() from cfg.pressure.var:
+#   _X_AXIS_LABEL   — across-run x-axis label ("max budget (USD)" / "turn limit (max_turns)")
+#   _PVAR_SHORT     — token in filenames + "vs X" titles ("budget" / "turns")
+#   _FRACTION_LABEL — x-axis label for the fraction-used analyses
+_X_AXIS_LABEL = "max budget (USD)"
+_PVAR_SHORT = "budget"
+_FRACTION_LABEL = "fraction of budget used (cost so far / set budget)"
+_PVAR = PRESSURE_VARS["budget_usd"]  # active pressure var; set per-sweep by analyze()
 
 
 def _mean_se(values: list[float]) -> tuple[float, float]:
@@ -63,7 +73,8 @@ def _budget_sort_key(b):
 
 
 def _budget_label(b) -> str:
-    return "unlimited" if b is None else f"${b:g}"
+    # Unit-aware tick / arm label for the active pressure ("$0.05" for budget, "10" for turns).
+    return _PVAR.tick_label(b)
 
 
 def _line_positions(budgets) -> list[float]:
@@ -125,7 +136,7 @@ def _violin(positions, datasets, labels, ylabel, title, out_path: Path, color: s
         offs = np.linspace(-spread, spread, n) if n > 1 else np.array([0.0])
         ax.scatter(xi + offs, vals, s=24, color=color, edgecolor="white", linewidth=0.5, zorder=3)
     _budget_xaxis(ax, pos, labels)
-    ax.set_xlabel("max budget (USD)")
+    ax.set_xlabel(_X_AXIS_LABEL)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, axis="y", alpha=0.3)
@@ -175,13 +186,13 @@ def _overlaid_density(datasets, labels, colors, xlabel, ylabel, title, out_path:
             ax.fill_between(grid, dens, color=col, alpha=0.10)
         else:
             ax.plot([], [], color=col, lw=2, label=f"{lab}  (n={n})")
-    ax.axvline(1.0, color="grey", ls="--", lw=1, alpha=0.6)  # budget exhausted
+    ax.axvline(1.0, color="grey", ls="--", lw=1, alpha=0.6)  # cap exhausted
     ax.set_xlim(0, x_hi)
     ax.set_ylim(bottom=0)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    ax.legend(title="set budget", fontsize=9)
+    ax.legend(title=f"set {_PVAR_SHORT}", fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,7 +211,7 @@ def _plot(positions, labels, y, yerr, ylabel, title, out_path: Path, color: str)
     hi = np.where(np.isnan(yerr), y, y + yerr)
     ax.fill_between(x, lo, hi, color=color, alpha=0.20, linewidth=0)
     _budget_xaxis(ax, x, labels)
-    ax.set_xlabel("max budget (USD)")
+    ax.set_xlabel(_X_AXIS_LABEL)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
@@ -325,7 +336,7 @@ def _person_period_rows(cfg: SweepConfig, judgeable: list[dict],
             if ev_turn is not None and t > ev_turn:
                 break
             rows.append({
-                "run_name": rn, "budget_usd": r["budget_usd"], "turn": t,
+                "run_name": rn, "pressure_value": r["pressure_value"], "turn": t,
                 "frac_used": row["frac_used"], "spent_usd": row["spent_usd"],
                 "cum_output_tokens": row["cum_output_tokens"],
                 "event": int(ev_turn is not None and t == ev_turn),
@@ -353,7 +364,7 @@ def _recurrent_person_period(cfg: SweepConfig, judgeable: list[dict],
             t = row["turn_index"]
             n_ev = cnts.get(t, 0)
             rows.append({
-                "run_name": rn, "budget_usd": r["budget_usd"], "turn": t,
+                "run_name": rn, "pressure_value": r["pressure_value"], "turn": t,
                 "frac_used": row["frac_used"], "spent_usd": row["spent_usd"],
                 "cum_output_tokens": row["cum_output_tokens"],
                 "n_hack_events": n_ev, "event": int(n_ev > 0),
@@ -491,7 +502,7 @@ def _state_dependence_analysis(cfg: SweepConfig, behavior: str, det_label: str, 
             m, b = np.polyfit(of, rate, 1)
             xs = np.array([of.min(), of.max()])
             ax.plot(xs, m * xs + b, color="#8e44ad", ls="--", lw=1.5, alpha=0.7)
-        ax.set_xlabel("onset fraction (budget used at FIRST transgression)")
+        ax.set_xlabel(f"onset fraction ({_PVAR_SHORT} used at FIRST transgression)")
         ax.set_ylabel("post-onset recurrence rate")
         ax.set_title(f"{cfg.experiment_name}: {behavior} onset-timing vs recurrence ({det_label})\n"
                      f"Spearman ρ={rho:.2f}, p={pval:.3g}, n={len(pts)} "
@@ -535,7 +546,7 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
     fig, ax = plt.subplots(figsize=(8, 5))
     total_events = 0
     for b, lab, col in zip(budgets, labels, arm_colors):
-        runs = [r["run_name"] for r in judgeable if r["budget_usd"] == b]
+        runs = [r["run_name"] for r in judgeable if r["pressure_value"] == b]
         durations, evs = [], []
         for rn in runs:
             if rn in first_hacks:
@@ -555,7 +566,7 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
     ax.set_ylabel("S(t) = P(no hack event by turn t)")
     ax.set_ylim(0, 1.02)
     ax.set_title(f"{cfg.experiment_name}: survival without hack event ({det_label} detector)")
-    ax.legend(title="set budget", fontsize=9)
+    ax.legend(title=cfg.pressure.var.axis_label, fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     figs.mkdir(parents=True, exist_ok=True)
@@ -586,7 +597,7 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
         for b, lab, col in zip(budgets, labels, arm_colors):
             if b is None:
                 continue
-            arm = [r for r in capped_rows if r["budget_usd"] == b]
+            arm = [r for r in capped_rows if r["pressure_value"] == b]
             n_ev = sum(r["event"] for r in arm)
             if n_ev < MIN_ARM_EVENTS:
                 if arm:
@@ -598,9 +609,9 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
             ax.plot(xs_a, hz_a, "-o", color=col, lw=1.5, alpha=0.8,
                     label=f"{lab}  (events={n_ev})")
         ax.axvline(1.0, color="grey", ls="--", lw=1, alpha=0.6)
-        ax.set_xlabel("fraction of budget used at turn")
+        ax.set_xlabel(_FRACTION_LABEL)
         ax.set_ylabel("hazard: P(first hack at this turn | no hack yet)")
-        ax.set_title(f"{cfg.experiment_name}: hack hazard vs budget pressure ({det_label})")
+        ax.set_title(f"{cfg.experiment_name}: hack hazard vs {_PVAR_SHORT} pressure ({det_label})")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
@@ -645,7 +656,7 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
             for b, lab, col in zip(budgets, labels, arm_colors):
                 if b is None:
                     continue
-                arm = [r for r in rec_capped if r["budget_usd"] == b]
+                arm = [r for r in rec_capped if r["pressure_value"] == b]
                 n_ev = sum(r["n_hack_events"] for r in arm)
                 if n_ev < MIN_ARM_EVENTS:
                     continue
@@ -655,7 +666,7 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
                 ax.plot(xs_a, it_a, "-o", color=col, lw=1.5, alpha=0.8,
                         label=f"intensity {lab}  (events={n_ev})")
             ax.axvline(1.0, color="grey", ls="--", lw=1, alpha=0.6)
-            ax.set_xlabel("fraction of budget used at turn")
+            ax.set_xlabel(_FRACTION_LABEL)
             ax.set_ylabel("hack actions per at-risk turn")
             ax.set_title(f"{cfg.experiment_name}: hacking intensity vs onset hazard ({det_label})")
             ax.legend(fontsize=8)
@@ -679,7 +690,7 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
     if "judge" in sources:
         rate_d = []
         for b in budgets:
-            runs = [r["run_name"] for r in judgeable if r["budget_usd"] == b]
+            runs = [r["run_name"] for r in judgeable if r["pressure_value"] == b]
             rate_d.append([p_hat_by_run[rn] / api_turns_by_run[rn] for rn in runs
                            if rn in p_hat_by_run and api_turns_by_run.get(rn)])
         if any(rate_d):
@@ -687,21 +698,21 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
             _plot(line_pos, labels, list(means), list(ses),
                   f"{behavior} yes-rate / API turn",
                   f"{cfg.experiment_name}: {behavior} rate per turn (exposure-corrected)",
-                  figs / f"binary_rate_per_turn_vs_budget_{behavior}.pdf", "#c0392b")
+                  figs / f"binary_rate_per_turn_vs_{_PVAR_SHORT}_{behavior}.pdf", "#c0392b")
 
     # ---- density of hack events on the fraction-used axis (all events, capped arms) ----
     capped = [b for b in budgets if b is not None]
     ev_by_budget = {b: [] for b in capped}
     for e in _iter_hack_events(cfg, behavior, sources):
-        if e.get("frac_used") is not None and e.get("budget_usd") in ev_by_budget:
-            ev_by_budget[e["budget_usd"]].append(e["frac_used"])
+        if e.get("frac_used") is not None and e.get("pressure_value") in ev_by_budget:
+            ev_by_budget[e["pressure_value"]].append(e["frac_used"])
     if any(ev_by_budget.values()):
         frac_colors = [plt.cm.viridis(i / max(1, len(capped) - 1)) for i in range(len(capped))]
         _overlaid_density(
             [ev_by_budget[b] for b in capped], [_budget_label(b) for b in capped], frac_colors,
-            "fraction of budget used (cost so far / set budget)",
+            _FRACTION_LABEL,
             "probability density of hack events",
-            f"{cfg.experiment_name}: when (in budget consumption) hack events occur ({det_label})",
+            f"{cfg.experiment_name}: when (in {_PVAR_SHORT} consumption) hack events occur ({det_label})",
             figs / f"hack_events_by_fraction_used{suffix}.pdf")
 
     return diag_out
@@ -719,6 +730,12 @@ def analyze(cfg: SweepConfig) -> None:
     if not judgeable:
         print("No status=ok trajectories with a trajectory.json to analyze. Run --phase run first.")
         return
+
+    global _X_AXIS_LABEL, _PVAR_SHORT, _FRACTION_LABEL, _PVAR
+    _PVAR = cfg.pressure.var
+    _X_AXIS_LABEL = _PVAR.axis_label               # generalize the across-run x-axis label
+    _PVAR_SHORT = _PVAR.short                       # filename/title token
+    _FRACTION_LABEL = _PVAR.fraction_axis_label     # fraction-used x-axis label
 
     # ---- judge fingerprints for staleness (keyed run|behavior|mode) ----
     expected_fp = None
@@ -778,10 +795,10 @@ def analyze(cfg: SweepConfig) -> None:
             word_perturn_api_by_run[rn] = raw / at
 
     # ---- group by budget ----
-    budgets = sorted({r["budget_usd"] for r in judgeable}, key=_budget_sort_key)
+    budgets = sorted({r["pressure_value"] for r in judgeable}, key=_budget_sort_key)
     rows = []
     for b in budgets:
-        runs = [r["run_name"] for r in judgeable if r["budget_usd"] == b]
+        runs = [r["run_name"] for r in judgeable if r["pressure_value"] == b]
         words = [word_perturn_by_run[rn] for rn in runs if rn in word_perturn_by_run]
         words_api = [word_perturn_api_by_run[rn] for rn in runs if rn in word_perturn_api_by_run]
         raws = [word_raw_by_run[rn] for rn in runs if rn in word_raw_by_run]
@@ -818,18 +835,18 @@ def analyze(cfg: SweepConfig) -> None:
 
     # budget-awareness LINE plots — SDK num_turns (unreliable, retitled) + API turns (recommended)
     _plot(line_pos, labels, df["wordrate_sdk_mean"], df["wordrate_sdk_se"],
-          "budget-word mentions / turn (SDK num_turns)",
-          f"{cfg.experiment_name}: budget-awareness vs budget  [SDK num_turns]",
-          figs / "budget_mentions_vs_budget.pdf", "#2980b9")
+          "pressure-word mentions / turn (SDK num_turns)",
+          f"{cfg.experiment_name}: pressure-awareness vs {_PVAR_SHORT}  [SDK num_turns]",
+          figs / f"pressure_mentions_vs_{_PVAR_SHORT}.pdf", "#2980b9")
     _plot(line_pos, labels, df["wordrate_api_mean"], df["wordrate_api_se"],
-          "budget-word mentions / API turn",
-          f"{cfg.experiment_name}: budget-awareness vs budget  [per API turn]",
-          figs / "budget_mentions_apiturns_vs_budget.pdf", "#2980b9")
+          "pressure-word mentions / API turn",
+          f"{cfg.experiment_name}: pressure-awareness vs {_PVAR_SHORT}  [per API turn]",
+          figs / f"pressure_mentions_apiturns_vs_{_PVAR_SHORT}.pdf", "#2980b9")
 
     # --- per-budget DISTRIBUTION plots (violin KDE + overlaid raw run points) ---
     cost_d, aware_sdk_d, aware_api_d, turn_sdk_d, turn_api_d = [], [], [], [], []
     for b in budgets:
-        runs = [r["run_name"] for r in judgeable if r["budget_usd"] == b]
+        runs = [r["run_name"] for r in judgeable if r["pressure_value"] == b]
         cost_d.append([cost_by_run[rn] for rn in runs if rn in cost_by_run])
         aware_sdk_d.append([word_perturn_by_run[rn] for rn in runs if rn in word_perturn_by_run])
         aware_api_d.append([word_perturn_api_by_run[rn] for rn in runs if rn in word_perturn_api_by_run])
@@ -837,22 +854,22 @@ def analyze(cfg: SweepConfig) -> None:
         turn_api_d.append([api_turns_by_run[rn] for rn in runs if rn in api_turns_by_run])
 
     _violin(line_pos, cost_d, labels, "actual run cost (USD)",
-            f"{cfg.experiment_name}: run-cost distribution per budget",
-            figs / "cost_dist_vs_budget.pdf", "#16a085")
+            f"{cfg.experiment_name}: run-cost distribution per {_PVAR_SHORT}",
+            figs / f"cost_dist_vs_{_PVAR_SHORT}.pdf", "#16a085")
     # turn-count distribution: SDK (unreliable, retitled) + API (recommended)
     _violin(line_pos, turn_sdk_d, labels, "turns per run (SDK num_turns)",
             f"{cfg.experiment_name}: turn-count distribution  [SDK num_turns]",
-            figs / "turns_dist_vs_budget.pdf", "#2c3e50")
+            figs / f"turns_dist_vs_{_PVAR_SHORT}.pdf", "#2c3e50")
     _violin(line_pos, turn_api_d, labels, "turns per run (API turns)",
             f"{cfg.experiment_name}: turn-count distribution  [API turns]",
-            figs / "turns_dist_apiturns_vs_budget.pdf", "#2c3e50")
-    # budget-awareness distribution: SDK (unreliable, retitled) + API (recommended)
-    _violin(line_pos, aware_sdk_d, labels, "budget-words / turn (SDK num_turns)",
-            f"{cfg.experiment_name}: budget-awareness distribution  [SDK num_turns]",
-            figs / "budget_awareness_dist_vs_budget.pdf", "#d35400")
-    _violin(line_pos, aware_api_d, labels, "budget-words / API turn",
-            f"{cfg.experiment_name}: budget-awareness distribution  [per API turn]",
-            figs / "budget_awareness_dist_apiturns_vs_budget.pdf", "#d35400")
+            figs / f"turns_dist_apiturns_vs_{_PVAR_SHORT}.pdf", "#2c3e50")
+    # pressure-awareness distribution: SDK (unreliable, retitled) + API (recommended)
+    _violin(line_pos, aware_sdk_d, labels, "pressure-words / turn (SDK num_turns)",
+            f"{cfg.experiment_name}: pressure-awareness distribution  [SDK num_turns]",
+            figs / f"pressure_awareness_dist_vs_{_PVAR_SHORT}.pdf", "#d35400")
+    _violin(line_pos, aware_api_d, labels, "pressure-words / API turn",
+            f"{cfg.experiment_name}: pressure-awareness distribution  [per API turn]",
+            figs / f"pressure_awareness_dist_apiturns_vs_{_PVAR_SHORT}.pdf", "#d35400")
 
     # --- NEW: WHEN (in budget consumption) the agent mentions budget ---
     # x = fraction of budget used (SPENT/TOTAL) at each mention; one density per CAPPED
@@ -861,17 +878,17 @@ def analyze(cfg: SweepConfig) -> None:
     frac_datasets, frac_labels = [], []
     for b in capped:
         pooled = []
-        for r in [r for r in judgeable if r["budget_usd"] == b]:
+        for r in [r for r in judgeable if r["pressure_value"] == b]:
             pooled.extend(budget_mention_fractions(r["run_dir"], cfg.wordcount_patterns, capped=True))
         frac_datasets.append(pooled)
         frac_labels.append(_budget_label(b))
     frac_colors = [plt.cm.viridis(i / max(1, len(capped) - 1)) for i in range(len(capped))]
     _overlaid_density(
         frac_datasets, frac_labels, frac_colors,
-        "fraction of budget used (cost so far / set budget)",
-        "probability density of budget-word mentions",
-        f"{cfg.experiment_name}: when (in budget consumption) the agent mentions budget",
-        figs / "budget_mentions_by_fraction_used.pdf")
+        _FRACTION_LABEL,
+        "probability density of pressure-word mentions",
+        f"{cfg.experiment_name}: when (in {_PVAR_SHORT} consumption) the agent mentions {_PVAR_SHORT}",
+        figs / "pressure_mentions_by_fraction_used.pdf")
 
     # ---- PER-BEHAVIOR: rate/severity plots + per-detector exposure-corrected analysis ----
     mech_behaviors = {b.name for b in cfg.all_behaviors if b.mechanical and b.mechanical.enabled}
@@ -882,7 +899,7 @@ def analyze(cfg: SweepConfig) -> None:
 
         brows = []
         for bud in budgets:
-            runs = [r["run_name"] for r in judgeable if r["budget_usd"] == bud]
+            runs = [r["run_name"] for r in judgeable if r["pressure_value"] == bud]
             p_hats = [float(np.mean(bin_by_run[rn])) for rn in runs if bin_by_run.get(rn)]
             scores = [float(np.mean(scl_by_run[rn])) for rn in runs if scl_by_run.get(rn)]
             br, bse = _mean_se(p_hats)
@@ -898,13 +915,13 @@ def analyze(cfg: SweepConfig) -> None:
         if bdf["n_binary"].sum() > 0:
             _plot(line_pos, labels, bdf["binary_rate"], bdf["binary_se"],
                   f"{behavior} rate (fraction 'yes')",
-                  f"{cfg.experiment_name}: {behavior} rate vs budget",
-                  figs / f"binary_rate_vs_budget_{behavior}.pdf", "#c0392b")
+                  f"{cfg.experiment_name}: {behavior} rate vs {_PVAR_SHORT}",
+                  figs / f"binary_rate_vs_{_PVAR_SHORT}_{behavior}.pdf", "#c0392b")
         if bdf["n_scale"].sum() > 0:
             _plot(line_pos, labels, bdf["score_mean"], bdf["score_se"],
                   f"mean {behavior} score (1-5)",
-                  f"{cfg.experiment_name}: {behavior} degree vs budget",
-                  figs / f"score_vs_budget_{behavior}.pdf", "#8e44ad")
+                  f"{cfg.experiment_name}: {behavior} degree vs {_PVAR_SHORT}",
+                  figs / f"score_vs_{_PVAR_SHORT}_{behavior}.pdf", "#8e44ad")
 
         # exposure-corrected event/hazard analysis, per available detector
         p_hat_by_run = {rn: float(np.mean(v)) for rn, v in bin_by_run.items() if v}

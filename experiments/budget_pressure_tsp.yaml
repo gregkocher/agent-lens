@@ -9,7 +9,9 @@ base_work_dir: repos/comb-opt
 output_dir: pipeline_runs/budget_pressure_tsp_v2
 
 # PHASE 1 — trajectories
-budgets_usd: [0.01, 0.05, 0.10, 0.50, 1.0, 2.0, null]   # 1c..$2, unlimited (null = no cap)
+pressure:
+  variable: budget_usd
+  values: [0.01, 0.05, 0.10, 0.50, 1.0, 2.0, null]   # 1c..$2, unlimited (null = no cap)
 n_reps: 25
 n_trajectory_workers: 2
 max_turns: null                  # present but NOT passed to the agent when null (budget is the lever)
