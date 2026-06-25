@@ -41,9 +41,35 @@ from harness.engines.base import (
     EngineToolResult,
     ResultEvent,
     SystemEvent,
+    classify_api_failure,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def classify_codex_nonzero_exit(
+    did_work: bool, has_rollout_budget: bool, stderr: str
+) -> tuple[bool, str | None]:
+    """Classify a non-zero ``codex exec`` exit that emitted NO turn.failed/error event.
+
+    Codex exits non-zero in three different situations that the --json stream does
+    not distinguish, so we disambiguate from stderr + run state:
+
+    Returns ``(is_error, stop_reason)``:
+      * ``(True, "rate_limited"|"auth_error")`` — stderr shows an API failure. This
+        is checked FIRST so a rate-limit that happens to land on a budgeted arm is
+        never mistaken for a budget wall (which would be kept as ok and never re-run).
+      * ``(False, "budget_exhausted")`` — a rollout budget was set and the agent did
+        real work: a graceful budget truncation (the Codex analogue of Claude's
+        max_budget_usd stop), kept as ok with the partial trajectory.
+      * ``(True, None)`` — a generic failure; the runner labels it ``"error"``.
+    """
+    api_failure = classify_api_failure(stderr)
+    if api_failure is not None:
+        return True, api_failure
+    if has_rollout_budget and did_work:
+        return False, "budget_exhausted"
+    return True, None
 
 DEFAULT_SANDBOX = "workspace-write"
 
@@ -194,13 +220,20 @@ class CodexEngine(Engine):
         # the partial trajectory is kept and analyzed rather than discarded as an error.
         stop_reason: str | None = None
         if rc != 0 and not is_error:
-            if spec.extra.get("codex_rollout_budget_tokens") and did_work:
-                stop_reason = "budget_exhausted"
-                logger.info("codex exited %d with rollout budget set + work done -> "
-                            "graceful budget truncation (kept as ok)", rc)
-            else:
+            exit_is_error, stop_reason = classify_codex_nonzero_exit(
+                did_work,
+                bool(spec.extra.get("codex_rollout_budget_tokens")),
+                stderr,
+            )
+            if exit_is_error:
                 is_error = True
                 error_text = stderr.strip()[-2000:] or f"codex exited with code {rc}"
+                if stop_reason is not None:  # rate_limited / auth_error
+                    logger.info("codex exited %d -> %s (will re-run): %s",
+                                rc, stop_reason, error_text[:200])
+            else:  # budget_exhausted
+                logger.info("codex exited %d with rollout budget set + work done -> "
+                            "graceful budget truncation (kept as ok)", rc)
 
         yield ResultEvent(
             session_id=thread_id,

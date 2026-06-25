@@ -7,7 +7,9 @@ base_task_config: experiments/comb_opt_research_relaxed.yaml
 base_work_dir: repos/comb-opt
 output_dir: pipeline_runs/budget_pressure_tsp_smoke
 
-budgets_usd: [0.05, null]        # one tiny budget + the unlimited path
+pressure:
+  variable: budget_usd
+  values: [0.05, null]        # one tiny budget + the unlimited path
 n_reps: 1
 n_trajectory_workers: 2
 max_turns: 4                     # smoke only: bound the null-budget run so it ends fast

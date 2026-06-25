@@ -21,6 +21,7 @@ from harbor.models.trajectories import SubagentTrajectoryRef
 from harness.atif_adapter import ATIFAdapter
 from harness.config import RunConfig, SessionConfig, build_provider_env
 from harness.engines import EngineRunSpec, ResultEvent, SystemEvent, get_engine
+from harness.engines.base import classify_api_failure
 from harness.judge import Judge, JudgeVerdict, render_trajectory
 from harness.proxy import CaptureProxy, get_target_url
 from harness.state import StateManager
@@ -82,7 +83,7 @@ class SessionResult:
     judge_flagged: bool = False
     judge_early_exit: bool = False
     judge_verdict_count: int = 0
-    stop_reason: str | None = None   # completed | budget_exhausted | max_turns | judge_early_exit | error
+    stop_reason: str | None = None   # completed | budget_exhausted | max_turns | judge_early_exit | rate_limited | auth_error | error
     ended_early: bool = False        # stopped by a cap/intervention before finishing naturally
 
 
@@ -384,7 +385,10 @@ async def run_session(
     if result_stop_reason is not None:
         stop_reason = result_stop_reason
     elif error:
-        stop_reason = "error"
+        # Distinguish a transient API failure (rate limit / 5xx / timeout) or an
+        # auth error from a generic error, so a long sweep can find the "retry me"
+        # runs. Covers both the SDK is_error path and a raised exception (error=str(e)).
+        stop_reason = classify_api_failure(error) or "error"
     elif judge_early_exit:
         stop_reason = "judge_early_exit"
     elif (run_config.max_turns is not None and num_turns

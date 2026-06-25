@@ -6,8 +6,12 @@ These are pure translation tests — no subprocess, no network.
 from __future__ import annotations
 
 from harness.atif_adapter import ATIFAdapter
-from harness.engines.base import EngineRunSpec
-from harness.engines.codex import CodexEngine, codex_upstream
+from harness.engines.base import EngineRunSpec, classify_api_failure
+from harness.engines.codex import (
+    CodexEngine,
+    classify_codex_nonzero_exit,
+    codex_upstream,
+)
 
 
 def _engine():
@@ -192,3 +196,71 @@ class TestEndToEndTranslationToATIF:
         fc = traj.steps[1]
         assert fc.tool_calls[0].function_name == "file_change"
         assert fc.observation.results[0].source_call_id == "i1"
+
+
+class TestClassifyApiFailure:
+    """Engine-agnostic error -> cause classification (rate_limited / auth_error / None)."""
+
+    def test_429_is_rate_limited(self):
+        assert classify_api_failure("stream error: HTTP 429 Too Many Requests") == "rate_limited"
+
+    def test_rate_limit_phrase(self):
+        assert classify_api_failure("Error: rate limit exceeded, retry") == "rate_limited"
+
+    def test_overloaded_is_rate_limited(self):
+        assert classify_api_failure("anthropic: Overloaded (529)") == "rate_limited"
+
+    def test_5xx_and_timeout_are_rate_limited(self):
+        assert classify_api_failure("503 Service Unavailable") == "rate_limited"
+        assert classify_api_failure("upstream request timed out") == "rate_limited"
+
+    def test_bad_key_is_auth_error(self):
+        assert classify_api_failure(
+            "Incorrect API key provided: sk-or-v1***a3c3") == "auth_error"
+
+    def test_401_is_auth_error(self):
+        assert classify_api_failure("HTTP 401 unauthorized") == "auth_error"
+
+    def test_generic_error_is_none(self):
+        assert classify_api_failure("Traceback ... KeyError: 'foo'") is None
+
+    def test_empty_is_none(self):
+        assert classify_api_failure("") is None
+        assert classify_api_failure(None) is None
+
+    def test_budget_value_not_a_false_positive(self):
+        # A clean budget abort whose text mentions the limit must NOT look like an API
+        # failure (else a real budget wall would be misclassified and re-run forever).
+        assert classify_api_failure(
+            "rollout budget of 200000 weighted tokens reached; exiting") is None
+
+
+class TestCodexNonzeroExit:
+    """The non-zero-exit disambiguation: rate-limit MUST win over the budget default."""
+
+    def test_rate_limit_beats_budget(self):
+        # 429 on a budgeted arm: an error to re-run, NOT a (kept-as-ok) budget wall.
+        is_error, stop_reason = classify_codex_nonzero_exit(
+            did_work=True, has_rollout_budget=True,
+            stderr="stream disconnected: HTTP 429 Too Many Requests")
+        assert is_error is True
+        assert stop_reason == "rate_limited"
+
+    def test_clean_budget_exit_is_budget_exhausted(self):
+        is_error, stop_reason = classify_codex_nonzero_exit(
+            did_work=True, has_rollout_budget=True, stderr="")
+        assert is_error is False
+        assert stop_reason == "budget_exhausted"
+
+    def test_generic_error_when_no_budget(self):
+        is_error, stop_reason = classify_codex_nonzero_exit(
+            did_work=True, has_rollout_budget=False, stderr="segfault in tool")
+        assert is_error is True
+        assert stop_reason is None
+
+    def test_no_work_does_not_earn_budget_credit(self):
+        # exited before doing anything: a real error, not a budget truncation.
+        is_error, stop_reason = classify_codex_nonzero_exit(
+            did_work=False, has_rollout_budget=True, stderr="")
+        assert is_error is True
+        assert stop_reason is None

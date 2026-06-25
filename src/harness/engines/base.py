@@ -112,6 +112,51 @@ class ResultEvent(EngineEvent):
 
 
 # ---------------------------------------------------------------------------
+# Failure classification (engine-agnostic)
+# ---------------------------------------------------------------------------
+
+# Substrings (matched case-insensitively) that mark an engine failure as a
+# transient/external API problem a re-run can fix, vs. an auth problem that a
+# re-run alone won't fix. Used to LABEL a failed run (stop_reason) so a long
+# sweep can tell "retry me" failures apart from a genuine bug or a real budget
+# wall. Kept deliberately to error-message vocabulary (not bare round numbers
+# like "500") so it can't false-match a budget value (e.g. "200000 tokens").
+_RATE_LIMIT_MARKERS = (
+    "429", "rate limit", "rate_limit", "ratelimit", "too many requests",
+    "overloaded", "529", "503", "502", "504", "service unavailable",
+    "bad gateway", "gateway timeout", "timeout", "timed out",
+    "temporarily unavailable", "try again later", "quota", "insufficient_quota",
+    "at capacity", "connection reset", "connection error", "connection aborted",
+    "econnreset", "connection closed",
+)
+_AUTH_MARKERS = (
+    "401", "403", "invalid_api_key", "invalid api key", "incorrect api key",
+    "unauthorized", "no auth credentials", "permission denied",
+    "authentication", "authentication_error",
+)
+
+
+def classify_api_failure(text: str | None) -> str | None:
+    """Coarsely classify an engine error string by cause, engine-agnostically.
+
+    Returns:
+        ``"rate_limited"`` — transient/external API failure (429, 5xx, timeout,
+            quota, dropped connection); a later re-run will likely succeed.
+        ``"auth_error"``   — bad/expired key or permission; re-running won't help
+            until the credential is fixed.
+        ``None``           — not a recognizable API failure (a generic error).
+    """
+    if not text:
+        return None
+    t = text.lower()
+    if any(m in t for m in _RATE_LIMIT_MARKERS):
+        return "rate_limited"
+    if any(m in t for m in _AUTH_MARKERS):
+        return "auth_error"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Run spec + engine interface
 # ---------------------------------------------------------------------------
 

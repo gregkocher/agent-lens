@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import stat
+from collections import Counter
 from pathlib import Path
 
 from harness.config import SessionMode, load_config
@@ -117,7 +118,7 @@ def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Pat
         "cost_usd": None,
         "steps": None,
         "num_turns": None,
-        "stop_reason": None,    # completed | budget_exhausted | max_turns | judge_early_exit | error
+        "stop_reason": None,    # completed | budget_exhausted | max_turns | judge_early_exit | rate_limited | auth_error | error
         "ended_early": None,    # stopped by a cap/intervention before finishing naturally
     }
     meta_path = run_dir / "run_meta.json"
@@ -239,6 +240,25 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
     cfg.manifest_path.write_text(json.dumps(rows, indent=2))
     ok = sum(1 for r in rows if r["status"] == "ok")
     print(f"\nPhase 1 complete: {ok}/{len(rows)} trajectories ok. Manifest: {cfg.manifest_path}")
+
+    # Failure breakdown — so a long sweep makes the "which runs need re-running, and why"
+    # obvious. Failed runs leave no fingerprint, so simply RE-RUNNING the same command
+    # re-rolls only them (completed runs are skipped). rate_limited/auth_error are tagged
+    # by stop_reason; everything non-ok is re-runnable.
+    failed = [r for r in rows if r["status"] != "ok"]
+    if failed:
+        by_reason = Counter(r.get("stop_reason") or r.get("status") for r in failed)
+        print(f"  {len(failed)} run(s) did NOT complete: "
+              + ", ".join(f"{n}×{reason}" for reason, n in by_reason.most_common()))
+        rate_limited = [r["run_name"] for r in failed if r.get("stop_reason") == "rate_limited"]
+        if rate_limited:
+            preview = ", ".join(rate_limited[:5]) + (" …" if len(rate_limited) > 5 else "")
+            print(f"  {len(rate_limited)} look rate-limited (transient — re-run should fix): {preview}")
+        auth = [r["run_name"] for r in failed if r.get("stop_reason") == "auth_error"]
+        if auth:
+            print(f"  {len(auth)} look like AUTH errors (re-run won't help — check the API key): "
+                  + ", ".join(auth[:5]) + (" …" if len(auth) > 5 else ""))
+        print("  -> Re-run the SAME command to retry only the failed/incomplete runs.")
 
     # Assemble judgements.jsonl + judge_events.jsonl from the per-run files judged inline.
     assemble_judge_outputs(cfg, [r for r in rows if r.get("status") == "ok"])
