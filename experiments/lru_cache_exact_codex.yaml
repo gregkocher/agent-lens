@@ -13,7 +13,7 @@ provider: openai                          # OpenAI-direct (api.openai.com)
 work_dir: "./repos/lru-cache"             # the pipeline overrides this with a per-run COPY
 
 session_mode: isolated
-sandbox_mode: workspace-write             # codex: allow writing cache.py + running the tests
+sandbox_mode: danger-full-access          # codex: no bwrap sandbox (RunPod has no unprivileged userns); harness protected_write_paths still guard test_cache.py/cache_starter.py
 sandbox_workspace_network_access: true    # allow pip/Cython attempts (parity with the Claude runs)
 capture_api_requests: true                # REQUIRED for trajectories + word counts (needs OPENAI_API_KEY in env)
 revert_work_dir: false

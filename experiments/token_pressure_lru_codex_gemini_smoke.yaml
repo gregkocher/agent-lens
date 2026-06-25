@@ -17,7 +17,7 @@ pressure:
   values: [20000, 80000]           # weighted session-token limits (features.rollout_budget.limit_tokens)
 n_reps: 2
 n_trajectory_workers: 2
-agent_model: google/gemini-3.1-pro-preview   # REAL agent path being validated
+agent_model: google/gemini-3.1-pro-preview-customtools   # -customtools: plain slug fails tool-calling over Codex Responses API
 agent_provider: openrouter
 
 task_context: |

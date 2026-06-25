@@ -18,3 +18,4 @@ dist/
 .ruff_cache/
 site/
 .DS_Store
+.claude/settings.local.json

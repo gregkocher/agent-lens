@@ -36,7 +36,7 @@ n_trajectory_workers: 8          # parallel is OK (survival clock is steps + tok
                                  # Each worker spawns a `codex exec` process — watch host load and
                                  # session_error clusters in the roomy arms; failures are resumable.
 max_turns: null                  # token budget is the lever; base task's 400 is the backstop
-agent_model: google/gemini-3.1-pro-preview   # REAL agent: gemini-3.1-pro via OpenRouter
+agent_model: google/gemini-3.1-pro-preview-customtools   # gemini-3.1-pro via OpenRouter (-customtools: plain slug fails tool-calling over Codex Responses API)
 agent_provider: openrouter
 
 task_context: |
