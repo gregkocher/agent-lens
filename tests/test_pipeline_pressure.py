@@ -42,13 +42,22 @@ def test_build_run_config_turn_sweep_sets_max_turns(tmp_path):
     assert rc.run_name == "bp_t10_r1"            # turn axis uses the distinct 't' tag
 
 
+def test_build_run_config_token_budget_sets_rollout(tmp_path):
+    # codex-only token_budget pressure applies to the rollout-budget RunConfig field.
+    sweep = _sweep({"variable": "token_budget", "values": [10000]})
+    base = _base_runconfig(engine="codex", model="gpt-5.5", provider="openai")
+    rc = _build_run_config(sweep, base, 10000, 1, tmp_path / "wd")
+    assert rc.codex_rollout_budget_tokens == 10000
+    assert rc.run_name == "bp_k10000_r1"         # token axis uses the distinct 'k' tag
+
+
 def test_build_run_config_codex_bad_provider_override_raises(tmp_path):
     # codex base is valid (openai); the agent_provider override makes it invalid, and the
     # re-check (model_copy bypasses RunConfig validation) must catch it.
-    sweep = _sweep({"variable": "max_turns", "values": [10]}, agent_provider="anthropic")
-    base = _base_runconfig(engine="codex", model="gpt-5.4", provider="openai")
+    sweep = _sweep({"variable": "token_budget", "values": [10000]}, agent_provider="anthropic")
+    base = _base_runconfig(engine="codex", model="gpt-5.5", provider="openai")
     with pytest.raises(ValueError):
-        _build_run_config(sweep, base, 10, 1, tmp_path / "wd")
+        _build_run_config(sweep, base, 10000, 1, tmp_path / "wd")
 
 
 # --------------------------------------------------------------------------- _manifest_row
@@ -58,13 +67,14 @@ def test_manifest_row_turn_sweep_columns(tmp_path):
     rd.mkdir()
     (rd / "run_meta.json").write_text(json.dumps(
         {"engine": "codex", "total_cost_usd": None, "total_steps": 7,
-         "sessions": [{"num_turns": 9}]}))
+         "sessions": [{"num_turns": 9, "stop_reason": "budget_exhausted", "ended_early": True}]}))
     row = _manifest_row(sweep, 10, 1, "bp_t10_r1", rd, "ok", None)
     assert row["pressure_variable"] == "max_turns"
     assert row["pressure_value"] == 10
     assert row["budget_usd"] is None             # no budget semantics for a turn sweep
     assert row["engine"] == "codex"
     assert row["num_turns"] == 9 and row["steps"] == 7
+    assert row["stop_reason"] == "budget_exhausted" and row["ended_early"] is True
 
 
 def test_manifest_row_budget_sweep_aliases_budget_usd(tmp_path):

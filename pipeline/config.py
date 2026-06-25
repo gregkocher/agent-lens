@@ -185,9 +185,20 @@ PRESSURE_VARS: dict[str, PressureVar] = {
         tick_prefix="$"),
     "max_turns": PressureVar(
         name="max_turns", runconfig_field="max_turns",
-        engines=frozenset({"claude_code", "codex"}), realized_metric="num_turns",
+        # claude_code ONLY: a Codex "turn" is the whole autonomous exec, and Codex has
+        # no native turn cap (the --max-turns CLI flag was requested + closed not-planned),
+        # so max_turns is silently a no-op there. Use token_budget for Codex instead.
+        engines=frozenset({"claude_code"}), realized_metric="num_turns",
         axis_label="turn limit (max_turns)", tag="t", short="turns", fractional=True,
         fraction_axis_label="fraction of turn limit used (turns so far / max_turns)",
+        tick_prefix=""),
+    "token_budget": PressureVar(
+        # Codex's native enforced budget: features.rollout_budget.limit_tokens. Weighted
+        # session tokens, with <rollout_budget> reminders + turn-abort on exhaustion.
+        name="token_budget", runconfig_field="codex_rollout_budget_tokens",
+        engines=frozenset({"codex"}), realized_metric="num_turns",
+        axis_label="rollout token budget", tag="k", short="tokens", fractional=True,
+        fraction_axis_label="fraction of token budget used (output tokens so far / limit)",
         tick_prefix=""),
 }
 
@@ -228,7 +239,8 @@ def check_pressure_engine_compat(pressure: PressureConfig, engine: str) -> None:
         raise ValueError(
             f"pressure.variable '{pvar.name}' is not supported by engine '{engine}' "
             f"(supported engines: {sorted(pvar.engines)}). "
-            f"For the codex engine, use pressure.variable: max_turns.")
+            f"For codex use pressure.variable: token_budget; "
+            f"for claude_code use budget_usd or max_turns.")
 
 
 class SweepConfig(BaseModel):

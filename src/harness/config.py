@@ -118,6 +118,11 @@ class RunConfig(BaseModel):
     # token budget before substantive work. The Codex CLI does not expose this
     # as an exec flag; the budget lives on the create_goal tool.
     codex_goal_token_budget: int | None = Field(default=None, gt=0)
+    # codex rollout token budget: when set, AgentLens passes
+    # `features.rollout_budget.{enabled,limit_tokens}` to `codex exec`. Codex then
+    # natively tracks weighted session tokens, injects <rollout_budget> reminders, and
+    # ABORTS the turn when exhausted — the enforced analogue of max_budget_usd.
+    codex_rollout_budget_tokens: int | None = Field(default=None, gt=0)
     codex_goal_objective: str | None = None
 
     # working directory

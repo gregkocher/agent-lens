@@ -313,6 +313,8 @@ def _build_run_meta(
                 "step_count": r.step_count,
                 "tool_call_count": r.tool_call_count,
                 "num_turns": r.num_turns,
+                "stop_reason": r.stop_reason,
+                "ended_early": r.ended_early,
                 "total_cost_usd": r.total_cost_usd,
                 "compaction_count": r.compaction_count,
                 "subagent_count": r.subagent_count,

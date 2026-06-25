@@ -117,6 +117,8 @@ def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Pat
         "cost_usd": None,
         "steps": None,
         "num_turns": None,
+        "stop_reason": None,    # completed | budget_exhausted | max_turns | judge_early_exit | error
+        "ended_early": None,    # stopped by a cap/intervention before finishing naturally
     }
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
@@ -128,6 +130,8 @@ def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Pat
             sessions = meta.get("sessions") or []
             if sessions:
                 row["num_turns"] = sessions[0].get("num_turns")
+                row["stop_reason"] = sessions[0].get("stop_reason")
+                row["ended_early"] = sessions[0].get("ended_early")
                 if sessions[0].get("error") and status == "ok":
                     row["status"] = "session_error"
                     row["error"] = sessions[0].get("error")

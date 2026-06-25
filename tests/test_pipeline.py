@@ -84,8 +84,13 @@ def test_pressure_engine_compat():
     with pytest.raises(ValueError):
         check_pressure_engine_compat(sweep.pressure, "codex")     # monetary not on codex
     turns = _sweep(pressure={"variable": "max_turns", "values": [10, 20]})
-    check_pressure_engine_compat(turns.pressure, "codex")         # turn limit ok on codex
-    check_pressure_engine_compat(turns.pressure, "claude_code")
+    check_pressure_engine_compat(turns.pressure, "claude_code")   # turns ok on claude
+    with pytest.raises(ValueError):
+        check_pressure_engine_compat(turns.pressure, "codex")     # max_turns is a no-op on codex -> rejected
+    toks = _sweep(pressure={"variable": "token_budget", "values": [10000, 30000]})
+    check_pressure_engine_compat(toks.pressure, "codex")          # rollout token budget ok on codex
+    with pytest.raises(ValueError):
+        check_pressure_engine_compat(toks.pressure, "claude_code")  # token_budget is codex-only
 
 
 def test_max_turns_pressure_rejects_global_override():
@@ -499,6 +504,22 @@ def test_turn_table_turn_fraction(tmp_path):
     assert rows[0]["pressure_value"] == 4 and rows[0]["budget_usd"] is None
     # uncapped turn sweep (value None) -> no fraction
     assert turn_table(tmp_path, "max_turns", None)[0]["frac_used"] is None
+
+
+def test_turn_table_token_budget_fraction(tmp_path):
+    # token_budget pressure (codex rollout budget): frac = cumulative output tokens / limit.
+    sd = tmp_path / "session_01"
+    sd.mkdir()
+    (sd / "uuid_map.json").write_text(json.dumps({"turns": [
+        {"turn_index": 1, "atif_step_ids": [1], "request_file": "request_001.json"},
+        {"turn_index": 2, "atif_step_ids": [2], "request_file": "request_002.json"},
+    ]}))
+    (sd / "api_captures.jsonl").write_text(
+        json.dumps({"request_index": 1, "usage": {"output_tokens": 200}}) + "\n"
+        + json.dumps({"request_index": 2, "usage": {"output_tokens": 300}}) + "\n")
+    rows = turn_table(tmp_path, "token_budget", 1000)
+    assert [r["frac_used"] for r in rows] == [0.2, 0.5]   # 200/1000, (200+300)/1000
+    assert rows[0]["pressure_value"] == 1000 and rows[0]["budget_usd"] is None
 
 
 # --------------------------------------------------------------------------- final_score

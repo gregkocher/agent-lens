@@ -205,6 +205,8 @@ def turn_table(run_dir: str | Path, pressure_variable: str | None,
         if req_file:
             m = re.search(r"request_(\d+)", req_file)
             req_idx = int(m.group(1)) if m else None
+        if req_idx is not None:
+            cum_tokens += out_tokens_by_req.get(req_idx, 0)  # update first (token frac uses it)
         frac = spent = None
         if pressure_variable == "budget_usd":
             if req_file:
@@ -214,12 +216,13 @@ def turn_table(run_dir: str | Path, pressure_variable: str | None,
                     frac = spent / total if total > 0 else None
                 elif budget_usd is not None and (sdir / "raw_dumps" / req_file).exists():
                     spent, frac = 0.0, 0.0  # reminder not injected yet -> nothing spent
+        elif pressure_variable == "token_budget" and fractional:
+            # tokens consumed (output-token proxy) through this turn / the token limit.
+            frac = min(1.0, cum_tokens / pressure_value)
         elif fractional:
             # generic continuum: fraction of the finite cap consumed by this turn —
-            # the 1-based turn ordinal / cap (API turns ~ agent turns).
+            # the 1-based turn ordinal / cap (max_turns; API turns ~ agent turns).
             frac = min(1.0, (i + 1) / pressure_value)
-        if req_idx is not None:
-            cum_tokens += out_tokens_by_req.get(req_idx, 0)
         rows.append({
             "turn_index": t.get("turn_index"),
             "step_ids": t.get("atif_step_ids") or [],

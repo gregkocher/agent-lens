@@ -118,6 +118,7 @@ class CodexEngine(Engine):
         is_error = False
         error_text: str | None = None
         completed = False
+        did_work = False  # saw >=1 substantive item (not just the unstable-feature warning)
 
         assert proc.stdout is not None
         try:
@@ -154,7 +155,10 @@ class CodexEngine(Engine):
                     error_text = evt.get("message") or error_text
 
                 elif etype == "item.completed":
-                    event = self._translate_item(evt.get("item") or {})
+                    item = evt.get("item") or {}
+                    if item.get("type") != "error":  # ignore the unstable-feature warning item
+                        did_work = True
+                    event = self._translate_item(item)
                     if event is not None:
                         yield event
 
@@ -183,9 +187,20 @@ class CodexEngine(Engine):
         except Exception:
             stderr = ""
         rc = await proc.wait()
+        # A rollout-budget abort exits non-zero with NO turn.failed/error event in the
+        # --json stream (Codex emits the partial work, then exits). When the rollout budget
+        # was set and the agent did real work, treat the non-zero exit as a GRACEFUL budget
+        # truncation (status ok) — the Codex analogue of Claude's max_budget_usd stop — so
+        # the partial trajectory is kept and analyzed rather than discarded as an error.
+        stop_reason: str | None = None
         if rc != 0 and not is_error:
-            is_error = True
-            error_text = stderr.strip()[-2000:] or f"codex exited with code {rc}"
+            if spec.extra.get("codex_rollout_budget_tokens") and did_work:
+                stop_reason = "budget_exhausted"
+                logger.info("codex exited %d with rollout budget set + work done -> "
+                            "graceful budget truncation (kept as ok)", rc)
+            else:
+                is_error = True
+                error_text = stderr.strip()[-2000:] or f"codex exited with code {rc}"
 
         yield ResultEvent(
             session_id=thread_id,
@@ -194,6 +209,7 @@ class CodexEngine(Engine):
             usage=self._normalize_usage(usage_acc) if usage_acc else None,
             is_error=is_error,
             error_text=error_text,
+            stop_reason=stop_reason,
         )
 
     # ------------------------------------------------------------------
@@ -217,6 +233,20 @@ class CodexEngine(Engine):
         if spec.sandbox_workspace_network_access is not None:
             value = "true" if spec.sandbox_workspace_network_access else "false"
             common += ["-c", f"sandbox_workspace_write.network_access={value}"]
+        rollout_tokens = spec.extra.get("codex_rollout_budget_tokens")
+        if rollout_tokens:
+            # Native token-budget pressure: Codex tracks weighted session tokens, injects
+            # <rollout_budget> reminders, and aborts the turn when the limit is reached. Codex
+            # REQUIRES reminder thresholds when the rollout budget is enabled, so remind at
+            # ~50/25/10% of the limit remaining.
+            limit = int(rollout_tokens)
+            remind = [limit // 2, limit // 4, limit // 10]
+            common += [
+                "-c", "features.rollout_budget.enabled=true",
+                "-c", f"features.rollout_budget.limit_tokens={limit}",
+                "-c", f"features.rollout_budget.reminder_at_remaining_tokens={remind}",
+                "-c", "suppress_unstable_features_warning=true",  # rollout_budget is under-dev in codex
+            ]
         _upstream_base, env_key, provider_id = codex_upstream(spec.provider, spec.base_url)
         if spec.capture_base_url:
             # Route through the capture proxy via a custom model provider. The

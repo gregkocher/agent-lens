@@ -106,6 +106,9 @@ class ResultEvent(EngineEvent):
     usage: dict[str, Any] | None = None
     is_error: bool = False
     error_text: str | None = None
+    # How the run ended, when the engine can detect it natively (e.g. codex sets
+    # "budget_exhausted" on a rollout-budget abort). None = let the runner classify.
+    stop_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------

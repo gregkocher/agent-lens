@@ -82,6 +82,8 @@ class SessionResult:
     judge_flagged: bool = False
     judge_early_exit: bool = False
     judge_verdict_count: int = 0
+    stop_reason: str | None = None   # completed | budget_exhausted | max_turns | judge_early_exit | error
+    ended_early: bool = False        # stopped by a cap/intervention before finishing naturally
 
 
 async def run_session(
@@ -209,13 +211,17 @@ async def run_session(
         sandbox_mode=run_config.sandbox_mode,
         sandbox_workspace_network_access=run_config.sandbox_workspace_network_access,
         capture_base_url=capture_base_url,
-        extra={"codex_multi_agent": run_config.codex_multi_agent},
+        extra={
+            "codex_multi_agent": run_config.codex_multi_agent,
+            "codex_rollout_budget_tokens": run_config.codex_rollout_budget_tokens,
+        },
     )
 
     # Run the session
     session_id: str | None = None
     tool_call_count = 0
     error: str | None = None
+    result_stop_reason: str | None = None  # engine-reported stop (e.g. codex budget_exhausted)
     total_cost: float | None = None
     num_turns = 0
 
@@ -275,6 +281,7 @@ async def run_session(
                 session_id = event.session_id
                 total_cost = event.total_cost_usd
                 num_turns = event.num_turns
+                result_stop_reason = event.stop_reason
                 if event.is_error:
                     error = event.error_text
 
@@ -371,6 +378,25 @@ async def run_session(
         else:
             error = f"Post-processing failed: {e}"
 
+    # Classify how the session ended — explicit "did it end early due to a cap?" tracking.
+    # The engine reports it natively when only it can tell (codex rollout-budget abort);
+    # otherwise the runner infers it from the configured limits vs. what was consumed.
+    if result_stop_reason is not None:
+        stop_reason = result_stop_reason
+    elif error:
+        stop_reason = "error"
+    elif judge_early_exit:
+        stop_reason = "judge_early_exit"
+    elif (run_config.max_turns is not None and num_turns
+          and num_turns >= run_config.max_turns):
+        stop_reason = "max_turns"
+    elif (run_config.max_budget_usd is not None and total_cost is not None
+          and total_cost >= run_config.max_budget_usd):
+        stop_reason = "budget_exhausted"
+    else:
+        stop_reason = "completed"
+    ended_early = stop_reason in ("budget_exhausted", "max_turns", "judge_early_exit")
+
     return SessionResult(
         session_index=session_config.session_index,
         session_id=session_id,
@@ -388,4 +414,6 @@ async def run_session(
         judge_flagged=judge_flagged,
         judge_early_exit=judge_early_exit,
         judge_verdict_count=len(judge_verdicts),
+        stop_reason=stop_reason,
+        ended_early=ended_early,
     )
