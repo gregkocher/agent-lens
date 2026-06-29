@@ -163,16 +163,21 @@ class PressureVar:
     tick_prefix: str          # axis-tick / arm-label unit prefix ("$" for USD, "" for counts)
 
     def label(self, value) -> str:
-        """Filesystem-safe value label: 0.05 -> '0p05', 10 -> '10', None -> 'NONE'."""
+        """Filesystem-safe value label: 0.05 -> '0p05', 10 -> '10', None -> 'NONE',
+        and string variants pass through alnum-sanitized ('by_any_means' -> 'by_any_means')."""
         if value is None:
             return "NONE"
+        if isinstance(value, str):
+            return "".join(c if c.isalnum() else "_" for c in value).strip("_")
         return ("%g" % value).replace(".", "p").replace("-", "neg")
 
     def tick_label(self, value) -> str:
         """Human axis-tick / arm label carrying the pressure's unit: 0.05 -> '$0.05'
-        (budget), 10 -> '10' (turns), None -> 'unlimited'."""
+        (budget), 10 -> '10' (turns), None -> 'unlimited', strings pass through verbatim."""
         if value is None:
             return "unlimited"
+        if isinstance(value, str):
+            return value
         return f"{self.tick_prefix}{value:g}"
 
 
@@ -200,6 +205,15 @@ PRESSURE_VARS: dict[str, PressureVar] = {
         axis_label="rollout token budget", tag="k", short="tokens", fractional=True,
         fraction_axis_label="fraction of token budget used (output tokens so far / limit)",
         tick_prefix=""),
+    "prompt_variant": PressureVar(
+        # Sweep the USER PROMPT WORDING instead of a resource cap. Values are variant KEYS
+        # (strings); the exact prompt text for each lives in SweepConfig.prompt_variants and
+        # is applied specially in _build_run_config (sets sessions[0].prompt), not via setattr.
+        # Engine-agnostic. Not a continuum, so fractional=False (no hazard/fraction analyses).
+        name="prompt_variant", runconfig_field="__prompt_variant__",
+        engines=frozenset({"claude_code", "codex"}), realized_metric="num_turns",
+        axis_label="prompt variant", tag="p", short="variant", fractional=False,
+        fraction_axis_label="", tick_prefix=""),
 }
 
 
@@ -207,7 +221,7 @@ class PressureConfig(BaseModel):
     """The swept x-axis: which knob applies pressure, at what values (None = no cap)."""
 
     variable: str
-    values: list[float | int | None]
+    values: list[float | int | str | None]   # str = variant keys for the prompt_variant axis
 
     @field_validator("variable")
     @classmethod
@@ -222,7 +236,9 @@ class PressureConfig(BaseModel):
     def _check_values(cls, v):
         if not v:
             raise ValueError("pressure.values must be non-empty")
-        bad = [x for x in v if x is not None and x <= 0]
+        # positivity applies only to NUMERIC pressures; string values (prompt_variant keys)
+        # are categorical and skip the check.
+        bad = [x for x in v if isinstance(x, (int, float)) and not isinstance(x, bool) and x <= 0]
         if bad:
             raise ValueError(f"pressure.values must be > 0 or null (got {bad})")
         return v
@@ -259,6 +275,11 @@ class SweepConfig(BaseModel):
     agent_model: str | None = None   # if set, override the base task model
     agent_provider: str | None = None
 
+    # Only used when pressure.variable == 'prompt_variant': maps each variant key listed in
+    # pressure.values to the EXACT session-prompt text for that arm (the only thing differing
+    # between arms). Ignored for numeric pressure variables.
+    prompt_variants: dict[str, str] = Field(default_factory=dict)
+
     # Phase 2 — judge transport (model/workers/reps); rubric+criteria are per-behavior
     judge: JudgeConfig
 
@@ -285,6 +306,19 @@ class SweepConfig(BaseModel):
             raise ValueError(
                 "pressure.variable is 'max_turns' but a global `max_turns` override is "
                 "also set; remove the override (the sweep values control max_turns).")
+        return self
+
+    @model_validator(mode="after")
+    def _check_prompt_variants(self) -> "SweepConfig":
+        # When sweeping the prompt, every variant key in pressure.values must have its text.
+        if self.pressure.variable == "prompt_variant":
+            missing = [v for v in self.pressure.values if v not in self.prompt_variants]
+            if missing:
+                raise ValueError(
+                    f"pressure.variable is 'prompt_variant' but prompt_variants has no text "
+                    f"for: {missing} (keys present: {sorted(self.prompt_variants)}).")
+        elif self.prompt_variants:
+            raise ValueError("prompt_variants is only valid with pressure.variable: prompt_variant")
         return self
 
     @field_validator("n_reps", "n_trajectory_workers")

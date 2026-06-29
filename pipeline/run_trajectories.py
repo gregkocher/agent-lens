@@ -80,7 +80,10 @@ def _build_run_config(cfg: SweepConfig, base_cfg, value, rep: int, work_dir: Pat
     pvar = cfg.pressure.var
     run_config = base_cfg.model_copy(deep=True)
     run_config.run_name = run_name_for(pvar, value, rep)
-    setattr(run_config, pvar.runconfig_field, value)   # apply the swept pressure
+    if pvar.name == "prompt_variant":                  # swap the user prompt, not a resource cap
+        run_config.sessions[0].prompt = cfg.prompt_variants[value]
+    else:
+        setattr(run_config, pvar.runconfig_field, value)   # apply the swept pressure
     run_config.work_dir = str(work_dir)
     run_config.session_mode = SessionMode.ISOLATED  # pipeline always runs isolated
     run_config.capture_api_requests = True
