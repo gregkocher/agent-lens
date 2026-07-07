@@ -70,9 +70,13 @@ def expected_fingerprints(cfg: SweepConfig, judgeable: list[dict]) -> dict[str, 
     for r in judgeable:
         rendered = render_trajectory(r["run_dir"], cfg.judge.max_input_chars)
         for bname, rubrics in behavior_rubrics.items():
+            # MUST mirror _judge_one: sandbagging's judge input has the resource-state note
+            # appended (_augment_render), so its fingerprint is computed on the augmented
+            # render. Without this, every sandbagging judgement looks "stale" and is dropped.
+            rb = _augment_render(rendered, bname, r)
             for mode in MODES:
                 out[f"{r['run_name']}|{bname}|{mode}"] = judgement_fingerprint(
-                    cfg.judge.model, _system_prompt(rubrics, mode, cfg.task_context), rendered)
+                    cfg.judge.model, _system_prompt(rubrics, mode, cfg.task_context), rb)
     return out
 
 

@@ -19,6 +19,9 @@ VALID_JUDGE_MODES = {"binary", "scale_1_5"}
 MODES: tuple[str, ...] = ("binary", "scale_1_5")
 
 # Default budget-awareness regex patterns (case-insensitive) counted in agent reasoning.
+# Covers BOTH pressure regimes: dollar-cost words (claude_code budget_usd sweeps) and
+# token/turn-budget words (codex token_budget / rollout sweeps), so the pressure-mention
+# analysis is meaningful whichever pressure variable an experiment uses.
 DEFAULT_WORDCOUNT_PATTERNS: list[str] = [
     r"budget",
     r"remaining",
@@ -32,7 +35,13 @@ DEFAULT_WORDCOUNT_PATTERNS: list[str] = [
     r"careful",
     r"wrap (this |it )?up",
     r"running low",
-    r"out of (time|budget|money)",
+    r"out of (time|budget|money|tokens?)",
+    # token / rollout-budget vocabulary (codex token_budget pressure)
+    r"\btokens?\b",
+    r"weighted",
+    r"rollout",
+    r"quota",
+    r"turns? (left|remaining)",
 ]
 
 

@@ -155,28 +155,80 @@ def detect_events(run_dir: str | Path, signals: HackSignalsConfig,
 
 
 # --------------------------------------------------------------------------- turn table
+def _codex_turns_from_captures(sdir: Path) -> list[dict]:
+    """Reconstruct a uuid_map-style `turns` list for engines that write no uuid_map.json
+    (the codex engine). Each api_captures.jsonl record is one API turn (carrying
+    request_index + timestamp); ATIF steps are assigned to the latest turn whose request
+    timestamp precedes the step's timestamp. Returns rows shaped like the uuid_map turns
+    ({turn_index, request_file, atif_step_ids, timestamp}) so turn_table/locate_events stay
+    engine-agnostic downstream. ISO-8601 UTC timestamps compare lexicographically."""
+    cap = sdir / "api_captures.jsonl"
+    if not cap.exists():
+        return []
+    metas: list[tuple[int, str]] = []
+    for line in cap.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            c = json.loads(line)
+        except Exception:
+            continue
+        if c.get("request_index") is not None:
+            metas.append((int(c["request_index"]), c.get("timestamp") or ""))
+    if not metas:
+        return []
+    metas.sort(key=lambda x: x[0])
+    rows = [{"turn_index": i, "request_file": f"request_{ri:03d}.json",
+             "atif_step_ids": [], "timestamp": ts}
+            for i, (ri, ts) in enumerate(metas)]
+    turn_ts = [ts for _, ts in metas]
+    steps: list[tuple[str, int]] = []
+    tj = sdir / "trajectory.json"
+    if tj.exists():
+        try:
+            for s in json.loads(tj.read_text()).get("steps", []):
+                if s.get("step_id") is not None:
+                    steps.append((s.get("timestamp") or "", s["step_id"]))
+        except Exception:
+            steps = []
+    for step_ts, sid in steps:
+        idx = 0  # default: first turn (covers steps before the first request timestamp)
+        for j, tts in enumerate(turn_ts):
+            if tts and step_ts and tts <= step_ts:
+                idx = j
+            elif tts and step_ts and tts > step_ts:
+                break
+        rows[idx]["atif_step_ids"].append(sid)
+    return rows
+
+
 def turn_table(run_dir: str | Path, pressure_variable: str | None,
                pressure_value: float | int | None) -> list[dict]:
-    """Per-API-turn pressure/exposure table from uuid_map + raw dumps + captures.
+    """Per-API-turn pressure/exposure table, engine-agnostic. Turns come from uuid_map.json
+    (claude_code) or, when that's absent, are reconstructed from api_captures.jsonl (codex).
 
     frac_used is the fraction of the (finite) pressure cap consumed by each turn — the
     within-run pressure clock, generalized across pressure variables:
       - budget_usd: spent/budget, read from the turn's budget reminder (a request with
         no reminder yet in a CAPPED run -> 0.0).
+      - token_budget: cumulative output tokens / token limit (codex rollout budget).
       - max_turns (any `fractional` pressure with a finite cap): turn ordinal / cap
         (API turns ~ agent turns).
-      - uncapped (value None) or non-fractional pressures: None.
+      - uncapped (value None) or non-fractional pressures (e.g. prompt_variant): None.
     spent_usd stays budget-specific ($ spent), None otherwise. cum_output_tokens is a
     cumulative exposure clock that exists for every run regardless of pressure.
     """
     run_dir = Path(run_dir)
     sdir = run_dir / "session_01"
     map_path = sdir / "uuid_map.json"
-    if not map_path.exists():
-        return []
-    try:
-        turns = json.loads(map_path.read_text()).get("turns", [])
-    except Exception:
+    if map_path.exists():
+        try:
+            turns = json.loads(map_path.read_text()).get("turns", [])
+        except Exception:
+            turns = []
+    else:
+        turns = _codex_turns_from_captures(sdir)   # codex: no uuid_map -> rebuild from captures
+    if not turns:
         return []
 
     out_tokens_by_req: dict[int, int] = {}

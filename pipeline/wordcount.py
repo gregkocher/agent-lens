@@ -18,10 +18,17 @@ from pathlib import Path
 # a fallback for non-streamed full content blocks. We read only response_*.txt
 # (assistant output), so no system-reminders are present.
 _PATTERNS = [
+    # Anthropic Messages SSE (claude_code engine): streamed + full text/thinking blocks.
     re.compile(r'"type":"text_delta","text":"((?:[^"\\]|\\.)*)"'),
     re.compile(r'"type":"thinking_delta","thinking":"((?:[^"\\]|\\.)*)"'),
     re.compile(r'"type":"text","text":"((?:[^"\\]|\\.)*)"'),
     re.compile(r'"type":"thinking","thinking":"((?:[^"\\]|\\.)*)"'),
+    # OpenAI Responses SSE (codex engine): streamed output-text + reasoning DELTAS only
+    # (one event per line). Matching just the deltas counts each token once; the terminal
+    # `.done`/`response.completed` events repeat the same text under "output_text"/
+    # "reasoning_text" and are intentionally NOT matched here to avoid double counting.
+    re.compile(r'"type":"response\.output_text\.delta"[^\n]*?"delta":"((?:[^"\\]|\\.)*)"'),
+    re.compile(r'"type":"response\.reasoning_text\.delta"[^\n]*?"delta":"((?:[^"\\]|\\.)*)"'),
 ]
 
 
@@ -35,7 +42,11 @@ def _decode(s: str) -> str:
 # Markers that indicate a response dump contains real assistant output (not a
 # count_tokens / sdk_internal response, which is just {"input_tokens": N}).
 _ASSISTANT_MARKERS = ('"type":"text', '"type":"thinking', '"type":"tool_use',
-                      '"text_delta"', '"thinking_delta"')
+                      '"text_delta"', '"thinking_delta"',
+                      # codex (OpenAI Responses SSE): a real turn emits output-text/reasoning
+                      # deltas and/or a function_call; excludes token-count-only sidecars.
+                      'response.output_text', 'response.reasoning_text',
+                      '"type":"reasoning_text"', '"type":"function_call"')
 
 
 def agent_turns_from_dumps(run_dir: str | Path) -> int:

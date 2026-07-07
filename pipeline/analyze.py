@@ -69,7 +69,13 @@ def _mean_se(values: list[float]) -> tuple[float, float]:
 
 
 def _budget_sort_key(b):
-    return (1, 0.0) if b is None else (0, float(b))
+    # numeric pressures sort by value; None (unlimited) last; categorical (str, e.g. prompt
+    # variants) group together in alphabetical order so the axis doesn't choke on float(b).
+    if b is None:
+        return (2, 0.0, "")
+    if isinstance(b, (int, float)) and not isinstance(b, bool):
+        return (0, float(b), "")
+    return (1, 0.0, str(b))
 
 
 def _budget_label(b) -> str:
@@ -78,10 +84,15 @@ def _budget_label(b) -> str:
 
 
 def _line_positions(budgets) -> list[float]:
-    """x positions for budget-axis plots: TRUE LINEAR by budget value (budget is a
-    continuous pressure variable). 'unlimited' (None) has no finite position, so it is
-    placed one representative step past the max budget (reads as off-scale to the right)."""
-    vals = [b for b in budgets if b is not None]
+    """x positions for the across-arm plots. Numeric pressures (budget/turns/tokens) -> TRUE
+    LINEAR by value, with 'unlimited' (None) one step past the max. Categorical pressures
+    (e.g. prompt variants, where values are strings) -> evenly spaced integer positions in
+    the given order (a continuous x-axis is meaningless for them)."""
+    numeric = [b for b in budgets if isinstance(b, (int, float)) and not isinstance(b, bool)]
+    non_none = [b for b in budgets if b is not None]
+    if len(numeric) != len(non_none):          # any non-numeric value -> categorical axis
+        return [float(i) for i in range(len(budgets))]
+    vals = numeric
     if not vals:
         return list(range(len(budgets)))
     sv = sorted(vals)
@@ -718,6 +729,39 @@ def _event_analysis(cfg: SweepConfig, behavior: str, judgeable: list[dict],
     return diag_out
 
 
+def _plot_behavior_comparison(behavior_bdfs: dict, labels: list[str], figs: Path, cfg) -> None:
+    """One combined grouped-bar figure: every behavior's judge flag-rate (with binomial SE)
+    and mean severity, side by side across all arms. Emitted for every experiment; especially
+    the readable summary for few-arm sweeps like prompt-variant A/Bs. Saved as a PDF."""
+    if not behavior_bdfs:
+        return
+    behaviors = list(behavior_bdfs)
+    x = np.arange(len(labels))
+    w = 0.8 / max(1, len(behaviors))
+    palette = ["#c0392b", "#2980b9", "#7f8c8d", "#27ae60", "#8e44ad"]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(max(8.0, 2.4 * len(labels)), 5))
+    for i, beh in enumerate(behaviors):
+        bdf = behavior_bdfs[beh]
+        off = (i - (len(behaviors) - 1) / 2) * w
+        c = palette[i % len(palette)]
+        lab = beh.replace("_", " ")
+        ax1.bar(x + off, [100 * v for v in bdf["binary_rate"]], w,
+                yerr=[100 * v for v in bdf["binary_se"]], capsize=3, label=lab, color=c)
+        ax2.bar(x + off, list(bdf["score_mean"]), w,
+                yerr=list(bdf["score_se"]), capsize=3, label=lab, color=c)
+    for ax, title, yl in [(ax1, "judge flag-rate", "flag rate (%)"),
+                          (ax2, "mean severity", "severity (1-5)")]:
+        ax.set_xticks(x); ax.set_xticklabels(labels)
+        ax.set_xlabel(_X_AXIS_LABEL); ax.set_ylabel(yl); ax.set_title(title)
+        ax.legend(fontsize=8); ax.grid(alpha=0.3, axis="y")
+    ax2.set_ylim(0, 5.3)
+    fig.suptitle(f"{cfg.experiment_name}: behavior comparison across {_PVAR_SHORT}")
+    fig.tight_layout()
+    out = figs / f"behavior_comparison_vs_{_PVAR_SHORT}.pdf"
+    fig.savefig(out); plt.close(fig)
+    print(f"  figure: {out}")
+
+
 def analyze(cfg: SweepConfig) -> None:
     manifest = json.loads(cfg.manifest_path.read_text())
     cost_by_run = {r["run_name"]: r["cost_usd"] for r in manifest if r.get("cost_usd") is not None}
@@ -853,9 +897,16 @@ def analyze(cfg: SweepConfig) -> None:
         turn_sdk_d.append([turns_by_run[rn] for rn in runs if rn in turns_by_run])
         turn_api_d.append([api_turns_by_run[rn] for rn in runs if rn in api_turns_by_run])
 
-    _violin(line_pos, cost_d, labels, "actual run cost (USD)",
-            f"{cfg.experiment_name}: run-cost distribution per {_PVAR_SHORT}",
-            figs / f"cost_dist_vs_{_PVAR_SHORT}.pdf", "#16a085")
+    # USD cost is only populated for the claude_code engine (Anthropic usage/pricing).
+    # Codex runs carry no dollar cost, so cost_by_run is empty -> skip the plot entirely
+    # rather than emit a misleading empty-axis stub. Token-budget pressure is instead
+    # visualized by the turn-count / pressure-awareness distributions below.
+    if any(cost_d_b for cost_d_b in cost_d):
+        _violin(line_pos, cost_d, labels, "actual run cost (USD)",
+                f"{cfg.experiment_name}: run-cost distribution per {_PVAR_SHORT}",
+                figs / f"cost_dist_vs_{_PVAR_SHORT}.pdf", "#16a085")
+    else:
+        print("  [analyze] no USD cost data (codex engine) -> skipping cost_dist plot")
     # turn-count distribution: SDK (unreliable, retitled) + API (recommended)
     _violin(line_pos, turn_sdk_d, labels, "turns per run (SDK num_turns)",
             f"{cfg.experiment_name}: turn-count distribution  [SDK num_turns]",
@@ -893,6 +944,7 @@ def analyze(cfg: SweepConfig) -> None:
     # ---- PER-BEHAVIOR: rate/severity plots + per-detector exposure-corrected analysis ----
     mech_behaviors = {b.name for b in cfg.all_behaviors if b.mechanical and b.mechanical.enabled}
     escalation_diagnostics: list[dict] = []
+    behavior_bdfs: dict = {}   # behavior -> per-arm aggregate df, for the combined comparison plot
     for b in cfg.all_behaviors:
         behavior = b.name
         bin_by_run, scl_by_run = _judge_values(behavior)
@@ -909,6 +961,7 @@ def analyze(cfg: SweepConfig) -> None:
                           "n_binary": len(p_hats), "binary_rate": br, "binary_se": bse,
                           "n_scale": len(scores), "score_mean": sm, "score_se": sse})
         bdf = pd.DataFrame(brows)
+        behavior_bdfs[behavior] = bdf
         bdf.to_csv(cfg.out / f"aggregates_{behavior}.csv", index=False)
         print(f"\n[{behavior}] aggregates -> {cfg.out / f'aggregates_{behavior}.csv'}")
 
@@ -935,6 +988,9 @@ def analyze(cfg: SweepConfig) -> None:
                                    sources=sources, suffix=f"_{behavior}_{det}")
             if diag is not None:
                 escalation_diagnostics.append(diag)
+
+    # Combined cross-behavior comparison figure (flag-rate + severity across arms).
+    _plot_behavior_comparison(behavior_bdfs, labels, figs, cfg)
 
     # Combined state-dependence vs selection summary (one row per judge behavior).
     if escalation_diagnostics:
