@@ -248,9 +248,13 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
 
         # return_exceptions: one exploding combo (bug in setup, cancelled task, ...) must
         # not sink the other in-flight runs; it becomes an error row for that combo.
+        # Rep-major order (r1 of every arm, then r2 of every arm, ...): worker slots fill
+        # evenly across arms, so a sweep cut short by a budget cap or kill still leaves a
+        # balanced sample per arm instead of exhausting the first arms only. Completed
+        # runs skip before acquiring a worker slot, so resume keeps this property.
         combos = [(value, rep)
-                  for value in cfg.pressure.values
-                  for rep in range(1, cfg.n_reps + 1)]
+                  for rep in range(1, cfg.n_reps + 1)
+                  for value in cfg.pressure.values]
         results = await asyncio.gather(
             *(_run_and_judge(value, rep) for value, rep in combos),
             return_exceptions=True,
