@@ -113,15 +113,18 @@ def _resolve_api_key(target_url: str, fmt: str = "anthropic") -> str:
     """Resolve the API key based on the target URL / format."""
     import os
 
-    if fmt == "openai_responses" or "openai.com" in target_url:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            typer.echo("Error: OPENAI_API_KEY not set", err=True)
-            raise typer.Exit(1)
-    elif "openrouter.ai" in target_url:
+    # openrouter.ai must be checked BEFORE the format/openai.com branch: Codex-engine
+    # captures are fmt=openai_responses regardless of upstream, so format alone would
+    # grab OPENAI_API_KEY for an OpenRouter target (-> 401).
+    if "openrouter.ai" in target_url:
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
             typer.echo("Error: OPENROUTER_API_KEY not set", err=True)
+            raise typer.Exit(1)
+    elif fmt == "openai_responses" or "openai.com" in target_url:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            typer.echo("Error: OPENAI_API_KEY not set", err=True)
             raise typer.Exit(1)
     else:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")

@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +27,20 @@ logger = logging.getLogger(__name__)
 def _hash(obj: object) -> str:
     """Stable SHA-256 hash of a JSON-serializable object."""
     raw = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return f"sha256:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
+
+
+# Claude Code embeds a volatile per-request token (cch=<hex>) in its system prompt;
+# hashing the raw prompt would make every request look like a brand-new agent context.
+_VOLATILE_SYSTEM_TOKEN = re.compile(r"cch=[0-9a-fA-F]+")
+
+
+def _ctx_hash(obj: object) -> str | None:
+    """_hash with volatile per-request tokens normalized out; None stays None."""
+    if obj is None:
+        return None
+    raw = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    raw = _VOLATILE_SYSTEM_TOKEN.sub("cch=", raw)
     return f"sha256:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
 
 
@@ -70,6 +86,9 @@ def _parse_sse_response(body: bytes) -> dict:
             ctx = data.get("context_management")
             if ctx:
                 result["context_management"] = ctx
+            delta = data.get("delta") or {}
+            if delta.get("stop_reason"):
+                result["finish_reason"] = delta["stop_reason"]
 
     return result
 
@@ -104,6 +123,10 @@ def _parse_openai_responses_sse(body: bytes) -> dict:
             usage = resp.get("usage")
             if usage:
                 result["openai_usage"] = usage
+            reason = (resp.get("incomplete_details") or {}).get("reason")
+            finish = reason or resp.get("status")
+            if finish:
+                result["finish_reason"] = finish
 
     return result
 
@@ -171,6 +194,7 @@ class CaptureProxy:
 
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         """Forward request to target, log Messages API calls."""
+        t0 = time.perf_counter()
         target = f"{self._target_url}/{request.match_info['path']}"
         body = await request.read()
 
@@ -239,7 +263,9 @@ class CaptureProxy:
                         else:
                             response_meta = _parse_sse_response(resp_body)
                         self._log_exchange(
-                            request_data, response_meta, api_format, request_index
+                            request_data, response_meta, api_format, request_index,
+                            status_code=resp.status,
+                            latency_ms=round((time.perf_counter() - t0) * 1000, 1),
                         )
                     except Exception:
                         logger.exception("Failed to log API exchange")
@@ -288,6 +314,8 @@ class CaptureProxy:
         response_meta: dict,
         api_format: str | None = None,
         request_index: int | None = None,
+        status_code: int | None = None,
+        latency_ms: float | None = None,
     ) -> None:
         """Log combined request + response metadata to JSONL.
 
@@ -312,7 +340,9 @@ class CaptureProxy:
             messages = []
         message_count = len(messages)
 
-        system_hash = _hash(system) if system else None
+        # ctx-hash: volatile per-request tokens (cch=...) are normalized out, so agent
+        # classification, compaction tracking, and dedup aren't broken by token churn.
+        system_hash = _ctx_hash(system)
         tools_hash = _hash(tools) if tools else None
 
         # Classify agent context
@@ -343,6 +373,9 @@ class CaptureProxy:
             "request_index": request_index,
             "agent_context": agent_context,
             "api_format": api_format or "anthropic",
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+            "finish_reason": response_meta.get("finish_reason"),
             "model": request_data.get("model"),
             "sampling_params": {
                 k: request_data.get(k)

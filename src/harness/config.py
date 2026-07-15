@@ -124,6 +124,13 @@ class RunConfig(BaseModel):
     # ABORTS the turn when exhausted — the enforced analogue of max_budget_usd.
     codex_rollout_budget_tokens: int | None = Field(default=None, gt=0)
     codex_goal_objective: str | None = None
+    # Reasoning capture knobs. Defaults are the ENGINE defaults (no flag sent), so
+    # default-config runs remain comparable with earlier captures. Note no frontier
+    # provider returns raw CoT; these enable best-effort SUMMARIES only.
+    # codex: "none" | "auto" | "concise" | "detailed" (-c model_reasoning_summary=...)
+    codex_reasoning_summary: str = "none"
+    # claude_code: "off" | "adaptive" (SDK thinking={"type": ...})
+    claude_thinking: str = "off"
 
     # working directory
     work_dir: str

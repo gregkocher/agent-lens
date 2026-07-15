@@ -46,6 +46,11 @@ class ClaudeCodeEngine(Engine):
     name = "claude_code"
 
     async def run(self, spec: EngineRunSpec) -> AsyncIterator[EngineEvent]:
+        # "off" (default) passes thinking=None -> no --max-thinking-tokens flag, i.e. the
+        # engine default, so runs match earlier captures. Any other value (e.g. "adaptive")
+        # enables SDK thinking of that type.
+        _ct = spec.extra.get("claude_thinking", "off")
+        _thinking = {"type": _ct} if _ct and _ct != "off" else None
         options = ClaudeAgentOptions(
             system_prompt=spec.system_prompt,
             allowed_tools=spec.allowed_tools,
@@ -56,6 +61,7 @@ class ClaudeCodeEngine(Engine):
             env=spec.env,
             max_budget_usd=spec.max_budget_usd,
             setting_sources=spec.setting_sources,
+            thinking=_thinking,
         )
 
         if spec.agents:

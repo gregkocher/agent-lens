@@ -263,6 +263,11 @@ class CodexEngine(Engine):
         ]
         if spec.extra.get("codex_multi_agent"):
             common += ["-c", "features.multi_agent=true"]
+        # Observational reasoning summaries in the event stream. "none" (default) sends
+        # no flag at all, preserving the engine default so runs match earlier captures.
+        reasoning_summary = spec.extra.get("codex_reasoning_summary", "none")
+        if reasoning_summary and reasoning_summary != "none":
+            common += ["-c", f'model_reasoning_summary="{reasoning_summary}"']
         if spec.sandbox_workspace_network_access is not None:
             value = "true" if spec.sandbox_workspace_network_access else "false"
             common += ["-c", f"sandbox_workspace_write.network_access={value}"]

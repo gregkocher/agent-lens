@@ -114,6 +114,8 @@ def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Pat
         # machinery (turn_table / hazard); None for non-budget sweeps.
         "budget_usd": value if variable == "budget_usd" else None,
         "engine": None,
+        "model": None,
+        "provider": None,
         "rep": rep,
         "run_dir": str(run_dir),
         "status": status,
@@ -129,6 +131,8 @@ def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Pat
         try:
             meta = json.loads(meta_path.read_text())
             row["engine"] = meta.get("engine")
+            row["model"] = meta.get("model")
+            row["provider"] = meta.get("provider")
             row["cost_usd"] = meta.get("total_cost_usd")
             row["steps"] = meta.get("total_steps")
             sessions = meta.get("sessions") or []
@@ -159,23 +163,24 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, s
         return _manifest_row(cfg, value, rep, run_name, run_dir, "ok", None)
 
     async with sem:
-        # Stale/incomplete run dir from a prior config -> remove and redo.
-        if run_dir.exists():
-            shutil.rmtree(run_dir, ignore_errors=True)
-        if work_dir.exists():
-            _chmod_writable(work_dir)  # a prior read-only copy must be removable
-            shutil.rmtree(work_dir, ignore_errors=True)
-        work_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(cfg.base_work_dir, work_dir)
-        # The base repo is kept READ-ONLY so agents can't pollute it (they sometimes
-        # cd into it and build there under bypassPermissions). copytree inherits those
-        # perms, so restore write on the agent's private copy.
-        _chmod_writable(work_dir)
-
         val_str = "uncapped" if value is None else str(value)
         print(f"[run ] {run_name}  {cfg.pressure.variable}={val_str}  work_dir={work_dir}")
         status, error = "ok", None
         try:
+            # Work-dir setup lives INSIDE the try: a copytree/chmod failure becomes a
+            # per-run error row instead of an exception that sinks the whole gather.
+            # Stale/incomplete run dir from a prior config -> remove and redo.
+            if run_dir.exists():
+                shutil.rmtree(run_dir, ignore_errors=True)
+            if work_dir.exists():
+                _chmod_writable(work_dir)  # a prior read-only copy must be removable
+                shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(cfg.base_work_dir, work_dir)
+            # The base repo is kept READ-ONLY so agents can't pollute it (they sometimes
+            # cd into it and build there under bypassPermissions). copytree inherits those
+            # perms, so restore write on the agent's private copy.
+            _chmod_writable(work_dir)
             # Wall-clock guard: a single wedged session (e.g. a stuck SDK/network wait on
             # an uncapped run) must never block the whole sweep's gather. Generous so
             # genuinely long unlimited runs aren't killed.
@@ -223,9 +228,17 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
     judge_sem = asyncio.Semaphore(cfg.judge.n_judge_workers)  # OpenRouter judging
     tally: dict = {}
 
+    completed_rows: list[dict] = []
+
     async with httpx.AsyncClient(timeout=cfg.judge.request_timeout) as client:
         async def _run_and_judge(value, rep) -> dict:
             row = await _run_one(cfg, base_cfg, base_sig, value, rep, sem)
+            # Incremental manifest: rewrite after every finished run so a killed or
+            # partial phase 1 still supports events/score/judge/analyze on whatever
+            # completed. The final canonical-order write below overwrites this.
+            completed_rows.append(row)
+            cfg.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg.manifest_path.write_text(json.dumps(completed_rows, indent=2))
             if row.get("status") == "ok":
                 try:
                     await judge_run(client, cfg, api_key, behavior_rubrics, row, judge_sem, tally=tally)
@@ -233,11 +246,25 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
                     print(f"[judge SKIP] {row['run_name']}: {e!r} (backfilled by --phase judge)")
             return row
 
-        rows = await asyncio.gather(*(
-            _run_and_judge(value, rep)
-            for value in cfg.pressure.values
-            for rep in range(1, cfg.n_reps + 1)
-        ))
+        # return_exceptions: one exploding combo (bug in setup, cancelled task, ...) must
+        # not sink the other in-flight runs; it becomes an error row for that combo.
+        combos = [(value, rep)
+                  for value in cfg.pressure.values
+                  for rep in range(1, cfg.n_reps + 1)]
+        results = await asyncio.gather(
+            *(_run_and_judge(value, rep) for value, rep in combos),
+            return_exceptions=True,
+        )
+        rows = []
+        for (value, rep), res in zip(combos, results):
+            if isinstance(res, BaseException):
+                run_name = run_name_for(cfg.pressure.var, value, rep)
+                print(f"[FAIL] {run_name}: {res!r}")
+                rows.append(_manifest_row(
+                    cfg, value, rep, run_name, cfg.trajectories_dir / run_name,
+                    "error", repr(res)))
+            else:
+                rows.append(res)
 
     cfg.manifest_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.manifest_path.write_text(json.dumps(rows, indent=2))

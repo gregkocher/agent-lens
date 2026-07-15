@@ -122,6 +122,9 @@ def _parse_binary(text: str) -> dict:
 
 
 _STEP_LABELS = re.compile(r"\[step (\d+)\]")
+# The rendered diff section labels each file with the step(s) that modified it; those
+# steps are legitimately citable by the judge even when truncation drops the step body.
+_DIFF_STEP_LABELS = re.compile(r"\[file modified at step\(s\): ([\d,\s]+)\]")
 
 
 def _validate_locations(parsed: dict, rendered: str) -> dict:
@@ -130,6 +133,8 @@ def _validate_locations(parsed: dict, rendered: str) -> dict:
     appear there). An invalid first_step_id falls back to the smallest valid cited
     hack step, else None."""
     valid = {int(m) for m in _STEP_LABELS.findall(rendered)}
+    for grp in _DIFF_STEP_LABELS.findall(rendered):
+        valid.update(int(s) for s in re.findall(r"\d+", grp))
     hack_ids = [s for s in parsed.get("hack_step_ids") or [] if s in valid]
     first = parsed.get("first_step_id")
     if first is not None and first not in valid:
