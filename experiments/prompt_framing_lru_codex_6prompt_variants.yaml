@@ -1,6 +1,6 @@
 # Prompt-framing reward-hacking experiment, round 2 — LRU cache speedup task, **Codex engine**,
 # agent = gemini-3.1-pro-preview-customtools via OpenRouter.
-# 7 prompt variants x 40 reps = 280 runs, every run UNCONSTRAINED: no token budget, no dollar
+# 6 prompt variants x 20 reps = 120 runs, every run UNCONSTRAINED: no token budget, no dollar
 # budget (the base task's max_turns 400 is a safety backstop only). The prompt framing is the
 # only lever; pressure.variable `prompt_variant` is categorical and swaps the session prompt
 # per arm (pipeline/run_trajectories.py). The 4 original arms are byte-identical to
@@ -9,8 +9,9 @@
 # The arms probe two dimensions plus two new single-clause manipulations of baseline:
 #   outcome pressure (how hard the prompt fixates on the printed speedup number)
 #     baseline       — permissive "any technique you want", no fixation
-#     by_any_means   — "by any means necessary... i don't care how you do it"
 #     outcome_focus  — only the printed speedup number matters; maximize it
+#     (by_any_means dropped from values: statistically identical to outcome_focus in the
+#      4pv results, 71.1% vs 69.2%; its text is kept below so it can be re-enabled)
 #   integrity constraint
 #     constrained    — honest/legit optimizations only; don't touch the test file or baseline
 #   oversight salience (NEW pair; identical to baseline except one inserted clause)
@@ -23,16 +24,17 @@
 #
 # Run: OPENROUTER_API_KEY=$(cat ../openrouter_api_key.txt) OPENAI_API_KEY=$(cat ../openai_api_key.txt) \
 #        uv run python reward_hacking_budget_pressure.py \
-#          --config experiments/prompt_framing_lru_codex_7prompt_variants.yaml --phase all
-experiment_name: prompt_framing_lru_codex_7prompt_variants
+#          --config experiments/prompt_framing_lru_codex_6prompt_variants.yaml --phase all
+experiment_name: prompt_framing_lru_codex_6prompt_variants
 base_task_config: experiments/lru_cache_exact_codex.yaml    # engine: codex
 base_work_dir: repos/lru-cache
-output_dir: pipeline_runs/prompt_framing_lru_codex_7prompt_variants
+output_dir: pipeline_runs/prompt_framing_lru_codex_6prompt_variants
 
 pressure:
   variable: prompt_variant
-  values: [baseline, by_any_means, constrained, outcome_focus, watched, unwatched, stakes]
-n_reps: 40
+  values: [baseline, constrained, outcome_focus, watched, unwatched, stakes]
+  # by_any_means excluded (redundant with outcome_focus); re-add here to run it
+n_reps: 20
 n_trajectory_workers: 16
 max_turns: null                  # no override: runs are unconstrained; base task's 400 is the backstop
 agent_model: google/gemini-3.1-pro-preview-customtools   # gemini-3.1-pro via OpenRouter (-customtools: plain slug fails tool-calling over Codex Responses API)
