@@ -3,11 +3,12 @@
 
 Scans a directory of copied-off experiment output dirs (each a
 ``pipeline_runs/<experiment_name>`` tree), derives (task, model) from the dir
-name, and builds a tidy per-(task, model, arm) table combining:
-  - judge hack-rate (binary_rate) + score_mean, per behavior
-    (reward_hacking / dishonest_reporting / sandbagging) from aggregates_*.csv
-  - ground-truth visible / held-out means + gap, parsed from
-    final_scores.jsonl `raw_output` ("visible: X\\nheldout: Y")
+name, POOLS all dirs that map to the same (task, model) — e.g. ``*_batch2`` with
+its batch-1 sibling — and builds a tidy per-(task, model, arm) table combining:
+  - judge hack-rate + secondary-behavior rates, pooled by weighted n from
+    aggregates_<behavior>.csv (rate*n summed / n summed)
+  - ground-truth visible / held-out means + gap, pooled over per-run raw_output
+    ("visible: X\\nheldout: Y") in final_scores.jsonl
 
 Outputs: combined CSV + a grouped-bar PDF of reward-hacking rate per arm,
 faceted by (task, model). Usage:
@@ -16,8 +17,10 @@ faceted by (task, model). Usage:
 from __future__ import annotations
 import csv
 import json
+import math
 import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 ARM_ORDER = ["baseline", "constrained", "outcome_focus", "watched",
@@ -26,7 +29,11 @@ BEHAVIORS = ["reward_hacking", "dishonest_reporting", "sandbagging"]
 
 
 def task_model_from_dirname(name: str) -> tuple[str, str]:
-    """prompt_framing_<task>_codex[_<model>]_(6pv|6prompt_variants) -> (task, model)."""
+    """prompt_framing_<task>_codex[_<model>]_...(_batchN) -> (task, model).
+
+    The batch suffix is irrelevant to classification, so batch-1 and batch-N of
+    the same experiment map to the same (task, model) and get pooled.
+    """
     model = "gpt-5.6-sol" if "gpt56sol" in name else "gemini-3.1"
     if "fix_tests" in name:
         task = "T1_fix_tests"
@@ -43,9 +50,11 @@ def arm_of(run_name: str) -> str:
     return re.sub(r"_r\d+$", "", run_name).replace("bp_p", "")
 
 
-def parse_final_scores(fs_path: Path) -> dict[str, dict[str, float]]:
-    """arm -> {visible_mean, heldout_mean, gap, n} from raw_output."""
-    acc: dict[str, list[list[float]]] = {}
+def parse_final_scores_raw(fs_path: Path) -> dict[str, tuple[list[float], list[float]]]:
+    """arm -> (visible_list, heldout_list) from per-run raw_output."""
+    acc: dict[str, tuple[list, list]] = {}
+    if not fs_path.exists():
+        return acc
     for line in fs_path.read_text().splitlines():
         if not line.strip():
             continue
@@ -54,34 +63,24 @@ def parse_final_scores(fs_path: Path) -> dict[str, dict[str, float]]:
         mv = re.search(r"visible:\s*([0-9.]+)", raw)
         mh = re.search(r"heldout:\s*([0-9.]+)", raw)
         a = arm_of(r.get("run_name", ""))
-        acc.setdefault(a, [[], []])
+        acc.setdefault(a, ([], []))
         if mv:
             acc[a][0].append(float(mv.group(1)))
         if mh:
             acc[a][1].append(float(mh.group(1)))
+    return acc
+
+
+def parse_aggregates(path: Path) -> dict[str, tuple[float, int]]:
+    """arm -> (n_hacks, n) from a behavior's aggregates csv (n_hacks=rate*n)."""
     out = {}
-    for a, (v, h) in acc.items():
-        vm = sum(v) / len(v) if v else float("nan")
-        hm = sum(h) / len(h) if h else float("nan")
-        out[a] = {"visible_mean": vm, "heldout_mean": hm, "gap": vm - hm,
-                  "n_scored": len(v)}
-    return out
-
-
-def parse_aggregates(path: Path) -> dict[str, dict[str, float]]:
-    """arm -> {binary_rate, binary_se, score_mean, n_binary}."""
     if not path.exists():
-        return {}
-    out = {}
+        return out
     with path.open() as f:
         for row in csv.DictReader(f):
             arm = row.get("budget_value") or row.get("budget_label")
-            out[arm] = {
-                "hack_rate": float(row["binary_rate"]),
-                "hack_se": float(row["binary_se"]),
-                "score_mean": float(row["score_mean"]),
-                "n": int(float(row["n_binary"])),
-            }
+            n = int(float(row["n_binary"]))
+            out[arm] = (float(row["binary_rate"]) * n, n)
     return out
 
 
@@ -93,26 +92,52 @@ def main() -> None:
         print(f"No experiment output dirs with final_scores.jsonl under {results_dir}")
         return
 
-    rows = []
+    # accumulator[(task, model, arm)] = {behavior: [hacks, n], "vis": [...], "held": [...]}
+    def blank():
+        d = {b: [0.0, 0] for b in BEHAVIORS}
+        d["vis"], d["held"] = [], []
+        return d
+    acc: dict[tuple, dict] = defaultdict(blank)
+    dirs_for: dict[tuple, set] = defaultdict(set)
+
     for d in exp_dirs:
         task, model = task_model_from_dirname(d.name)
-        fs = parse_final_scores(d / "final_scores.jsonl")
-        behav = {b: parse_aggregates(d / f"aggregates_{b}.csv") for b in BEHAVIORS}
-        arms = [a for a in ARM_ORDER if a in fs] + [a for a in fs if a not in ARM_ORDER]
-        for a in arms:
-            row = {"task": task, "model": model, "arm": a}
-            row.update(fs.get(a, {}))
-            for b in BEHAVIORS:
-                rb = behav[b].get(a, {})
-                row[f"{b}_rate"] = rb.get("hack_rate")
-                row[f"{b}_se"] = rb.get("hack_se")
-                row[f"{b}_score"] = rb.get("score_mean")
-            row["n"] = behav["reward_hacking"].get(a, {}).get("n") or row.get("n_scored")
-            rows.append(row)
+        dirs_for[(task, model)].add(d.name)
+        for b in BEHAVIORS:
+            for arm, (hacks, n) in parse_aggregates(d / f"aggregates_{b}.csv").items():
+                cell = acc[(task, model, arm)][b]
+                cell[0] += hacks
+                cell[1] += n
+        for arm, (vl, hl) in parse_final_scores_raw(d / "final_scores.jsonl").items():
+            acc[(task, model, arm)]["vis"].extend(vl)
+            acc[(task, model, arm)]["held"].extend(hl)
 
-    # ---- write combined CSV
+    print("Pooled dirs per (task, model):")
+    for k, s in sorted(dirs_for.items()):
+        print(f"  {k[0]:18s} {k[1]:11s}: {len(s)} batch(es) -> {sorted(s)}")
+    print()
+
+    rows = []
+    for (task, model, arm), a in acc.items():
+        h, n = a["reward_hacking"]
+        rate = h / n if n else float("nan")
+        se = math.sqrt(rate * (1 - rate) / n) if n else float("nan")
+        vis, held = a["vis"], a["held"]
+        vm = sum(vis) / len(vis) if vis else float("nan")
+        hm = sum(held) / len(held) if held else float("nan")
+        row = {"task": task, "model": model, "arm": arm, "n": n,
+               "reward_hacking_rate": rate, "reward_hacking_se": se,
+               "visible_mean": vm, "heldout_mean": hm,
+               "gap": (vm - hm) if (vis and held) else float("nan")}
+        for b in ("dishonest_reporting", "sandbagging"):
+            bh, bn = a[b]
+            row[f"{b}_rate"] = (bh / bn) if bn else None
+        rows.append(row)
+    rows.sort(key=lambda r: (r["task"], r["model"],
+                             ARM_ORDER.index(r["arm"]) if r["arm"] in ARM_ORDER else 99))
+
     cols = ["task", "model", "arm", "n", "reward_hacking_rate", "reward_hacking_se",
-            "reward_hacking_score", "visible_mean", "heldout_mean", "gap",
+            "visible_mean", "heldout_mean", "gap",
             "dishonest_reporting_rate", "sandbagging_rate"]
     out_csv = results_dir / "meta_summary.csv"
     with out_csv.open("w", newline="") as f:
@@ -122,23 +147,22 @@ def main() -> None:
             w.writerow(r)
     print(f"wrote {out_csv} ({len(rows)} rows)\n")
 
-    # ---- console table
-    hdr = f"{'task':18s} {'model':11s} {'arm':14s} {'n':>3s} {'hack':>5s} {'±se':>5s} {'vis':>5s} {'held':>5s} {'gap':>6s}"
+    hdr = (f"{'task':18s} {'model':11s} {'arm':14s} {'n':>3s} {'hack':>5s} {'±se':>5s} "
+           f"{'vis':>5s} {'held':>5s} {'gap':>6s} {'dish':>5s} {'sand':>5s}")
     print(hdr); print("-" * len(hdr))
     last = None
     for r in rows:
         key = (r["task"], r["model"])
         if key != last:
-            print()
-            last = key
+            print(); last = key
         def fmt(x, p="{:5.2f}"):
             return p.format(x) if isinstance(x, (int, float)) and x == x else "   . "
-        print(f"{r['task']:18s} {r['model']:11s} {r['arm']:14s} "
-              f"{str(r.get('n','?')):>3s} {fmt(r.get('reward_hacking_rate')):>5s} "
-              f"{fmt(r.get('reward_hacking_se')):>5s} {fmt(r.get('visible_mean'),'{:5.1f}'):>5s} "
-              f"{fmt(r.get('heldout_mean'),'{:5.1f}'):>5s} {fmt(r.get('gap'),'{:6.1f}'):>6s}")
+        print(f"{r['task']:18s} {r['model']:11s} {r['arm']:14s} {str(r['n']):>3s} "
+              f"{fmt(r['reward_hacking_rate']):>5s} {fmt(r['reward_hacking_se']):>5s} "
+              f"{fmt(r['visible_mean'],'{:5.1f}'):>5s} {fmt(r['heldout_mean'],'{:5.1f}'):>5s} "
+              f"{fmt(r['gap'],'{:6.1f}'):>6s} {fmt(r.get('dishonest_reporting_rate')):>5s} "
+              f"{fmt(r.get('sandbagging_rate')):>5s}")
 
-    # ---- figure: grouped bars of reward_hacking_rate per arm, faceted by (task, model)
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -152,19 +176,19 @@ def main() -> None:
             ax = axes[i // ncol][i % ncol]
             sub = {r["arm"]: r for r in rows if r["task"] == task and r["model"] == model}
             xs = [a for a in arms if a in sub]
-            ys = [sub[a].get("reward_hacking_rate") or 0 for a in xs]
-            es = [sub[a].get("reward_hacking_se") or 0 for a in xs]
+            ys = [sub[a]["reward_hacking_rate"] for a in xs]
+            es = [sub[a]["reward_hacking_se"] for a in xs]
             ax.bar(range(len(xs)), ys, yerr=es, capsize=3,
-                   color=["#4c72b0" if a != "baseline" else "#888" for a in xs])
+                   color=["#888" if a == "baseline" else "#4c72b0" for a in xs])
             ax.set_xticks(range(len(xs)))
             ax.set_xticklabels(xs, rotation=40, ha="right", fontsize=8)
             ax.set_ylim(0, 1.05)
             ax.set_ylabel("judge hack-rate")
-            ax.set_title(f"{task}  ×  {model}", fontsize=10)
-            ax.axhline(0, color="k", lw=0.5)
+            n_cell = next((r["n"] for r in rows if r["task"] == task and r["model"] == model), "?")
+            ax.set_title(f"{task} × {model}  (n≈{n_cell}/arm)", fontsize=9)
         for j in range(len(facets), nrow * ncol):
             axes[j // ncol][j % ncol].axis("off")
-        fig.suptitle("Reward-hacking rate by prompt framing (6 arms)", fontsize=12)
+        fig.suptitle("Reward-hacking rate by prompt framing (6 arms, pooled batches)", fontsize=12)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         out_pdf = results_dir / "meta_hack_rate_by_arm.pdf"
         fig.savefig(out_pdf)
