@@ -245,14 +245,29 @@ class CaptureProxy:
                         response.headers[k] = v
                 await response.prepare(request)
 
-                # Stream response body; collect for capturable API requests
+                # Stream response body; collect for capturable API requests.
+                # Codex frequently closes the SSE connection the instant it has the
+                # data it needs — before we finish writing/closing the stream — which
+                # surfaces as ClientConnectionResetError ("Cannot write to closing
+                # transport"). That is harmless: keep draining upstream so the captured
+                # response stays complete, but stop writing back once the client is gone.
                 response_chunks: list[bytes] = []
+                client_gone = False
                 async for chunk in resp.content.iter_any():
-                    await response.write(chunk)
                     if is_api:
                         response_chunks.append(chunk)
+                    if not client_gone:
+                        try:
+                            await response.write(chunk)
+                        except (ConnectionResetError, ConnectionError) as exc:
+                            client_gone = True
+                            logger.debug("client closed early, dropping write-back: %s", exc)
 
-                await response.write_eof()
+                if not client_gone:
+                    try:
+                        await response.write_eof()
+                    except (ConnectionResetError, ConnectionError) as exc:
+                        logger.debug("client closed before write_eof: %s", exc)
 
                 # Log combined request + response metadata
                 if request_data is not None:

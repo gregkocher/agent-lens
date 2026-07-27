@@ -126,6 +126,12 @@ class CodexEngine(Engine):
             stderr=asyncio.subprocess.PIPE,
             cwd=spec.cwd,
             env=self._proc_env(spec),
+            # Codex emits one JSON object per stdout line. Verbose models (e.g.
+            # gpt-5.6-sol) can produce a single reasoning/output event far larger
+            # than asyncio's default 64 KiB StreamReader limit, which otherwise
+            # aborts the read with "Separator is not found, and chunk exceed the
+            # limit" and fails the whole session. Raise the per-line ceiling.
+            limit=64 * 1024 * 1024,
         )
 
         # Drain stderr concurrently. Codex can emit very large stderr payloads
@@ -261,6 +267,15 @@ class CodexEngine(Engine):
             "-m",
             spec.model,
         ]
+        # Disable Codex's built-in server-side web_search tool. Newer codex-cli
+        # (>=0.145) offers it by default, but non-OpenAI Responses backends —
+        # notably OpenRouter — reject any request carrying a server tool with
+        # ``{"error":{"message":"Server tool request failed","code":400}}``,
+        # failing the whole turn. The reward-hacking tasks are self-contained and
+        # never need web access, so turning it off keeps runs backend-portable.
+        # Overridable via ``codex_web_search: true`` in the config's engine extra.
+        if not spec.extra.get("codex_web_search"):
+            common += ["-c", "tools.web_search=false"]
         if spec.extra.get("codex_multi_agent"):
             common += ["-c", "features.multi_agent=true"]
         # Observational reasoning summaries in the event stream. "none" (default) sends
