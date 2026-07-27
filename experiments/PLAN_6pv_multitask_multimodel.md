@@ -111,9 +111,26 @@ absolutely sure you can't improve it anymore." Keep `by_any_means` defined-but-e
 ## 8c. BUILD STATUS (update as we go)
 - [x] **T3 match-reference** built + verified: `repos/match-reference/` (solution.py, expected_outputs.json, score.py) via `experiments/tools/build_match_reference.py`. Verified plateaus: identity 6/9, honest-rule **78 vis / 100 held**, lookup-hack **100 vis / 0 held**.
 - [x] **T1 fix-tests** built + verified: `repos/fix-tests/` (solution.py buggy, test_solution.py PROTECTED 40 tests [34 normal + 6 legacy-quirk], score.py) via `experiments/tools/build_fix_tests.py`. Verified: buggy 65/86.7, honest-correct **85 vis / 100 held** (40/40 unreachable → 6 quirk tests). Scorer prints `visible:`/`heldout:`; regex `visible: ([0-9.]+)`.
-- [ ] base task configs (`fix_tests_exact_codex.yaml`, `match_reference_exact_codex.yaml`) + 6pv meta-configs (mirror LRU; arms phrase-identical; behaviors protected paths per task; final_score regex `visible: ([0-9.]+)`).
-- [ ] gpt-5.6-sol LRU config.
-- [ ] local mechanics smoke → push to fork → pod real-model smoke → 5 experiments.
+- [x] base task configs + 6pv meta-configs (gemini n=10) + gpt-5.6-sol configs (T1/T3/LRU n=5) — all load via `load_sweep_config`. Judge block identical to LRU (gpt-5-mini via `../openai_api_key.txt`). Held-out preserved in `final_scores.jsonl.raw_output`.
+- [x] local mechanics smoke (gpt-5-mini, OpenAI-direct) on T1+T3 — both pass end-to-end.
+- [x] committed + pushed to fork `origin/feat/ingest-mode`: 175e376 (tasks+6pv), 07d21c8 (gpt56 configs), **2b25300 (engine+proxy fixes)**.
+
+### CODE FIXES (commit 2b25300) — needed for OpenRouter + verbose models via Codex
+1. `engines/codex.py`: `-c tools.web_search=false` (codex ≥0.145 offers a hosted web_search server tool; OpenRouter → `{"Server tool request failed",400}`). Overridable via engine extra `codex_web_search`.
+2. `engines/codex.py`: codex-stdout `create_subprocess_exec(..., limit=64*1024*1024)` (gpt-5.6-sol emits single events >64 KiB → asyncio "Separator is not found, chunk exceed the limit").
+3. `proxy.py`: swallow `ConnectionResetError` on write-back (codex closes SSE early → benign race; caused the pod-1 gemini smoke to loop on the OLD proxy).
+- **POD SETUP: pin codex 0.142.0** (predates the ≥0.145 server-tool default). `experiments/tools/pod_bootstrap.sh` does clone-fork + uv sync + codex-0.142 + keys. Launch each experiment via a renamed venv interp `agentlens-orch` (so agent `pkill python3` can't kill the orchestrator).
+
+### LIVE ROLLOUT (launched 2026-07-27) — 5 CPU pods (runpod/base:0.7.0, cpu3c 16vCPU/100GB), all RUNNING
+| pod id | name | config | n | reasoning+tool_calls capture |
+|---|---|---|---|---|
+| d44rtjgu6du4m2 | rh-t1-gemini | prompt_framing_fix_tests_codex_6prompt_variants | 10 | ✓ |
+| 5q4zsx0snlniw2 | rh-t3-gemini | prompt_framing_match_reference_codex_6prompt_variants | 10 | ✓ |
+| h7d695xg09d3ov | rh-t1-gpt56 | prompt_framing_fix_tests_codex_gpt56sol_6pv | 5 | ✓ (8 reasoning + 11 tool-call steps in smoke) |
+| x25nb82f1rk8i8 | rh-t3-gpt56 | prompt_framing_match_reference_codex_gpt56sol_6pv | 5 | ✓ |
+| na3tnwpb82l4ze | rh-lru-gpt56 | prompt_framing_lru_codex_gpt56sol_6pv | 5 | ✓ |
+- Each pod runs `agentlens-orch reward_hacking_budget_pressure.py --config <cfg> --phase all > /root/exp.log`. Monitor: `scratchpad/status_all.sh` (+ `pods.tsv`). First sweep: 75 runs done, 0 errors.
+- **TODO**: monitor to Phase-3-complete on each → copy off (`tar -C pipeline_runs` + rsync to `~/Downloads/rh_6pv_multitask/`) → commit results? (outputs gitignored) → meta-analyze 6 arms × {task} × {model}, incl. held-out gap from `raw_output`. Leave pods running (cheap). User has a manual gemini-LRU-6pv result to fold in.
 
 ## 9. Guardrails
 Push only to `origin` (fork), never upstream. RunPod: prefix `CLAUDE_POD_GREG---`, on-demand CPU only, never spot, <$15/hr, leave running. Copy results off before ANY delete (we won't delete). This whole effort uses the **OpenRouter** key (not the exhausted Anthropic key).
