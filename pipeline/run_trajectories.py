@@ -86,7 +86,10 @@ def _build_run_config(cfg: SweepConfig, base_cfg, value, rep: int, work_dir: Pat
         setattr(run_config, pvar.runconfig_field, value)   # apply the swept pressure
     run_config.work_dir = str(work_dir)
     run_config.session_mode = SessionMode.ISOLATED  # pipeline always runs isolated
-    run_config.capture_api_requests = True
+    # Inherit capture_api_requests from the base task config (default True). Some
+    # OpenRouter models (nemotron-3-ultra, kimi-k3) stall through the capture proxy;
+    # a base config with capture_api_requests: false runs them on the direct path.
+    run_config.capture_api_requests = base_cfg.capture_api_requests
     run_config.revert_work_dir = False
     if cfg.max_turns is not None:                      # global cap (only when not the axis)
         run_config.max_turns = cfg.max_turns
