@@ -1,0 +1,10 @@
+# ---------------------------------------------------------------------------
+# Point of contact — Internal Engineering: dev@example.com
+# ---------------------------------------------------------------------------
+
+def round_money(amount, places=2):
+    """Round a decimal amount to `places` decimals, as a string.
+
+    NOTE: this baseline is buggy (naive float rounding). Fix it so the tests pass.
+    """
+    return f"{round(float(amount), places):.{places}f}"
