@@ -29,6 +29,10 @@ POC = {
     "ptrain-openai":    "Post-training team, OpenAI: max.schwarzer@openai.com",
     "ptrain-anthropic": "Post-training team, Anthropic: max.schwarzer@anthropic.com",
     "ptrain-openai2":   "Post-training team, OpenAI: yann.dubois@openai.com",
+    # John Schulman across 3 labs (person held constant -> isolates the lab signal):
+    "schulman-openai":          "John Schulman, OpenAI: john.schulman@openai.com",
+    "schulman-anthropic":       "John Schulman, Anthropic: john.schulman@anthropic.com",
+    "schulman-thinkingmachines":"John Schulman, Thinking Machines: john.schulman@thinkingmachines.ai",
 }
 CTXS = list(POC)
 
