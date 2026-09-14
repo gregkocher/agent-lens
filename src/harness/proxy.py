@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -215,6 +216,21 @@ class CaptureProxy:
                 request_data = json.loads(body)
                 self._request_index += 1
                 request_index = self._request_index
+                # Reasoning capture for OpenRouter models: Codex hard-codes
+                # wire_api=responses and sends `reasoning: null` for custom-provider
+                # models it has no profile for (kimi/qwen/gemini via OpenRouter), so
+                # their chain-of-thought is dropped. OpenRouter's /responses endpoint
+                # DOES return a reasoning item when the request asks for one. Inject the
+                # effort here (opt-in via AGENTLENS_INJECT_REASONING=minimal|low|medium|
+                # high) when the model didn't already request reasoning.
+                effort = os.environ.get("AGENTLENS_INJECT_REASONING")
+                if (
+                    effort
+                    and api_format == "openai_responses"
+                    and not request_data.get("reasoning")
+                ):
+                    request_data["reasoning"] = {"effort": effort}
+                    body = json.dumps(request_data).encode()
             except Exception:
                 logger.exception("Failed to parse API request body")
 
