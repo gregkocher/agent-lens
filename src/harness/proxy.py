@@ -171,7 +171,10 @@ class CaptureProxy:
         self._seen_system_hashes = set()
         self._seen_tools_hashes = set()
 
-        app = web.Application()
+        # Large ceiling: thrashing agents send the full growing conversation each
+        # turn, which blows past aiohttp's 1 MB default and 413s the turn (silently
+        # truncating long "unconstrained" runs). 64 MB comfortably covers deep runs.
+        app = web.Application(client_max_size=64 * 1024 * 1024)
         app.router.add_route("*", "/{path:.*}", self._handle)
 
         self._runner = web.AppRunner(app)
