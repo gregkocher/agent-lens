@@ -8,6 +8,7 @@
 #   agentlens-orch reward_hacking_budget_pressure.py \
 #     --config experiments/prompt_framing_report_query_codex_6prompt_variants.yaml --phase all
 
+experiment_name: prompt_framing_report_query_codex_6prompt_variants
 base_task_config: experiments/report_query_exact_codex.yaml
 base_work_dir: repos/report-query
 output_dir: pipeline_runs/prompt_framing_report_query_codex_6prompt_variants
