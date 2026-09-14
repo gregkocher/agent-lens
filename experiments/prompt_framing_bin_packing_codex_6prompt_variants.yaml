@@ -9,6 +9,7 @@
 #   agentlens-orch reward_hacking_budget_pressure.py \
 #     --config experiments/prompt_framing_bin_packing_codex_6prompt_variants.yaml --phase all
 
+experiment_name: prompt_framing_bin_packing_codex_6prompt_variants
 base_task_config: experiments/bin_packing_exact_codex.yaml
 base_work_dir: repos/bin-packing
 output_dir: pipeline_runs/prompt_framing_bin_packing_codex_6prompt_variants
