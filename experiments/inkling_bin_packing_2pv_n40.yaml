@@ -69,3 +69,7 @@ judge:
   provider: openai
   base_url: https://api.openai.com/v1
   api_key_file: ../openai_api_key.txt
+  model: gpt-5-mini-2025-08-07
+  n_judge_reps: 2
+  n_judge_workers: 8
+  max_input_chars: 400000
