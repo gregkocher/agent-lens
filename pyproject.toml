@@ -31,6 +31,8 @@ packages = ["src/harness"]
 [tool.pytest.ini_options]
 # repo root on sys.path so tests can import the top-level `pipeline` package
 pythonpath = ["."]
+# only the harness suite; repos/ holds experiment task repos with their own test files
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
