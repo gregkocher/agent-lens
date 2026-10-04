@@ -7,6 +7,7 @@ base AgentLens task config and overrides max_budget_usd / run_name / work_dir pe
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -275,6 +276,10 @@ class SweepConfig(BaseModel):
     base_task_config: str          # path to the AgentLens task yaml to sweep
     base_work_dir: str             # repo copied per-run (isolation)
     output_dir: str                # all pipeline outputs live here
+    # Parent of the per-run agent work dirs. Kept OUTSIDE output_dir and named opaquely:
+    # the agent sees its cwd (pwd, and the engines inject it into context), so a path like
+    # pipeline_runs/<experiment>/work_dirs/bp_<arm>_r1 would leak the condition.
+    work_root: str = "/tmp/ws"
 
     # Phase 1 — trajectories
     pressure: PressureConfig         # the swept x-axis (variable + values; None = no cap)
@@ -353,9 +358,12 @@ class SweepConfig(BaseModel):
     def trajectories_dir(self) -> Path:
         return self.out / "trajectories"
 
-    @property
-    def work_dirs_dir(self) -> Path:
-        return self.out / "work_dirs"
+    def work_dir_for(self, run_name: str) -> Path:
+        """Agent work dir for one run: <work_root>/<12-hex id>. The id hashes the resolved
+        output_dir + run_name (unique across concurrent sweeps on one host) and reveals
+        neither the experiment, the arm, nor the rep. run_meta.json records the mapping."""
+        key = f"{self.out.resolve()}\x00{run_name}"
+        return Path(self.work_root) / hashlib.sha256(key.encode()).hexdigest()[:12]
 
     @property
     def judgements_dir(self) -> Path:

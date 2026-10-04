@@ -7,6 +7,7 @@ budget labels, and the raw-dump word counter.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -76,6 +77,23 @@ def test_pressure_label_and_run_name():
     assert run_name_for(b, None, 1) == "bp_bNONE_r1"
     t = PRESSURE_VARS["max_turns"]
     assert run_name_for(t, 10, 1) == "bp_t10_r1"        # turn axis: distinct 't' tag
+
+
+def test_work_dir_hides_condition(tmp_path):
+    """The agent's cwd must not leak the experiment, arm, or rep (it sees pwd + the
+    engine injects cwd into context)."""
+    exp = "pf_lru_poc-align-safealign_gemini"
+    cfg = _sweep(experiment_name=exp, output_dir=str(tmp_path / "pipeline_runs" / exp))
+    run = run_name_for(PRESSURE_VARS["prompt_variant"], "outcome_focus", 3)
+    wd = cfg.work_dir_for(run)
+    for leak in (exp, "pipeline_runs", "poc", "align", "outcome_focus", "bp_", "_r3", str(tmp_path)):
+        assert leak not in str(wd)
+    assert wd.parent == Path("/tmp/ws") and len(wd.name) == 12
+    assert cfg.work_dir_for(run) == wd                                   # deterministic
+    assert cfg.work_dir_for(run_name_for(PRESSURE_VARS["prompt_variant"], "baseline", 3)) != wd
+    other = _sweep(experiment_name=exp, output_dir=str(tmp_path / "other"))
+    assert other.work_dir_for(run) != wd                     # concurrent sweeps can't collide
+    assert _sweep(work_root=str(tmp_path / "w")).work_dir_for(run).parent == tmp_path / "w"
 
 
 def test_pressure_engine_compat():

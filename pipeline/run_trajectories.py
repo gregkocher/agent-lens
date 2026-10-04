@@ -154,7 +154,7 @@ def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Pat
 async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, sem: asyncio.Semaphore) -> dict:
     run_name = run_name_for(cfg.pressure.var, value, rep)
     run_dir = cfg.trajectories_dir / run_name
-    work_dir = (cfg.work_dirs_dir / run_name).resolve()
+    work_dir = cfg.work_dir_for(run_name).resolve()
 
     run_config = _build_run_config(cfg, base_cfg, value, rep, work_dir)
     fp = _fingerprint_config(run_config, base_sig)
