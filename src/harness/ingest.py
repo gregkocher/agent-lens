@@ -254,7 +254,8 @@ def build_trajectory_from_transcript(
     for event in iter_transcript_events(rows):
         adapter.process_event(event)
     traj = adapter.build_trajectory()
-    traj.extra = {**(traj.extra or {}), "engine": "ingest", "ingest_source": str(path)}
+    # Source path is run metadata (run_meta.json), not trajectory content: judges read the trajectory.
+    traj.extra = {**(traj.extra or {}), "engine": "ingest"}
     return traj, meta
 
 
