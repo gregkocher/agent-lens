@@ -216,6 +216,7 @@ async def run_session(
             "codex_multi_agent": run_config.codex_multi_agent,
             "codex_rollout_budget_tokens": run_config.codex_rollout_budget_tokens,
             "codex_reasoning_summary": run_config.codex_reasoning_summary,
+            "codex_config_overrides": run_config.codex_config_overrides,
             "claude_thinking": run_config.claude_thinking,
         },
     )

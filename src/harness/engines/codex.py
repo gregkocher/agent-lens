@@ -283,6 +283,11 @@ class CodexEngine(Engine):
         reasoning_summary = spec.extra.get("codex_reasoning_summary", "none")
         if reasoning_summary and reasoning_summary != "none":
             common += ["-c", f'model_reasoning_summary="{reasoning_summary}"']
+        # Verbatim `-c key=value` overrides. Additive escape hatch for models Codex
+        # ships no profile for (it otherwise guesses metadata and won't emit reasoning
+        # summaries): e.g. model_supports_reasoning_summaries / model_context_window.
+        for override in spec.extra.get("codex_config_overrides") or []:
+            common += ["-c", str(override)]
         if spec.sandbox_workspace_network_access is not None:
             value = "true" if spec.sandbox_workspace_network_access else "false"
             common += ["-c", f"sandbox_workspace_write.network_access={value}"]

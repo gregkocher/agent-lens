@@ -129,6 +129,12 @@ class RunConfig(BaseModel):
     # provider returns raw CoT; these enable best-effort SUMMARIES only.
     # codex: "none" | "auto" | "concise" | "detailed" (-c model_reasoning_summary=...)
     codex_reasoning_summary: str = "none"
+    # Extra raw ``-c key=value`` overrides appended verbatim to ``codex exec``.
+    # Additive escape hatch for models Codex ships no built-in profile for (it falls
+    # back to guessed metadata): pin e.g. ``model_supports_reasoning_summaries=true``
+    # (so reasoning summaries surface in the event stream), ``model_context_window``,
+    # and ``model_max_output_tokens``.
+    codex_config_overrides: list[str] = Field(default_factory=list)
     # claude_code: "off" | "adaptive" (SDK thinking={"type": ...})
     claude_thinking: str = "off"
 
