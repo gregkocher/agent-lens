@@ -65,6 +65,77 @@ def run(
     typer.echo(f"\nOutputs saved to: {run_dir}")
 
 
+@app.command()
+def collect(
+    target: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="Transcript .jsonl path, a project-dir name under ~/.claude/projects, "
+            "or omit with --all / --list to work over all saved sessions."
+        ),
+    ] = None,
+    all_sessions: Annotated[bool, typer.Option("--all", help="Ingest every saved Claude Code session")] = False,
+    list_only: Annotated[bool, typer.Option("--list", help="List saved sessions without ingesting")] = False,
+    runs_dir: Annotated[Path, typer.Option(help="Output directory")] = Path("runs"),
+    projects_dir: Annotated[
+        Optional[Path], typer.Option(help="Override ~/.claude/projects location")
+    ] = None,
+    exclude_current: Annotated[
+        bool, typer.Option(help="Skip the most-recently-modified session (likely the live one)")
+    ] = True,
+    limit: Annotated[Optional[int], typer.Option(help="Cap how many sessions to ingest")] = None,
+) -> None:
+    """Ingest saved Claude Code transcripts into ATIF trajectories (read-only, post-hoc).
+
+    Reconstructs each session's trajectory.json + run_meta.json under runs/ so the
+    existing viewer/judges can consume real, human-driven sessions with no re-run.
+    """
+    from harness.ingest import collect_to_run_dir, discover_transcripts
+
+    # Resolve the set of transcript files to ingest.
+    files: list[Path]
+    if target and target.endswith(".jsonl"):
+        files = [Path(target)]
+    else:
+        all_files = discover_transcripts(projects_dir)
+        # Optionally drop the newest file (heuristic for the currently-live session).
+        current_id = None
+        if exclude_current and all_files:
+            current_id = all_files[0].stem
+            all_files = all_files[1:]
+        if target:  # treat as a project-dir name filter
+            all_files = [p for p in all_files if target in p.parent.name]
+        files = all_files
+
+    if list_only:
+        typer.echo(f"{len(files)} saved session(s):")
+        for p in files:
+            typer.echo(f"  {p.parent.name}/{p.name}")
+        raise typer.Exit()
+
+    if not (target and target.endswith(".jsonl")) and not all_sessions and not target:
+        typer.echo("Nothing selected. Use a transcript path, a project name, --all, or --list.")
+        raise typer.Exit(1)
+
+    if limit:
+        files = files[:limit]
+    if not files:
+        typer.echo("No matching transcripts found.")
+        raise typer.Exit(1)
+
+    typer.echo(f"Ingesting {len(files)} session(s) -> {runs_dir}/")
+    ok = 0
+    for p in files:
+        try:
+            run_dir = collect_to_run_dir(p, runs_dir=runs_dir)
+            n = json.loads((run_dir / "run_meta.json").read_text()).get("total_steps")
+            typer.echo(f"  ✓ {p.parent.name}/{p.stem[:8]}  ->  {run_dir}  ({n} steps)")
+            ok += 1
+        except Exception as e:  # keep going across a batch
+            typer.echo(f"  ✗ {p.parent.name}/{p.stem[:8]}  FAILED: {e}")
+    typer.echo(f"\nDone: {ok}/{len(files)} ingested into {runs_dir}/")
+
+
 @app.command(name="list")
 def list_runs(
     runs_dir: Annotated[Path, typer.Option(help="Runs directory")] = Path("runs"),
