@@ -18,6 +18,7 @@ src/harness/
   judge.py           # Auto-judge: LLM rubric evaluation + early exit
   state.py           # Per-step write tracking via shadow git
   shadow_git.py      # Shadow git: invisible change tracking for working directory
+  isolation.py       # Per-run OS isolation: agent users, env allowlist, Claude launcher
   proxy.py           # Reverse proxy for raw API request capture
   resample.py        # Turn-level resample implementation
   resample_session.py # Session-level resample implementation
@@ -183,6 +184,42 @@ This enables:
 - **Full diffs**: every file change is captured, not just declared files
 - **Turn-level replay**: git worktrees provide isolated filesystem copies at any turn's state for parallel replay
 - **Per-step attribution**: file writes are detected after each tool-using step
+
+### Pipeline isolation & realism (reward_hacking_budget_pressure.py sweeps)
+
+Sweep configs carry two blocks, both ON by default (see `pipeline/config.py`):
+
+```yaml
+isolation:
+  per_run_users: true        # Linux + root only (RunPod); skipped with a warning elsewhere
+  hide_process_args: true    # Codex prompt via stdin; orchestrator retitled "worker"
+realism:
+  seed_git_history: true     # work dir = git repo with 2-3 backdated commits
+  git_author: "Greg <greg@aisolutions.com>"
+  seed_memory_file: false    # no harness MEMORY.md (overrides the task's memory_seed)
+  codex_prompt_preamble: false   # no "Your working directory is ..." prefix for Codex
+```
+
+- Each run's agent works in an opaque `/tmp/ws/<12-hex>/` (`work_root`), never under
+  `pipeline_runs/` — the cwd used to leak experiment, arm and rep.
+- Under isolation every concurrent run gets its own unprivileged user (`dev01`, `dev02`, ...;
+  `pipeline/workspace.py:UserPool`, flock-claimed so several orchestrators can share a host).
+  The user owns only its work dir (700) and private home; `/tmp/ws` is 711, `/root` 700, so
+  agents cannot read the checkout (configs, rubrics, detectors), other runs, or other agents'
+  engine state, and cannot kill other users' or root's processes. Env is rebuilt from an
+  allowlist (`harness/isolation.py`), umask 077, private `TMPDIR`. Released users are reset
+  (processes killed, home wiped). Claude Code runs through a launcher at
+  `/usr/local/lib/claude-code/launch` that drops privileges before exec'ing the CLI.
+- Launch isolated sweeps with `experiments/tools/launch_sweep.sh <config>` (not `uv run`), so
+  no parent process shows the config path in `ps`. Monitoring commands run on the pod are
+  visible to agents too — don't name the experiment in them.
+- NEVER run isolated and non-isolated sweeps (or any root-level agent) on the same host:
+  non-isolated agents run as root and can read and kill everything.
+- Still visible by design: the API key in the agent's env, other agents' `codex exec` /
+  `claude` command lines (no prompts; Claude's argv carries its system prompt and
+  `--max-budget-usd`), and the shared network.
+- Old configs re-run with these defaults get the NEW environment; set the flags off to
+  reproduce the old one. Never pool results across the two environments.
 
 ### Session modes
 - **isolated**: Fresh conversation each session, working directory unchanged
