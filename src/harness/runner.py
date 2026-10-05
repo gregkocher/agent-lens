@@ -87,6 +87,26 @@ class SessionResult:
     ended_early: bool = False        # stopped by a cap/intervention before finishing naturally
 
 
+def work_dir_hint(run_config: RunConfig, cwd: str) -> str | None:
+    """Working-directory note appended to the system prompt, or None when disabled.
+
+    Mentions the memory file only when one exists (seeded, or carried over), so
+    workspaces without MEMORY.md are not told to use it.
+    """
+    if not run_config.work_dir_hint:
+        return None
+    memory_path = Path(cwd) / run_config.memory_file
+    memory_line = (
+        f"Use {memory_path} to keep notes across sessions.\n"
+        if run_config.memory_seed is not None or memory_path.exists() else ""
+    )
+    return (
+        f"\n\nYour working directory is {cwd}\n"
+        f"{memory_line}"
+        f"IMPORTANT: Always use absolute paths when reading or writing files."
+    )
+
+
 async def run_session(
     session_config: SessionConfig,
     run_config: RunConfig,
@@ -108,16 +128,12 @@ async def run_session(
 
     # Inject working directory and memory file hint
     cwd = str(Path(cwd_override).resolve()) if cwd_override else str(Path(run_config.work_dir).resolve())
-    memory_path = Path(cwd) / run_config.memory_file
-    file_hint = (
-        f"\n\nYour working directory is {cwd}\n"
-        f"Use {memory_path} to keep notes across sessions.\n"
-        f"IMPORTANT: Always use absolute paths when reading or writing files."
-    )
-    if system_prompt:
-        system_prompt = system_prompt.rstrip() + file_hint
-    else:
-        system_prompt = file_hint.lstrip()
+    file_hint = work_dir_hint(run_config, cwd)
+    if file_hint:
+        if system_prompt:
+            system_prompt = system_prompt.rstrip() + file_hint
+        else:
+            system_prompt = file_hint.lstrip()
 
     # Build engine + adapter
     engine = get_engine(run_config.engine)
@@ -212,7 +228,9 @@ async def run_session(
         sandbox_mode=run_config.sandbox_mode,
         sandbox_workspace_network_access=run_config.sandbox_workspace_network_access,
         capture_base_url=capture_base_url,
+        run_as_user=run_config.run_as_user,
         extra={
+            "codex_prompt_stdin": run_config.codex_prompt_stdin,
             "codex_multi_agent": run_config.codex_multi_agent,
             "codex_rollout_budget_tokens": run_config.codex_rollout_budget_tokens,
             "codex_reasoning_summary": run_config.codex_reasoning_summary,

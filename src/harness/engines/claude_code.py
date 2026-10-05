@@ -82,6 +82,20 @@ class ClaudeCodeEngine(Engine):
             if spec.fork:
                 options.fork_session = True
 
+        self._home: Path | None = None
+        if spec.run_as_user:
+            # The SDK spawns the CLI as us with our env merged in; the launcher drops to
+            # the agent user and rebuilds the env from the allowlist before exec'ing it.
+            from harness.isolation import CLAUDE_LAUNCHER, RUN_AS_ENV, lookup_user
+
+            if not CLAUDE_LAUNCHER.exists():
+                raise RuntimeError(
+                    f"{CLAUDE_LAUNCHER} missing: call harness.isolation."
+                    "install_claude_launcher() before running isolated Claude Code agents")
+            self._home = lookup_user(spec.run_as_user).home
+            options.cli_path = str(CLAUDE_LAUNCHER)
+            options.env = {**(options.env or {}), RUN_AS_ENV: spec.run_as_user}
+
         async for msg in query(prompt=spec.prompt, options=options):
             event = self._translate(msg)
             if event is not None:
@@ -211,9 +225,8 @@ class ClaudeCodeEngine(Engine):
         self, session_id: str, cwd: str, session_dir: Path
     ) -> Path | None:
         project_hash = "-" + cwd.lstrip("/").replace("/", "-").replace("_", "-")
-        source = (
-            Path.home() / ".claude" / "projects" / project_hash / f"{session_id}.jsonl"
-        )
+        home = getattr(self, "_home", None) or Path.home()  # agent user's home if isolated
+        source = home / ".claude" / "projects" / project_hash / f"{session_id}.jsonl"
         if not source.exists():
             logger.warning("Transcript not found: %s", source)
             return None

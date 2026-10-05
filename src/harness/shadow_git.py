@@ -18,6 +18,12 @@ __all__ = ["ShadowGit"]
 logger = logging.getLogger(__name__)
 
 # Files/dirs to exclude from tracking
+# The work tree may be owned by an isolated agent user (harness.isolation) while the
+# shadow repo is driven by the orchestrator; git >= 2.35.2 refuses that ("dubious
+# ownership") unless the path is marked safe. Passed via env so no global config changes.
+_SAFE_DIRECTORY = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory",
+                   "GIT_CONFIG_VALUE_0": "*"}
+
 DEFAULT_IGNORE = """\
 .git
 __pycache__
@@ -71,6 +77,7 @@ class ShadowGit:
 
         env = {
             **os.environ,
+            **_SAFE_DIRECTORY,
             "GIT_DIR": str(self.git_dir),
             "GIT_WORK_TREE": str(self.work_dir),
         }
@@ -98,7 +105,7 @@ class ShadowGit:
 
         self.git_dir.mkdir(parents=True, exist_ok=True)
         # git init --bare doesn't allow GIT_WORK_TREE, so init without it
-        env = {**os.environ, "GIT_DIR": str(self.git_dir)}
+        env = {**os.environ, **_SAFE_DIRECTORY, "GIT_DIR": str(self.git_dir)}
         subprocess.run(
             ["git", "init", "--bare"],
             env=env,
@@ -181,7 +188,7 @@ class ShadowGit:
 
         dest = dest.resolve()
         dest.parent.mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, "GIT_DIR": str(self.git_dir)}
+        env = {**os.environ, **_SAFE_DIRECTORY, "GIT_DIR": str(self.git_dir)}
         subprocess.run(
             ["git", "worktree", "add", str(dest), ref, "--detach"],
             env=env,
@@ -198,7 +205,7 @@ class ShadowGit:
         import os
 
         dest = dest.resolve()
-        env = {**os.environ, "GIT_DIR": str(self.git_dir)}
+        env = {**os.environ, **_SAFE_DIRECTORY, "GIT_DIR": str(self.git_dir)}
         result = subprocess.run(
             ["git", "worktree", "remove", "--force", str(dest)],
             env=env,

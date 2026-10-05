@@ -189,6 +189,9 @@ class EngineRunSpec:
     # Codex-only: resume directly from a (truncated) rollout file for replay.
     resume_rollout_path: str | None = None
     fork: bool = False
+    # Run the agent process as this unprivileged user (harness.isolation); None = as
+    # the orchestrator user.
+    run_as_user: str | None = None
     sandbox_mode: str | None = None
     sandbox_workspace_network_access: bool | None = None
     # When set, the engine routes API traffic through this base URL (capture proxy).

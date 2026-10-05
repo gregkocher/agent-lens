@@ -100,6 +100,11 @@ class CodexEngine(Engine):
     def __init__(self) -> None:
         self._spawns: list[dict[str, Any]] = []
         self._cwd: str = ""
+        self._codex_home: Path | None = None  # set per run; None = ~/.codex
+
+    @property
+    def _sessions_root(self) -> Path:
+        return (self._codex_home or Path.home() / ".codex") / "sessions"
 
     async def run(self, spec: EngineRunSpec) -> AsyncIterator[EngineEvent]:
         if not isinstance(spec.prompt, str):
@@ -117,15 +122,31 @@ class CodexEngine(Engine):
         self._spawns: list[dict[str, Any]] = []
         self._cwd = spec.cwd
 
-        argv = self._build_argv(spec, prompt)
+        # Prompt on stdin ("-") keeps it out of the process table (`ps`), where other
+        # agents on the same host could read it.
+        via_stdin = bool(spec.extra.get("codex_prompt_stdin"))
+        argv = self._build_argv(spec, "-" if via_stdin else prompt)
         logger.info("Launching codex: %s", " ".join(argv[:-1]) + " <prompt>")
+
+        user_kwargs: dict[str, Any] = {}
+        if spec.run_as_user:
+            from harness.isolation import AGENT_UMASK, lookup_user
+
+            agent = lookup_user(spec.run_as_user)
+            self._codex_home = agent.home / ".codex"
+            user_kwargs = {"user": agent.uid, "group": agent.gid, "extra_groups": [],
+                           "umask": AGENT_UMASK}
+        else:
+            self._codex_home = None
 
         proc = await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.PIPE if via_stdin else None,  # None = inherit (as before)
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=spec.cwd,
             env=self._proc_env(spec),
+            **user_kwargs,
             # Codex emits one JSON object per stdout line. Verbose models (e.g.
             # gpt-5.6-sol) can produce a single reasoning/output event far larger
             # than asyncio's default 64 KiB StreamReader limit, which otherwise
@@ -141,6 +162,12 @@ class CodexEngine(Engine):
         # buffer (~64KB), Codex blocks writing stderr, stops producing stdout, and
         # the stdout loop deadlocks. Reading stderr in a background task keeps the
         # pipe drained so neither stream can stall the other.
+        if via_stdin:
+            assert proc.stdin is not None
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+
         assert proc.stderr is not None
         stderr_task = asyncio.ensure_future(proc.stderr.read())
 
@@ -344,6 +371,12 @@ class CodexEngine(Engine):
     def _proc_env(spec: EngineRunSpec) -> dict[str, str]:
         import os
 
+        if spec.run_as_user:
+            # Isolated agent: allowlisted env only, identity + CODEX_HOME of the agent user.
+            from harness.isolation import agent_env, lookup_user
+
+            agent = lookup_user(spec.run_as_user)
+            return agent_env(agent, extra={**spec.env, "CODEX_HOME": str(agent.home / ".codex")})
         # Inherit the full environment (codex needs PATH, HOME, ~/.codex auth),
         # then layer the engine-specific overrides from build_provider_env.
         env = dict(os.environ)
@@ -484,7 +517,7 @@ class CodexEngine(Engine):
         from harness.atif_adapter import ATIFAdapter
         from harness.transcript_codex import find_rollout_by_id, load_rollout_events
 
-        sessions_root = Path.home() / ".codex" / "sessions"
+        sessions_root = self._sessions_root
         records: list[dict[str, Any]] = []
         for spawn in getattr(self, "_spawns", []):
             prompt = spawn.get("prompt", "")
@@ -528,7 +561,7 @@ class CodexEngine(Engine):
     def copy_transcript(
         self, session_id: str, cwd: str, session_dir: Path
     ) -> Path | None:
-        sessions_root = Path.home() / ".codex" / "sessions"
+        sessions_root = self._sessions_root
         if not sessions_root.exists():
             logger.warning("Codex sessions dir not found: %s", sessions_root)
             return None

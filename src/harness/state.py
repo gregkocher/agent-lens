@@ -11,6 +11,8 @@ Two levels of granularity:
 
 from __future__ import annotations
 
+import os
+
 import difflib
 import json
 import logging
@@ -62,6 +64,11 @@ class StateManager:
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
             target.write_text(memory_seed)
+            # Isolated runs: the work dir belongs to the agent user; keep the seeded file
+            # (written by the orchestrator) editable by it.
+            owner = self.work_dir.stat()
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and owner.st_uid != 0:
+                os.chown(target, owner.st_uid, owner.st_gid)
 
     def check_for_writes(self, session_index: int, step_id: int) -> list[WriteEvent]:
         """Detect file changes since last check using shadow git.
