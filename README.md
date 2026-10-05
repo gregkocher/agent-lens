@@ -18,8 +18,10 @@ The harness takes a YAML config describing a sequence of sessions (prompts to an
 - **Shadow git change tracking** — automatic tracking of all file changes via an invisible git repo, with per-step write attribution and full unified diffs
 - **Session chaining** — three modes for controlling how sessions relate to each other (isolated, chained, forked)
 - **Resampling & replay** — study behavioral variance at multiple levels: stateless API resampling, intervention testing (edit assistant text, tool results, or system prompts and resample), session-level resampling, and turn-level replay with full tool execution from any branch point
+- **Branch rollouts** — remove or add a sentence in a step's reasoning and roll out the entire rest of the trajectory N times per arm (real tools, restored environment), to measure the causal effect of a thought on downstream behavior; Codex + open models with visible reasoning (see [Branch rollouts](#branch-rollouts))
+- **Reasoning capture** — every step's reasoning is saved (raw chain of thought, provider summary, or marked encrypted) and shown to judges, whatever the engine's event stream carries
 - **Subagent capture** — separate ATIF trajectories for each subagent invocation, linked to the parent via `SubagentTrajectoryRef`
-- **Auto-judge** — an LLM judge evaluates the running trajectory against a rubric every N turns, flags matches, and can early-exit the agent loop; backend-configurable (Anthropic/OpenAI/OpenRouter/custom) and works for both engines
+- **Auto-judge** — an LLM judge evaluates the full running trajectory (reasoning, actions and tool outputs, untruncated) against a rubric every N turns, flags matches, and can early-exit the agent loop; backend-configurable (Anthropic/OpenAI/OpenRouter/custom) and works for both engines
 
 ## Install
 
@@ -292,9 +294,14 @@ judge:
 | `every_n_turns` | no | `5` | Judge cadence in agent turns |
 | `early_exit` | no | `false` | Stop the session after the current turn when flagged |
 | `include_reasoning` | no | `true` | Include the agent's reasoning in what the judge sees |
+| `max_input_chars` | no | `750000` | Judge input budget; only above it are the largest tool outputs shortened (recorded per verdict as `render_info`) |
 | `max_tokens` / `temperature` | no | `1024` / `0.0` | Judge sampling |
 
 Verdicts are written to `session_NN/judge.jsonl`. Flagged sessions are recorded in `run_meta.json` (`judge_flagged` / `judge_early_exit` per session; `judge_flagged_sessions` / `judge_early_exits` totals) and shown by `harness inspect` with a `⚑ flagged` marker. The judge needs an API key for its backend (no subscription auth).
+
+### Branch rollouts
+
+A pipeline sweep (`reward_hacking_budget_pressure.py`) with a `branch:` section resamples the whole rest of a seed trajectory from an edited reasoning prefix at one API request — e.g. with one sentence removed — and treats the arms as the sweep's conditions, so scoring, mechanical detectors, the LLM judge and the analysis compare arms directly. Each branch is a complete, standalone trajectory (the judge cannot tell where the seed ends). Find the branch point with `harness branch-points <run_dir> --grep "<sentence>"`. Supported: Codex engine with `thinkingmachines/inkling` (Together), `moonshotai/kimi-k2.6` (Crusoe) and `openai/gpt-oss-120b` (Cerebras) via OpenRouter; other combinations raise a clear error. See `CLAUDE.md` for the config format, mechanics and support details.
 
 ### Lifecycle hooks
 
@@ -372,6 +379,7 @@ harness resample <run_dir> --session N --request N --count N           Resample 
 harness resample-edit <run_dir> --session N --request N --dump/--input Edit & resample
 harness resample-session <run_dir> --session N --count N               Re-run a session N times
 harness replay <run_dir> --session N --turn N --count N                Replay from a turn
+harness branch-points <run_dir> [--grep TEXT]                          Find requests/sentences to branch from
 ```
 
 ### `harness run`

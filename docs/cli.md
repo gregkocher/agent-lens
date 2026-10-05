@@ -257,3 +257,22 @@ harness replay runs/my-run --session 1 --turn 1 --count 2
 ```
 
 Each replay creates a new run directory (e.g. `replay_my-run_s1_t5_r01_2026-03-16T00-00-00/`) with full artifacts including `replay_meta.json` for provenance tracking. The source working directory is never modified — each replicate operates in its own git worktree.
+
+
+## `harness branch-points`
+
+List a run's model requests (session 1) that a branch rollout can start from: the trajectory
+step each produced, the kind of reasoning (`raw` / `summary` / `encrypted`) and a preview.
+Also reports whether the run's model/provider supports branch rollouts.
+
+```
+harness branch-points <run_dir> [--grep TEXT] [--width N]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--grep TEXT` | — | Only requests whose reasoning contains TEXT, shown in context |
+| `--width INT` | `160` | Preview width |
+
+Use the request number as `branch.request` and the sentence as `prefix_until` /
+`prefix_through` in a pipeline sweep's `branch:` section.

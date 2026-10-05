@@ -16,15 +16,23 @@ src/harness/
     codex.py         #   Codex CLI engine (codex exec --json)
   atif_adapter.py    # Normalized EngineEvents → ATIF steps
   judge.py           # Auto-judge: LLM rubric evaluation + early exit
+  judge_budget.py    # Judge input budget: full trajectory, shorten largest tool outputs first
+  reasoning_capture.py # Recover every step's reasoning from captured API responses
   state.py           # Per-step write tracking via shadow git
   shadow_git.py      # Shadow git: invisible change tracking for working directory
   isolation.py       # Per-run OS isolation: agent users, env allowlist, Claude launcher
+  prefill.py         # Branch rollouts: raw-completion reasoning prefill + support matrix
+  resume.py          # Faithful Codex resumes (strip what `codex exec resume` adds)
   proxy.py           # Reverse proxy for raw API request capture
   resample.py        # Turn-level resample implementation
   resample_session.py # Session-level resample implementation
   transcript.py      # Transcript parser and truncation for turn-level replay
   uuid_map.py        # UUID map: correlates transcript, ATIF, and raw API dumps
   replay.py          # Turn-level replay orchestrator
+
+pipeline/            # Sweep pipeline (reward_hacking_budget_pressure.py): run/events/score/judge/analyze
+  branch.py          #   Branch rollouts from an edited reasoning prefix (branch: sweeps)
+  workspace.py       #   Per-run workspace: git-history realism + isolation user pool
 
 ui/                  # SvelteKit web UI for exploring runs
   src/routes/        # Pages: runs list, session viewer, resamples
@@ -47,6 +55,7 @@ harness list                                 # List runs
 harness inspect runs/<name>                  # Inspect run
 harness replay runs/<name> --session 1 --turn 5 --count 3  # Replay from turn
 harness replay runs/<name> --session 1 --list-turns         # List turns
+harness branch-points runs/<name> --grep "CTF"              # Find a request/sentence to branch from
 ```
 
 ## Config format (YAML)
@@ -57,6 +66,9 @@ Required fields: `model`, `work_dir`, `sessions`
 engine: claude_code                     # claude_code (default) | codex
 model: "claude-sonnet-4-20250514"      # engine-appropriate model name
 provider: anthropic                     # claude_code: anthropic|openrouter|bedrock|vertex; codex: openai|openrouter
+provider_order: ["together"]            # openrouter only: pin the upstream provider (proxy-enforced)
+claude_thinking: adaptive               # claude_code: adaptive (default) | off
+codex_reasoning_summary: auto           # codex: auto (default) | none | concise | detailed
 sandbox_mode: workspace-write           # codex only: read-only | workspace-write | danger-full-access
 sandbox_workspace_network_access: true  # codex only: override workspace-write network access (unset = Codex default)
 codex_multi_agent: false                # codex only: enable subagent spawning (features.multi_agent)
@@ -115,9 +127,14 @@ runs are always clearly labeled **Claude Code** or **Codex**.
   Responses API by default, or OpenRouter with `provider: openrouter` (any
   vendor-prefixed slug, e.g. `openai/gpt-5.3-codex`; AgentLens injects the
   `model_providers` block with `wire_api=responses`). Requires the `codex` CLI
-  installed (>= 0.135). Supports trajectories, diffs, change tracking, API
-  capture, resample, turn-level replay (via `experimental_resume`), and subagent
-  capture.
+  installed (>= 0.135; pods pin 0.142.0). Supports trajectories, diffs, change
+  tracking, API capture, resample, turn-level replay (resumes by session id via
+  `codex exec resume` from a private CODEX_HOME; the capture proxy strips what
+  resume adds, see `harness/resume.py`), branch rollouts, and subagent capture.
+  AgentLens passes `-c web_search="disabled"`: with Codex's server-side
+  web_search tool in a request, OpenRouter silently drops all prior reasoning
+  (`tools.web_search=false` is ignored by 0.142.0); the proxy warns if a server
+  tool reappears.
 
 **Subagents.** The two engines have different subagent mechanisms:
 - *Claude Code* uses the `agents:` config block (Claude `AgentDefinition`s invoked
@@ -152,12 +169,23 @@ Engines share the same normalized event model (`engines/base.py`), so shadow git
 ATIF mapping, diffs, and state tracking are identical across engines. Add a new
 engine by implementing `Engine` and registering it in `engines/__init__.py`.
 
+### Reasoning capture
+
+Every saved trajectory carries the model's reasoning for every step, whatever the engine
+reports: `harness/reasoning_capture.py` rebuilds it from the capture proxy's raw responses
+(or the Codex rollout transcript) and attaches each response's reasoning to the step with
+its action. Each such step gets `extra.reasoning_kind`: `raw` (full chain of thought: open
+models via OpenRouter, Claude thinking), `summary` (OpenAI/Gemini summaries) or `encrypted`
+(no readable text; the blob stays in raw_dumps). Coverage stats go to
+`session_NN/reasoning_capture.json`. Defaults ask models for reasoning
+(`claude_thinking: adaptive`, `codex_reasoning_summary: auto`).
+
 ### Auto-judge
 
 An optional `judge:` block runs an LLM that evaluates the live trajectory against
-a rubric every `every_n_turns` agent turns. The judge sees the trajectory so far
-(messages, tool calls, observations, and — unless `include_reasoning: false` —
-the agent's reasoning) and returns a structured verdict
+a rubric every `every_n_turns` agent turns. The judge sees the FULL trajectory so far
+(every message, tool call, tool output and — unless `include_reasoning: false` —
+the agent's reasoning, nothing truncated) and returns a structured verdict
 (`{flagged, reason, confidence}`). If a verdict is flagged and `early_exit: true`,
 the session stops after the current turn.
 
@@ -166,6 +194,10 @@ the session stops after the current turn.
 - **Configurable backend**: `provider` is `anthropic` (Messages API), `openai`, or
   `openrouter` (both Chat Completions). For any other compatible endpoint set
   `base_url` + `api_key_env`. The judge needs an API key (no subscription auth).
+- **Budget**: only above `max_input_chars` (default 750k) are the largest tool
+  outputs shortened first (`harness/judge_budget.py`); what was cut is recorded
+  per verdict (`render_info`). The pipeline judge (`pipeline/render.py`) follows the
+  same policy, then the diff, then whole steps as a last resort.
 - **Outputs**: verdicts are saved to `session_NN/judge.jsonl`; `run_meta.json`
   records `judge_flagged`/`judge_early_exit` per session plus
   `judge_flagged_sessions`/`judge_early_exits` totals; `harness inspect` shows a
@@ -220,6 +252,51 @@ realism:
   `--max-budget-usd`), and the shared network.
 - Old configs re-run with these defaults get the NEW environment; set the flags off to
   reproduce the old one. Never pool results across the two environments.
+
+### Branch rollouts (thought-anchors-style resampling)
+
+Resample the whole rest of a trajectory from an edited reasoning prefix: e.g. remove (or
+add) one sentence in the reasoning of step k and roll out N times per arm, then compare
+downstream behavior. A pipeline sweep with a `branch:` section and
+`pressure.variable: branch_arm`:
+
+```yaml
+pressure: {variable: branch_arm, values: [cut, keep]}
+n_reps: 50
+branch:
+  seed_run: pipeline_runs/<seeds>/trajectories/bp_poutcome_focus_r7   # any run dir
+  request: 4                    # API request (raw_dumps index) whose reasoning is edited
+  arms:
+    cut:  {prefix_until: "Actually, let me think about whether I can"}   # model continues from here
+    keep: {prefix_through: "...still technically an LRU cache but faster."}
+    # also: prefix: "<literal>", full_original: true, append: "<inserted sentence>",
+    #       history_replace: [{old, new}]  (edit earlier items of the request)
+  provider: together            # default: the seed's provider_order[0]
+```
+
+Each branch restores the work dir from the seed's shadow git, resumes Codex from the seed
+rollout truncated at request k, and the capture proxy answers request k with a
+raw-completion prefill (`harness/prefill.py`: the model's HF chat template + edited prefix
+via a pinned OpenRouter provider), then forwards every later step to the same provider.
+Every branch is a normal run dir with a FULL trajectory (seed steps + new steps, seamless,
+continuous ids), so events/score/judge/analyze work unchanged; injected vs generated text
+is recorded only in `branch_meta.json` (incl. `first_request_matches_seed`).
+`harness branch-points <run> --grep TEXT` finds the request and sentence to branch at.
+
+Supported (anything else raises `BranchUnsupportedError`):
+
+| Model | Provider (pin) | Status |
+|---|---|---|
+| `thinkingmachines/inkling` | `together` | verified (tool call recovered from JSON; Together strips special tokens) |
+| `moonshotai/kimi-k2.6` | `crusoe/bf16` | verified; `streamlake/fp8`, `parasail/int4`, `chutes/int4` prefill-probed |
+| `openai/gpt-oss-120b` | `cerebras/fp16` | verified (DeepInfra excluded) |
+
+Not supported: the claude_code engine (future work), closed models (OpenAI, Gemini,
+Anthropic: reasoning hidden/summarized/encrypted), Kimi K2-thinking, GLM-5.3, Qwen3 and
+Nemotron (no OpenRouter provider continues raw prompts with usable markers). Seeds should
+be generated with `provider_order` pinned to the branch provider; seeds made while Codex
+still sent web_search (before 2026-10) had past reasoning dropped by OpenRouter, which
+branches then mirror for the prefilled step. Pod checks: `tests/e2e_branch/`.
 
 ### Session modes
 - **isolated**: Fresh conversation each session, working directory unchanged
