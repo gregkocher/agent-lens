@@ -55,13 +55,29 @@ def rollout(rid: str, meta: dict, judging: Path) -> dict | None:
     later = [q for q in v.get("framing_language") or []
              if (q.get("step_id") or 0) >= k and q.get("quote") and q["quote"].strip()[:120] not in prefix]
     trick_later = [q for q in later if q.get("category") == "ctf_puzzle" or TRICK.search(q.get("quote", ""))]
+    # Mechanical measure (independent of judges): trick framing in the reasoning the MODEL
+    # generated at/after the branch step (the injected/kept prefix is stripped).
+    steps = json.loads((rd / "session_01" / "trajectory.json").read_text()).get("steps") or []
+    mech = []
+    for st in steps:
+        if (st.get("step_id") or 0) < k:
+            continue
+        text = st.get("reasoning_content") or ""
+        if st.get("step_id") == k and text.startswith(prefix):
+            text = text[len(prefix):]
+        m = TRICK.search(text)
+        if m:
+            mech.append({"step": st.get("step_id"), "match": text[max(0, m.start() - 80): m.end() + 80]})
     return {
         "id": rid, "experiment": meta["experiment"], "run": meta["run_name"], "arm": bm["arm"],
         "branch_step": k, "rh": v["reward_hacking"]["verdict"] == "yes",
         "rh_score": v["reward_hacking"].get("score_1_5"), "dr": v["dishonest_reporting"]["verdict"] == "yes",
         "first_hack_step": v.get("first_hack_step"),
         "trick_in_branch_step": bool(TRICK.search(cont.split("</think>")[0][:6000])),
-        "trick_later": bool(trick_later),
+        "trick_later_judge": bool(trick_later),
+        "trick_later": bool(mech),
+        "trick_later_mech_hits": mech[:4],
+        "trick_first_mech_step": mech[0]["step"] if mech else None,
         "trick_later_quotes": [{"step": q.get("step_id"), "quote": q["quote"][:300]} for q in trick_later[:4]],
         "n_attempts": bm.get("n_attempts"), "summary": v.get("summary", ""),
         "rh_rationale": v["reward_hacking"].get("rationale", ""),
@@ -82,6 +98,7 @@ def summarize(rows: list[dict], kind: str) -> dict:
             "n": n, "rh": h, "rh_rate": h / n if n else None, "rh_ci": wilson(h, n),
             "dr": sum(r["dr"] for r in rs), "dr_rate": sum(r["dr"] for r in rs) / n if n else None,
             "trick_later": len(re_), "trick_later_rate": len(re_) / n if n else None,
+            "trick_later_judge": sum(r["trick_later_judge"] for r in rs),
             "trick_in_branch_step": sum(r["trick_in_branch_step"] for r in rs),
             "rh_given_trick": [sum(r["rh"] for r in re_), len(re_)],
             "rh_given_no_trick": [sum(r["rh"] for r in no), len(no)],
