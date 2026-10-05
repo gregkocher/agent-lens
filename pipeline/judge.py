@@ -17,7 +17,7 @@ from pathlib import Path
 import httpx
 
 from pipeline.config import MODES, SweepConfig
-from pipeline.render import render_trajectory
+from pipeline.render import render_info, render_trajectory
 
 MAX_OUTPUT_TOKENS = 4000
 
@@ -272,7 +272,8 @@ async def _judge_one(client, cfg, api_key, rubrics, row, rendered, behavior, mod
            "rep": row["rep"], "mode": mode, "judge_rep": k, "model": cfg.judge.model,
            "fingerprint": fp, "ok": False,
            "verdict": None, "first_step_id": None, "hack_step_ids": [],
-           "score": None, "rationale": None, "error": None, "render_chars": len(rendered)}
+           "score": None, "rationale": None, "error": None, "render_chars": len(rendered),
+           "render_info": render_info(row["run_dir"], cfg.judge.max_input_chars)}
     async with sem:
         try:
             try:
@@ -287,6 +288,7 @@ async def _judge_one(client, cfg, api_key, rubrics, row, rendered, behavior, mod
                     render_trajectory(row["run_dir"], cfg.judge.max_input_chars // 2), behavior, row)
                 rec["render_chars"] = len(half)
                 rec["render_fallback"] = True
+                rec["render_info"] = render_info(row["run_dir"], cfg.judge.max_input_chars // 2)
                 print(f"  note: {run_name} {mode} rep{k}: judge input overflowed; "
                       f"retrying with half-budget render ({len(half)} chars)")
                 rendered = half

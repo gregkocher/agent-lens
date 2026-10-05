@@ -22,7 +22,8 @@ from harness.atif_adapter import ATIFAdapter
 from harness.config import RunConfig, SessionConfig, build_provider_env
 from harness.engines import EngineRunSpec, ResultEvent, SystemEvent, get_engine
 from harness.engines.base import classify_api_failure
-from harness.judge import Judge, JudgeVerdict, render_trajectory
+from harness.judge import Judge, JudgeVerdict, render_trajectory_with_info
+from harness.reasoning_capture import enrich_trajectory_reasoning
 from harness.proxy import CaptureProxy, get_target_url
 from harness.state import StateManager
 from harness.uuid_map import build_uuid_map
@@ -169,6 +170,10 @@ async def run_session(
     # Start capture proxy if configured.
     proxy: CaptureProxy | None = None
     capture_base_url: str | None = None
+    proxy_inject: dict[str, Any] = {}
+    if run_config.provider_order:
+        proxy_inject["provider"] = {"order": list(run_config.provider_order),
+                                    "allow_fallbacks": run_config.provider_allow_fallbacks}
     if run_config.capture_api_requests:
         if run_config.engine == "codex":
             # Codex talks to a Responses API (OpenAI or OpenRouter); route it
@@ -177,14 +182,14 @@ async def run_session(
             from harness.engines.codex import codex_upstream
 
             upstream_base, _, _ = codex_upstream(run_config.provider, run_config.base_url)
-            proxy = CaptureProxy(raw_dump_count=9999)
+            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject)
             port = await proxy.start(upstream_base, session_dir / "api_captures.jsonl")
             # Codex appends `/responses` to its provider base_url; the proxy
             # forwards that path onto the resolved upstream base.
             capture_base_url = f"http://127.0.0.1:{port}"
         else:
             target_url = get_target_url(run_config.provider, run_config.base_url)
-            proxy = CaptureProxy(raw_dump_count=9999)
+            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject)
             port = await proxy.start(target_url, session_dir / "api_captures.jsonl")
             provider_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
 
@@ -282,11 +287,17 @@ async def run_session(
             if judge and step is not None and step.source == "agent":
                 judge_turn_count += 1
                 if judge_turn_count % judge_every == 0:
-                    transcript_text = render_trajectory(
-                        adapter.steps,
+                    # Same reasoning recovery as the saved trajectory, on a snapshot.
+                    snap = adapter.build_trajectory().to_json_dict()
+                    with contextlib.suppress(Exception):
+                        enrich_trajectory_reasoning(snap, session_dir, run_config.engine, run_config.model)
+                    transcript_text, render_info = render_trajectory_with_info(
+                        snap.get("steps") or [],
                         include_reasoning=run_config.judge.include_reasoning,
+                        max_chars=run_config.judge.max_input_chars,
                     )
                     verdict = await judge.evaluate(transcript_text, judge_turn_count)
+                    verdict.render_info = render_info
                     judge_verdicts.append(verdict)
                     if verdict.flagged:
                         judge_flagged = True
@@ -378,17 +389,33 @@ async def run_session(
         if ref_map:
             adapter.attach_subagent_refs(ref_map)
 
-        # Build and save trajectory
+        # Copy the engine's native transcript first: it is a fallback reasoning source.
+        if session_id:
+            engine.copy_transcript(session_id, cwd, session_dir)
+
+        # Build and save trajectory, with every step's reasoning recovered from the
+        # captured API responses (or the engine transcript) when the engine stream
+        # did not carry it. Coverage stats are run bookkeeping: kept out of the trajectory.
         trajectory = adapter.build_trajectory()
         trajectory.extra = {**(trajectory.extra or {}), "engine": run_config.engine}
         step_count = len(trajectory.steps)
+        traj_dict = trajectory.to_json_dict()
+        try:
+            stats = enrich_trajectory_reasoning(traj_dict, session_dir, run_config.engine, run_config.model)
+            if proxy and proxy.server_tools_seen:
+                stats["server_tools_seen"] = sorted(proxy.server_tools_seen)
+                logger.warning("Session %d sent server-side tools %s (OpenRouter drops prior "
+                               "reasoning when these are present)", session_config.session_index,
+                               sorted(proxy.server_tools_seen))
+            (session_dir / "reasoning_capture.json").write_text(json.dumps(stats, indent=2))
+        except Exception:
+            logger.exception("Reasoning enrichment failed; saving trajectory without it")
         traj_path = session_dir / "trajectory.json"
         with open(traj_path, "w") as f:
-            json.dump(trajectory.to_json_dict(), f, indent=2)
+            json.dump(traj_dict, f, indent=2)
 
-        # Copy the engine's native transcript and build UUID map for replay
+        # Build UUID map for replay
         if session_id:
-            engine.copy_transcript(session_id, cwd, session_dir)
             build_uuid_map(session_dir, session_config.session_index)
 
     except Exception as e:

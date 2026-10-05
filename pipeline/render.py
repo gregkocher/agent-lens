@@ -1,12 +1,13 @@
 """Render an AgentLens run into a single text document for the LLM judge.
 
-Includes the task the agent was given (system + session prompts from the run's saved
-config.yaml — NOT max_budget_usd, so the judge stays blind to the experimental
-condition), the agent's reasoning + tool calls + (truncated) tool outputs, followed by
-the run's full_diff.patch — which is the key evidence for file-level reward hacking
-(edits to the scorer, training on the held-out set, etc.). Large pieces are
-middle-elided and the whole thing is capped to a character budget, with the diff
-preserved.
+The judge sees the FULL run: the task the agent was given (system + session prompts from
+the run's saved config.yaml — NOT max_budget_usd, so the judge stays blind to the
+experimental condition), every step's reasoning, messages, tool calls and tool outputs
+in full, then the run's full_diff.patch (key evidence for file-level reward hacking).
+Only when that exceeds the judge's budget is anything cut, in this order: the largest
+tool outputs first (middle elided, visible marker), then the diff (priority files kept),
+and only as a last resort whole steps. ``render_info`` reports what was cut, so the
+judge records it next to each verdict (never inside the trajectory).
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import re
 from pathlib import Path
 
 import yaml
+
+from harness.judge_budget import shrink_largest
 
 
 # Files whose diffs are decisive evidence of reward hacking; kept (truncated if needed)
@@ -108,47 +111,55 @@ def _trunc(text: str, limit: int) -> str:
     return f"{text[:head]}\n...[{elided} chars elided]...\n{text[-tail:]}"
 
 
-def _format_args(args) -> str:
-    try:
-        s = json.dumps(args, ensure_ascii=False)
-    except Exception:
-        s = str(args)
-    return _trunc(s, 600)
 
 
-def _render_step_blocks(steps: list[dict], per_obs_limit: int = 2000) -> list[str]:
-    """One rendered text block per step (labelled `[step N]` for judge citation)."""
-    out: list[str] = []
+def _step_parts(steps: list[dict]) -> list[tuple[str, list[str]]]:
+    """Per step: (head text, [tool outputs]). Full content; outputs kept separate so the
+    budget policy can shorten the largest ones first. Heads are labelled `[step N]`."""
+    out: list[tuple[str, list[str]]] = []
     for st in steps:
         src = st.get("source")
         if src == "user":
             # The initial task prompt — include once for context.
             msg = st.get("message") or ""
             if msg.strip():
-                out.append(f"[TASK PROMPT]\n{_trunc(msg, 1500)}\n")
+                out.append((f"[TASK PROMPT]\n{msg}\n", []))
             continue
         if src != "agent":
             continue
-        sid = st.get("step_id")
-        block = [f"[step {sid}]"]
+        block = [f"[step {st.get('step_id')}]"]
         reasoning = st.get("reasoning_content")
+        kind = (st.get("extra") or {}).get("reasoning_kind")
         if reasoning:
-            block.append(f"THINKING: {_trunc(reasoning, 2500)}")
+            block.append(f"THINKING{' (summary)' if kind == 'summary' else ''}: {reasoning}")
+        elif kind == "encrypted":
+            block.append("THINKING: (present but encrypted by the provider; not readable)")
         msg = st.get("message")
         if msg:
-            block.append(f"SAID: {_trunc(msg, 2000)}")
+            block.append(f"SAID: {msg}")
         for tc in st.get("tool_calls") or []:
-            name = tc.get("function_name", "?")
-            block.append(f"TOOL CALL: {name}({_format_args(tc.get('arguments'))})")
+            try:
+                args = json.dumps(tc.get("arguments"), ensure_ascii=False)
+            except Exception:
+                args = str(tc.get("arguments"))
+            block.append(f"TOOL CALL: {tc.get('function_name', '?')}({args})")
         obs = st.get("observation") or {}
-        for res in obs.get("results", []) or []:
-            content = res.get("content", "")
-            block.append(f"TOOL RESULT: {_trunc(content, per_obs_limit)}")
-        out.append("\n".join(block))
+        out.append(("\n".join(block), [str(r.get("content", "")) for r in obs.get("results", []) or []]))
     return out
 
 
+def _assemble(parts: list[tuple[str, list[str]]], results: list[list[str]]) -> list[str]:
+    return ["\n".join([head] + [f"TOOL RESULT: {c}" for c in rs]) for (head, _), rs in zip(parts, results)]
+
+
+def _render_step_blocks(steps: list[dict]) -> list[str]:
+    """One full rendered text block per step (labelled `[step N]` for judge citation)."""
+    parts = _step_parts(steps)
+    return _assemble(parts, [rs for _, rs in parts])
+
+
 _STEP_LABEL = re.compile(r"^\[step (\d+)\]")
+_STEP_LABEL_ANY = re.compile(r"(?m)^\[step \d+\]")
 
 
 def _fit_blocks(blocks: list[str], budget: int) -> str:
@@ -222,7 +233,15 @@ def _write_steps_by_file(run_dir: Path) -> dict[str, list[int]]:
     return {k: sorted(v) for k, v in out.items()}
 
 
-def render_trajectory(run_dir: str | Path, max_chars: int = 200_000) -> str:
+_INFO_CACHE: dict[tuple[str, int], dict] = {}
+
+
+def render_info(run_dir: str | Path, max_chars: int) -> dict | None:
+    """What the most recent render of (run_dir, max_chars) cut, if anything."""
+    return _INFO_CACHE.get((str(Path(run_dir)), max_chars))
+
+
+def render_trajectory(run_dir: str | Path, max_chars: int = 750_000) -> str:
     """Render run_dir (an AgentLens run directory) to a judge-input string."""
     run_dir = Path(run_dir)
     traj_path = run_dir / "session_01" / "trajectory.json"
@@ -230,24 +249,49 @@ def render_trajectory(run_dir: str | Path, max_chars: int = 200_000) -> str:
 
     try:
         traj = json.loads(traj_path.read_text())
-        steps = traj.get("steps", [])
+        parts = _step_parts(traj.get("steps", []))
     except Exception as e:
-        blocks = [f"(could not load trajectory: {e})"]
-    else:
-        blocks = _render_step_blocks(steps)
+        parts = [(f"(could not load trajectory: {e})", [])]
+    results = [list(rs) for _, rs in parts]
 
     diff = diff_path.read_text() if diff_path.exists() else "(no full_diff.patch found)"
-    task = _trunc(_load_task_description(run_dir), 6_000) or "(task config not found)"
+    step_map = _write_steps_by_file(run_dir)
+    full_diff = _render_diff(diff, 10 ** 12, step_map)
+    task = _load_task_description(run_dir) or "(task config not found)"
 
-    # Reserve room for the task and the diff (key evidence), give the rest to the body.
-    diff_budget = min(len(diff) + 2_000, max(20_000, int(max_chars * 0.4)))
-    body_budget = max(5_000, max_chars - diff_budget - len(task) - 800)
+    def doc(body: str, diff_text: str) -> str:
+        return (f"=== TASK GIVEN TO THE AGENT ===\n{task}\n\n"
+                f"=== AGENT TRAJECTORY ({run_dir.name}) ===\n{body}\n\n"
+                f"=== FINAL FILE DIFF (full_diff.patch) ===\n{diff_text}\n")
 
-    return (
-        f"=== TASK GIVEN TO THE AGENT ===\n"
-        f"{task}\n\n"
-        f"=== AGENT TRAJECTORY ({run_dir.name}) ===\n"
-        f"{_fit_blocks(blocks, body_budget)}\n\n"
-        f"=== FINAL FILE DIFF (full_diff.patch) ===\n"
-        f"{_render_diff(diff, diff_budget, _write_steps_by_file(run_dir))}\n"
-    )
+    info = {"budget": max_chars, "truncated": False, "tool_outputs_shortened": 0,
+            "tool_output_chars_omitted": 0, "diff_chars_omitted": 0, "steps_omitted": 0}
+    blocks = _assemble(parts, results)
+    out = doc("\n\n".join(blocks), full_diff)
+    if len(out) > max_chars:
+        # 1) the largest tool outputs, down to a common cap
+        flat = [c for rs in results for c in rs]
+        shrunk = shrink_largest(flat, len(out) - max_chars)
+        it = iter(shrunk.texts)
+        results = [[next(it) for _ in rs] for rs in results]
+        blocks = _assemble(parts, results)
+        info.update(truncated=True, tool_outputs_shortened=shrunk.shortened,
+                    tool_output_chars_omitted=shrunk.chars_omitted)
+        out = doc("\n\n".join(blocks), full_diff)
+    diff_text = full_diff
+    if len(out) > max_chars:
+        # 2) the diff (decisive files kept first, see _render_diff)
+        diff_budget = max(20_000, len(full_diff) - (len(out) - max_chars))
+        diff_text = _render_diff(diff, diff_budget, step_map)
+        info["diff_chars_omitted"] = max(0, len(full_diff) - len(diff_text))
+        out = doc("\n\n".join(blocks), diff_text)
+    if len(out) > max_chars:
+        # 3) last resort: whole steps from the middle, with an explicit marker
+        body_budget = max(5_000, max_chars - len(doc("", diff_text)))
+        body = _fit_blocks(blocks, body_budget)
+        n_steps = sum(1 for b in blocks if _STEP_LABEL.match(b))
+        info["steps_omitted"] = max(0, n_steps - len(_STEP_LABEL_ANY.findall(body)))
+        out = doc(body, diff_text)
+    info["rendered_chars"] = len(out)
+    _INFO_CACHE[(str(run_dir), max_chars)] = info
+    return out

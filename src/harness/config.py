@@ -76,6 +76,10 @@ class JudgeConfig(BaseModel):
     # rendering / sampling
     name: str = "judge"
     include_reasoning: bool = True  # show the agent's thinking to the judge
+    # Judge input budget (chars). The full trajectory is sent; only above this are the
+    # largest tool outputs shortened (harness.judge_budget). ~750k chars fits a
+    # ~272k-token judge context with room for the rubric.
+    max_input_chars: int = Field(default=750_000, ge=10_000)
     max_tokens: int = 1024
     temperature: float = 0.0
 
@@ -104,6 +108,11 @@ class RunConfig(BaseModel):
     model: str
     provider: str = "anthropic"
     base_url: str | None = None
+    # OpenRouter only: pin the upstream provider(s), in order, so every request of the
+    # run is served by the same weights/quantization (required for branch rollouts and
+    # their seeds). Injected into each request by the capture proxy.
+    provider_order: list[str] | None = None
+    provider_allow_fallbacks: bool = False
 
     # codex sandbox policy (codex engine only)
     sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] = (
@@ -124,11 +133,11 @@ class RunConfig(BaseModel):
     # ABORTS the turn when exhausted — the enforced analogue of max_budget_usd.
     codex_rollout_budget_tokens: int | None = Field(default=None, gt=0)
     codex_goal_objective: str | None = None
-    # Reasoning capture knobs. Defaults are the ENGINE defaults (no flag sent), so
-    # default-config runs remain comparable with earlier captures. Note no frontier
-    # provider returns raw CoT; these enable best-effort SUMMARIES only.
+    # Reasoning is always saved and shown to judges (harness.reasoning_capture). These
+    # knobs make the model produce it: open-weight models via OpenRouter return their raw
+    # chain of thought regardless; OpenAI-family models return summaries only when asked.
     # codex: "none" | "auto" | "concise" | "detailed" (-c model_reasoning_summary=...)
-    codex_reasoning_summary: str = "none"
+    codex_reasoning_summary: str = "auto"
     # Extra raw ``-c key=value`` overrides appended verbatim to ``codex exec``.
     # Additive escape hatch for models Codex ships no built-in profile for (it falls
     # back to guessed metadata): pin e.g. ``model_supports_reasoning_summaries=true``
@@ -136,7 +145,7 @@ class RunConfig(BaseModel):
     # and ``model_max_output_tokens``.
     codex_config_overrides: list[str] = Field(default_factory=list)
     # claude_code: "off" | "adaptive" (SDK thinking={"type": ...})
-    claude_thinking: str = "off"
+    claude_thinking: str = "adaptive"
 
     # working directory
     work_dir: str
@@ -234,6 +243,14 @@ class RunConfig(BaseModel):
                     "slug including the vendor prefix (e.g. 'openai/gpt-5.3-codex'). "
                     f"Got '{self.model}'."
                 )
+
+        if self.provider_order is not None:
+            if self.provider != "openrouter":
+                raise ValueError("provider_order pins OpenRouter providers; it needs provider: openrouter.")
+            if not self.provider_order:
+                raise ValueError("provider_order must list at least one provider (e.g. ['together']).")
+            if not self.capture_api_requests:
+                raise ValueError("provider_order is enforced by the capture proxy; set capture_api_requests: true.")
 
         # Subagents are a Claude Code feature; Codex has no equivalent.
         if self.engine == "codex" and self.agents:

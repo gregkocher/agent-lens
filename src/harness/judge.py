@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 import httpx
 
 from harness.config import JudgeConfig
+from harness.judge_budget import shrink_largest
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class JudgeVerdict:
     confidence: float | None = None
     raw: str = ""
     error: str | None = None
+    render_info: dict | None = None  # what (if anything) was cut from the judge input
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -170,35 +172,82 @@ def _parse_verdict(raw: str, turn: int) -> JudgeVerdict:
     )
 
 
-def render_trajectory(steps, include_reasoning: bool = True, max_chars: int = 20000) -> str:
-    """Render ATIF steps into a compact transcript for the judge.
+def _get(obj, key, default=None):
+    """Field access for ATIF steps given as model objects or as JSON dicts."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
-    Keeps the most recent content when over ``max_chars`` (the tail matters most
-    for catching emergent behavior).
-    """
-    blocks: list[str] = []
+
+def _reasoning_line(step) -> str | None:
+    text = _get(step, "reasoning_content")
+    kind = (_get(step, "extra") or {}).get("reasoning_kind") if isinstance(_get(step, "extra"), dict) else None
+    if text:
+        return f"  [reasoning{' (summary)' if kind == 'summary' else ''}] {text}"
+    if kind == "encrypted":
+        return "  [reasoning] (present but encrypted by the provider; not readable)"
+    return None
+
+
+def render_trajectory_with_info(steps, include_reasoning: bool = True,
+                                max_chars: int = 750_000) -> tuple[str, dict]:
+    """Render the FULL trajectory for the judge: every reasoning block, message, tool
+    call and tool output. Over ``max_chars``, the largest tool outputs are shortened
+    first (judge_budget); only if that is not enough are the earliest steps dropped
+    (keeping the most recent ones). Returns (text, info about what was cut)."""
+    heads: list[tuple[str, list[str]]] = []
+    results: list[list[str]] = []
     for step in steps:
-        src = (step.source or "agent").upper()
+        src = (_get(step, "source") or "agent").upper()
         parts: list[str] = []
-        if include_reasoning and getattr(step, "reasoning_content", None):
-            parts.append(f"  [reasoning] {step.reasoning_content}")
-        if step.message:
-            parts.append(f"  {step.message}")
-        for tc in step.tool_calls or []:
-            args = json.dumps(tc.arguments, default=str)
-            if len(args) > 500:
-                args = args[:500] + "…"
-            parts.append(f"  [tool_call] {tc.function_name}({args})")
-        if step.observation:
-            for r in step.observation.results:
-                content = r.content or ""
-                if len(content) > 500:
-                    content = content[:500] + "…"
-                parts.append(f"  [result] {content}")
-        body = "\n".join(parts) if parts else "  (empty)"
-        blocks.append(f"[step {step.step_id}] {src}:\n{body}")
+        if include_reasoning:
+            line = _reasoning_line(step)
+            if line:
+                parts.append(line)
+        if _get(step, "message"):
+            parts.append(f"  {_get(step, 'message')}")
+        for tc in _get(step, "tool_calls") or []:
+            args = json.dumps(_get(tc, "arguments"), default=str)
+            parts.append(f"  [tool_call] {_get(tc, 'function_name')}({args})")
+        heads.append((f"[step {_get(step, 'step_id')}] {src}:", parts))
+        obs = _get(step, "observation")
+        results.append([(_get(r, "content") or "") for r in (_get(obs, "results") or [])] if obs else [])
 
-    text = "\n\n".join(blocks)
+    def assemble(res: list[list[str]]) -> list[str]:
+        blocks = []
+        for (label, parts), rs in zip(heads, res):
+            lines = parts + [f"  [result] {c}" for c in rs]
+            blocks.append(label + "\n" + ("\n".join(lines) if lines else "  (empty)"))
+        return blocks
+
+    info = {"budget": max_chars, "truncated": False, "tool_outputs_shortened": 0,
+            "tool_output_chars_omitted": 0, "steps_omitted": 0}
+    text = "\n\n".join(assemble(results))
     if len(text) > max_chars:
-        text = "…(earlier turns truncated)…\n\n" + text[-max_chars:]
-    return text
+        flat = [c for rs in results for c in rs]
+        shrunk = shrink_largest(flat, len(text) - max_chars)
+        it = iter(shrunk.texts)
+        results = [[next(it) for _ in rs] for rs in results]
+        info.update(truncated=True, tool_outputs_shortened=shrunk.shortened,
+                    tool_output_chars_omitted=shrunk.chars_omitted)
+        blocks = assemble(results)
+        text = "\n\n".join(blocks)
+        if len(text) > max_chars:  # last resort: keep the most recent steps
+            kept: list[str] = []
+            used = 0
+            for b in reversed(blocks):
+                if used + len(b) + 2 > max_chars - 60:
+                    break
+                kept.insert(0, b)
+                used += len(b) + 2
+            info["steps_omitted"] = len(blocks) - len(kept)
+            text = "…(earlier turns truncated)…\n\n" + "\n\n".join(kept)
+            if not kept:  # a single step larger than the whole budget
+                text = "…(earlier turns truncated)…\n\n" + text[-max_chars:]
+    info["rendered_chars"] = len(text)
+    return text, info
+
+
+def render_trajectory(steps, include_reasoning: bool = True, max_chars: int = 750_000) -> str:
+    """Full-trajectory judge input (see ``render_trajectory_with_info``)."""
+    return render_trajectory_with_info(steps, include_reasoning, max_chars)[0]

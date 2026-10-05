@@ -217,6 +217,11 @@ class CodexEngine(Engine):
                     item = evt.get("item") or {}
                     if item.get("type") != "error":  # ignore the unstable-feature warning item
                         did_work = True
+                    if item.get("type") == "reasoning" and spec.capture_base_url:
+                        # The capture proxy records the full reasoning of every response;
+                        # the runner attaches it to the matching steps (reasoning_capture).
+                        # Codex's own reasoning item is at most a summary of it.
+                        continue
                     event = self._translate_item(item)
                     if event is not None:
                         yield event
@@ -294,15 +299,16 @@ class CodexEngine(Engine):
             "-m",
             spec.model,
         ]
-        # Disable Codex's built-in server-side web_search tool. Newer codex-cli
-        # (>=0.145) offers it by default, but non-OpenAI Responses backends —
-        # notably OpenRouter — reject any request carrying a server tool with
-        # ``{"error":{"message":"Server tool request failed","code":400}}``,
-        # failing the whole turn. The reward-hacking tasks are self-contained and
-        # never need web access, so turning it off keeps runs backend-portable.
-        # Overridable via ``codex_web_search: true`` in the config's engine extra.
+        # Disable Codex's built-in server-side web_search tool (sent by default).
+        # With it in the tool list, OpenRouter silently DROPS every prior reasoning
+        # item from the request, so the model never sees its own earlier thinking
+        # (verified across inkling/kimi/glm/qwen/gpt-oss); codex >= 0.145 also offers it
+        # in a form OpenRouter rejects outright ("Server tool request failed", 400).
+        # Only ``web_search="disabled"`` removes it: the older ``tools.web_search=false``
+        # is ignored by codex 0.142.0. The capture proxy warns if a server tool ever
+        # reappears. Overridable via ``codex_web_search: true`` in the engine extra.
         if not spec.extra.get("codex_web_search"):
-            common += ["-c", "tools.web_search=false"]
+            common += ["-c", 'web_search="disabled"']
         if spec.extra.get("codex_multi_agent"):
             common += ["-c", "features.multi_agent=true"]
         # Observational reasoning summaries in the event stream. "none" (default) sends

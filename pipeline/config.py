@@ -57,7 +57,9 @@ class JudgeConfig(BaseModel):
     model: str = "openai/gpt-5-mini-2025-08-07"
     n_judge_reps: int = 2          # repeats of identical (trajectory, rubric) call -> variance reduction
     n_judge_workers: int = 8       # parallel judge API calls (cheap)
-    max_input_chars: int = 200_000  # truncate the rendered trajectory if larger
+    # Judge input budget (chars). The full run is rendered; only above this budget are the
+    # largest tool outputs (then the diff, then steps) shortened — see pipeline/render.py.
+    max_input_chars: int = 750_000
     temperature: float = 0.0
     request_timeout: float = 180.0
     max_retries: int = 3
@@ -307,6 +309,9 @@ class SweepConfig(BaseModel):
     max_turns: int | None = None     # if None, do NOT override the base task's max_turns
     agent_model: str | None = None   # if set, override the base task model
     agent_provider: str | None = None
+    # OpenRouter provider pin (e.g. ["together"]): every request of every run is served by
+    # the same upstream, so seeds and branch rollouts are directly comparable.
+    agent_provider_order: list[str] | None = None
 
     # Only used when pressure.variable == 'prompt_variant': maps each variant key listed in
     # pressure.values to the EXACT session-prompt text for that arm (the only thing differing
