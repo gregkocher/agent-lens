@@ -241,7 +241,7 @@ async def run_branch(cfg, base_cfg: RunConfig, arm_name: str, rep: int, run_dir:
     # 2. Codex home holding the truncated seed rollout to resume from
     if agent_user:
         hand_over_work_dir(work_dir, agent_user)   # owner-only work dir, fresh ~/.codex + ~/tmp
-    codex_home = (agent_user.home / ".codex") if agent_user else (run_dir / "codex_home")
+    codex_home = (agent_user.home / ".codex") if agent_user else (run_dir / "codex_home").resolve()
     entries, sid = seed.truncated_rollout(str(work_dir))
     day = datetime.now(timezone.utc)
     rollout = codex_home / "sessions" / day.strftime("%Y/%m/%d") / f"rollout-{day.strftime('%Y-%m-%dT%H-%M-%S')}-{sid}.jsonl"

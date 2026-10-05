@@ -645,7 +645,7 @@ async def _run_codex_replicate(
 
     resume_id: str | None = None
     intercept = None
-    codex_home = replay_run_dir / "codex_home"
+    codex_home = (replay_run_dir / "codex_home").resolve()   # Codex runs from another cwd
     if turn_index == 1:
         prompt = (
             f"{session_config.prompt}\n\n{prompt_override}" if prompt_override else session_config.prompt
