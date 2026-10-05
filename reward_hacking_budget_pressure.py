@@ -49,7 +49,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True, help="path to the sweep meta-config YAML")
     ap.add_argument("--phase", choices=["all", "run", "events", "score", "judge", "analyze"], default="all")
+    ap.add_argument("--shard", help="i/n: run only every n-th run starting at i (0-based), e.g. to give "
+                    "each host its own runs so concurrent agents never share a machine")
     args = ap.parse_args()
+    shard = None
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        if not 0 <= i < n:
+            ap.error("--shard must be i/n with 0 <= i < n")
+        shard = (i, n)
 
     # Resolve the config against the caller's cwd, then chdir to the repo root so the
     # config's internal repo-root-relative paths (base_task_config, rubric_file, ...) work.
@@ -69,7 +77,7 @@ def main() -> None:
 
     if args.phase in ("all", "run"):
         print("\n===== PHASE 1: run trajectories =====")
-        asyncio.run(run_all_trajectories(cfg))
+        asyncio.run(run_all_trajectories(cfg, shard))
     if args.phase in ("all", "events"):
         print("\n===== PHASE events: mechanical hack-event detection =====")
         detect_all(cfg)

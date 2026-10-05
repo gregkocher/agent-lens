@@ -275,10 +275,12 @@ def request_to_messages(req: dict, drop_past_reasoning: bool = False,
             role = it.get("role")
             text = _text(it.get("content"), style.part_sep)
             if role == "assistant":
+                # One assistant turn = reasoning + text + tool calls in ONE message (as the
+                # provider renders it); it ends at the next tool output / user message /
+                # reasoning item.
                 if pending is None:
                     pending = {"role": "assistant", "content": ""}
                 pending["content"] = (pending.get("content") or "") + text
-                flush()
             else:
                 flush()
                 if role in ("developer", "system"):

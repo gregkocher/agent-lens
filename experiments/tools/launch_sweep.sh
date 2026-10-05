@@ -9,14 +9,15 @@
 # as root and can read and kill everything.
 #
 # Usage (from anywhere, with OPENROUTER_API_KEY / OPENAI_API_KEY exported as needed):
-#   experiments/tools/launch_sweep.sh <sweep_config.yaml> [phase=all] [log=/root/sweep_<name>.log]
+#   experiments/tools/launch_sweep.sh <sweep_config.yaml> [phase=all] [log=/root/sweep_<name>.log] [shard=i/n]
 set -euo pipefail
 cfg=$(realpath "$1"); phase=${2:-all}
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 log=${3:-/root/sweep_$(basename "$cfg" .yaml).log}
+shard_args=(); [ -n "${4:-}" ] && shard_args=(--shard "$4")
 [ -x "$repo/.venv/bin/python" ] || { echo "run 'uv sync' in $repo first" >&2; exit 1; }
 cd "$repo"
 # -u: unbuffered, so the log survives even if the orchestrator is killed.
 setsid nohup "$repo/.venv/bin/python" -u reward_hacking_budget_pressure.py \
-  --config "$cfg" --phase "$phase" > "$log" 2>&1 < /dev/null &
+  --config "$cfg" --phase "$phase" "${shard_args[@]}" > "$log" 2>&1 < /dev/null &
 echo "launched pid $! -> $log"

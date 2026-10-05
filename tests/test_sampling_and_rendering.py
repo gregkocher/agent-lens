@@ -183,3 +183,21 @@ def test_run_meta_records_sampling(tmp_path):
     meta = _build_run_meta(_rc(), "r", [SessionResult(session_index=1, sampling=s, codex_model_limits=lim)], state)
     assert meta["sampling"] == s
     assert meta["sessions"][0]["sampling"] == s and meta["sessions"][0]["codex_model_limits"] == lim
+
+
+def test_assistant_turn_is_one_message():
+    """reasoning + text + tool call of one turn render as ONE assistant message (as providers
+    do); measured: splitting it cost 4 tokens per such turn on Together/Inkling."""
+    req = {"input": [
+        _m("user", "u"),
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "think"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I'll do it."}]},
+        {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": "{\"cmd\": \"ls\"}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "a.py"},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+    ]}
+    msgs = request_to_messages(req)
+    assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "assistant"]
+    a = msgs[1]
+    assert a["reasoning"] == "think" and a["content"] == "I'll do it." and a["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert msgs[3]["content"] == "done"
