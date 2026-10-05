@@ -23,6 +23,7 @@ from harness.config import RunConfig, SessionConfig, build_provider_env
 from harness.engines import EngineRunSpec, ResultEvent, SystemEvent, get_engine
 from harness.engines.base import classify_api_failure
 from harness.judge import Judge, JudgeVerdict, render_trajectory_with_info
+from harness.model_limits import resolve_codex_limits, resolve_sampling
 from harness.reasoning_capture import enrich_trajectory_reasoning
 from harness.proxy import CaptureProxy, get_target_url
 from harness.state import StateManager
@@ -86,6 +87,8 @@ class SessionResult:
     judge_verdict_count: int = 0
     stop_reason: str | None = None   # completed | budget_exhausted | max_turns | judge_early_exit | rate_limited | auth_error | error
     ended_early: bool = False        # stopped by a cap/intervention before finishing naturally
+    sampling: dict | None = None     # reasoning effort / temperature / top_p actually applied
+    codex_model_limits: dict | None = None  # context window / max output given to Codex
 
 
 def work_dir_hint(run_config: RunConfig, cwd: str) -> str | None:
@@ -206,6 +209,8 @@ async def run_session(
     proxy: CaptureProxy | None = None
     capture_base_url: str | None = None
     proxy_inject: dict[str, Any] = {}
+    sampling = resolve_sampling(run_config)
+    codex_limits = resolve_codex_limits(run_config)
     if run_config.provider_order:
         proxy_inject["provider"] = {"order": list(run_config.provider_order),
                                     "allow_fallbacks": run_config.provider_allow_fallbacks}
@@ -217,14 +222,16 @@ async def run_session(
             from harness.engines.codex import codex_upstream
 
             upstream_base, _, _ = codex_upstream(run_config.provider, run_config.base_url)
-            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject, intercept=proxy_intercept)
+            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject, intercept=proxy_intercept,
+                                 sampling=sampling)
             port = await proxy.start(upstream_base, session_dir / "api_captures.jsonl")
             # Codex appends `/responses` to its provider base_url; the proxy
             # forwards that path onto the resolved upstream base.
             capture_base_url = f"http://127.0.0.1:{port}"
         else:
             target_url = get_target_url(run_config.provider, run_config.base_url)
-            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject, intercept=proxy_intercept)
+            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject, intercept=proxy_intercept,
+                                 sampling=sampling)
             port = await proxy.start(target_url, session_dir / "api_captures.jsonl")
             provider_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
 
@@ -275,6 +282,8 @@ async def run_session(
             "codex_rollout_budget_tokens": run_config.codex_rollout_budget_tokens,
             "codex_reasoning_summary": run_config.codex_reasoning_summary,
             "codex_config_overrides": run_config.codex_config_overrides,
+            "codex_reasoning_effort": sampling.get("reasoning_effort"),
+            "codex_model_limits": codex_limits,
             "claude_thinking": run_config.claude_thinking,
         },
     )
@@ -506,4 +515,6 @@ async def run_session(
         judge_verdict_count=len(judge_verdicts),
         stop_reason=stop_reason,
         ended_early=ended_early,
+        sampling=sampling or None,
+        codex_model_limits=codex_limits,
     )

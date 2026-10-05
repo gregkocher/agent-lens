@@ -114,6 +114,23 @@ class RunConfig(BaseModel):
     provider_order: list[str] | None = None
     provider_allow_fallbacks: bool = False
 
+    # Sampling, applied identically to every agent request and to branch prefills, and
+    # recorded in run_meta.json ("sampling"). Codex engine only (claude_code: see
+    # claude_thinking). reasoning_effort -> Codex model_reasoning_effort (also enforced by
+    # the capture proxy); None = engine default. temperature/top_p are injected by the
+    # capture proxy; None = the model's recommended value when known
+    # (harness.prefill.recommended_sampling), else not sent (provider default).
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = "high"
+    temperature: float | None = Field(default=None, ge=0)
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    # False: temperature/top_p None means "not sent" (branch rollouts copy the seed's
+    # exact request values this way).
+    use_recommended_sampling: bool = True
+    # Codex + OpenRouter: tell Codex the model's real context window / max output (from
+    # OpenRouter's endpoint list for the pinned provider) instead of its 272k fallback
+    # guess for models it has no profile for. Explicit codex_config_overrides win.
+    codex_model_limits: bool = True
+
     # codex sandbox policy (codex engine only)
     sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] = (
         "workspace-write"
@@ -141,8 +158,9 @@ class RunConfig(BaseModel):
     # Extra raw ``-c key=value`` overrides appended verbatim to ``codex exec``.
     # Additive escape hatch for models Codex ships no built-in profile for (it falls
     # back to guessed metadata): pin e.g. ``model_supports_reasoning_summaries=true``
-    # (so reasoning summaries surface in the event stream), ``model_context_window``,
-    # and ``model_max_output_tokens``.
+    # (so reasoning summaries surface in the event stream). An override of
+    # model_reasoning_effort / model_context_window / model_max_output_tokens wins over
+    # reasoning_effort / codex_model_limits.
     codex_config_overrides: list[str] = Field(default_factory=list)
     # claude_code: "off" | "adaptive" (SDK thinking={"type": ...})
     claude_thinking: str = "adaptive"
@@ -251,6 +269,14 @@ class RunConfig(BaseModel):
                 raise ValueError("provider_order must list at least one provider (e.g. ['together']).")
             if not self.capture_api_requests:
                 raise ValueError("provider_order is enforced by the capture proxy; set capture_api_requests: true.")
+
+        if self.engine != "codex" and (self.temperature is not None or self.top_p is not None):
+            raise ValueError("temperature/top_p are supported with engine: codex only "
+                             "(Claude thinking requires the API default).")
+        if (self.engine == "codex" and not self.capture_api_requests
+                and (self.temperature is not None or self.top_p is not None)):
+            raise ValueError("temperature/top_p are injected by the capture proxy; "
+                             "set capture_api_requests: true.")
 
         # Subagents are a Claude Code feature; Codex has no equivalent.
         if self.engine == "codex" and self.agents:

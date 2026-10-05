@@ -11,8 +11,8 @@ from pipeline.render import render_trajectory
 
 runs_dir = Path(sys.argv[1]); names = sys.argv[2:]
 ok_all = True
-for rd in sorted(runs_dir.glob("e2e_*")):
-    if names and not any(rd.name.startswith(f"e2e_{n}") for n in names):
+for rd in sorted(runs_dir.glob("e2e*_*")):
+    if names and not any(rd.name.startswith(n) for n in names):
         continue
     s = rd / "session_01"
     meta = json.loads((rd / "run_meta.json").read_text()) if (rd / "run_meta.json").exists() else {}
@@ -46,6 +46,19 @@ for rd in sorted(runs_dir.glob("e2e_*")):
     judge = [json.loads(l) for l in (s / "judge.jsonl").read_text().splitlines()] if (s / "judge.jsonl").exists() else []
     live_ok = all("render_info" in j and j["render_info"] for j in judge) if judge else None
     errs = meta.get("errors") or []
+    # sampling: every request carries what run_meta says was applied (codex runs)
+    samp = meta.get("sampling") or {}
+    def sent(b):
+        r = b.get("reasoning") if isinstance(b.get("reasoning"), dict) else {}
+        return {"reasoning_effort": r.get("effort"), "temperature": b.get("temperature"), "top_p": b.get("top_p")}
+    want = {k: samp.get(k) for k in ("reasoning_effort", "temperature", "top_p")}
+    sampling_ok = (not samp) or all(sent(b) == want for b in bodies)
+    # Codex was told the real context window (codex_model_limits -> turn_context)
+    lim = ((meta.get("sessions") or [{}])[0]).get("codex_model_limits") or {}
+    tr = s / "transcript.jsonl"
+    windows = set(re.findall(r'"model_context_window":\s*(\d+)', tr.read_text())) if tr.exists() else set()
+    # Codex 0.142 caps the window at 272k and reports 95% of it as usable
+    window_ok = (not lim.get("context_window")) or windows == {str(int(min(lim["context_window"], 272_000) * 0.95))}
     checks = {
         "requests": len(bodies) > 1,
         "no_server_tools": not server,
@@ -53,11 +66,14 @@ for rd in sorted(runs_dir.glob("e2e_*")):
         "judge_sees_reasoning": rendered.count("THINKING") > 0,
         "prior_reasoning_resent": resent_last > 0 or len(bodies) <= 1,
         "no_errors": not errs,
+        "sampling_applied": sampling_ok,
+        "context_window_applied": window_ok,
     }
     ok = all(checks.values()); ok_all &= ok
     print(f"\n{'PASS' if ok else 'FAIL'} {rd.name}  engine={meta.get('engine')} model={meta.get('model')}")
     print(f"   requests={len(bodies)} server_tools={server} provider_pin={sorted(pins)[:2]}")
     print(f"   agent steps={len(agent)} with reasoning={len(with_r)} kinds={kinds} capture={ {k: stats.get(k) for k in ('source','records','with_reasoning','steps_filled','unmatched_records','server_tools_seen')} }")
     print(f"   prior reasoning items re-sent in final request={resent_last}; judge THINKING blocks={rendered.count('THINKING')}; live judge verdicts={len(judge)} render_info_ok={live_ok}")
+    print(f"   sampling={want} sent(first)={sent(bodies[0]) if bodies else None} limits={lim} codex windows={sorted(windows)}")
     print(f"   checks: {checks}{'  errors: ' + str(errs)[:200] if errs else ''}")
 print("\nALL PASS" if ok_all else "\nSOME FAILED")

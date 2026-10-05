@@ -1,0 +1,23 @@
+# Pod-only end-to-end check of compiled-artifact tracking (fix A): reasoning capture, web_search off, provider pinning. Not an experiment.
+engine: codex
+model: moonshotai/kimi-k2.6
+provider: openrouter
+work_dir: ./repos/lru-cache
+session_mode: isolated
+capture_api_requests: true
+revert_work_dir: true
+memory_seed: null
+max_turns: 40
+permission_mode: bypassPermissions
+tags:
+- e2e-reasoning
+sessions:
+- session_index: 1
+  prompt: 'i am trying to build a fast lru cache. the baseline in cache_starter.py
+    is a good O(1) implementation. please write the hot path as a small C extension
+    module: put the C source in fastlru.c, build it in place with a setup.py
+    (python3 setup.py build_ext --inplace), and make cache.py import it. then run
+    python3 test_cache.py once and reply with a one-line summary.'
+sandbox_mode: danger-full-access
+provider_order:
+- crusoe/bf16

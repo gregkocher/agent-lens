@@ -39,7 +39,10 @@ from harness.prefill import (
     ModelSpec,
     check_branch_support,
     complete_raw,
+    count_tokens,
+    render_chat,
     render_prompt,
+    request_effort,
     responses_sse,
 )
 from harness.reasoning_capture import (
@@ -84,7 +87,42 @@ class Seed:
         self.past_reasoning_dropped = any(
             t.get("type") not in ("function", "namespace", "custom")
             for t in self.request.get("tools") or [] if isinstance(t, dict))
+        self.provider_input_tokens: int | None = _sse_input_tokens(resp)
+        self._fidelity: dict | None = None
         self._locate_branch_step()
+
+    def template_fidelity(self) -> dict:
+        """Our rendering of request k vs the provider's own (its input token count).
+
+        The branch step is prefilled from OUR rendering of the chat template while every
+        other step is rendered by the provider, so they must agree. ``gap`` = our tokens
+        minus the provider's (0 = identical length).
+        """
+        if self._fidelity is None:
+            ours = count_tokens(self.spec, render_chat(self.request, self.spec, self.past_reasoning_dropped,
+                                                          self.provider))
+            prov = self.provider_input_tokens
+            self._fidelity = {"rendered_tokens": ours, "provider_tokens": prov,
+                              "gap": None if prov is None else ours - prov}
+        return self._fidelity
+
+    def check_fidelity(self, max_gap: int) -> dict:
+        f = self.template_fidelity()
+        if f["gap"] is None:
+            raise ValueError(f"seed {self.run_dir} response {self.k} carries no input token count; "
+                             "cannot verify the prompt rendering")
+        if abs(f["gap"]) > max_gap:
+            raise BranchUnsupportedError(
+                f"Our chat-template rendering of seed request {self.k} is {f['rendered_tokens']} tokens, "
+                f"the provider's is {f['provider_tokens']} (gap {f['gap']:+d}, allowed ±{max_gap}): the "
+                f"branch step would see a different prompt than the rest of the rollout. Raise "
+                f"branch.max_prompt_token_gap only if that difference is acceptable.")
+        return f
+
+    def sampling(self) -> dict:
+        """Reasoning effort / temperature / top_p the seed's request k was sent with."""
+        return {"reasoning_effort": request_effort(self.request),
+                "temperature": self.request.get("temperature"), "top_p": self.request.get("top_p")}
 
     def _locate_branch_step(self) -> None:
         traj = json.loads((self.session / "trajectory.json").read_text())
@@ -121,7 +159,9 @@ class Seed:
             base = r[: i + len(arm["prefix_through"])]
         else:
             raise ValueError("a branch arm needs one of: prefix, full_original, prefix_until, prefix_through")
-        return base + (arm.get("append") or "")
+        # Trailing whitespace would be its own token(s) where the model would naturally
+        # emit e.g. " The" next, an unnatural tokenization at the seam.
+        return (base + (arm.get("append") or "")).rstrip()
 
     def truncated_rollout(self, new_cwd: str) -> tuple[list[dict], str]:
         need = len(self.request.get("input") or [])
@@ -148,8 +188,9 @@ class BranchSplice:
     """Capture-proxy intercept for one branch rollout (see module docstring, step 3)."""
 
     def __init__(self, seed: Seed, prefix: str, new_cwd: str, api_key: str,
-                 history_replace: list[dict] | None = None):
+                 history_replace: list[dict] | None = None, max_attempts: int = 3):
         self.seed, self.prefix, self.api_key = seed, prefix, api_key
+        self.max_attempts = max_attempts
         self.history_replace = history_replace or []
         self.expected = self._edit(json.loads(json.dumps(seed.request["input"]).replace(seed.old_cwd, new_cwd)))
         self.n = 0
@@ -177,16 +218,44 @@ class BranchSplice:
                 "first_differing_item": next((i for i, (a, b) in enumerate(zip(self.expected, got)) if a != b),
                                              min(len(self.expected), len(got)))}
         drop = self.seed.past_reasoning_dropped
-        prompt, n_tok = render_prompt(request_data, self.seed.spec, self.prefix, drop_past_reasoning=drop)
-        d = await complete_raw(self.seed.config.model, self.seed.provider, prompt, self.api_key)
-        text = d["choices"][0].get("text") or ""
-        parsed = self.seed.spec.parser(text)
+        sampling = {"reasoning_effort": request_effort(request_data),
+                    "temperature": request_data.get("temperature"), "top_p": request_data.get("top_p")}
+        self.meta["sampling"] = sampling
+        self.meta["sampling_matches_seed"] = sampling == self.seed.sampling()
+        prompt, n_tok = render_prompt(request_data, self.seed.spec, self.prefix, drop_past_reasoning=drop,
+                                      provider=self.seed.provider)
+        # A continuation without a parseable action (cut off, malformed call) would end the
+        # rollout on a broken step: re-sample it, up to max_attempts, and record every try.
+        attempts = []
+        for _ in range(self.max_attempts):
+            d = await complete_raw(self.seed.config.model, self.seed.provider, prompt, self.api_key,
+                                   temperature=sampling["temperature"], top_p=sampling["top_p"])
+            text = d["choices"][0].get("text") or ""
+            parsed = self.seed.spec.parser(text)
+            attempts.append({"continuation": text, "action_parsed": parsed.complete,
+                             "finish_reason": d["choices"][0].get("finish_reason"),
+                             "served_by": d.get("provider")})
+            if parsed.complete:
+                break
         self.meta.update({
             "prompt_tokens_rendered": n_tok, "prompt_tokens_provider": (d.get("usage") or {}).get("prompt_tokens"),
             "past_reasoning_dropped": drop, "continuation": text, "action_parsed": parsed.complete,
+            "n_attempts": len(attempts), "attempts": attempts,
             "tool_calls": parsed.tool_calls, "message": parsed.message, "served_by": d.get("provider"),
         })
-        return responses_sse(self.seed.config.model, self.prefix + parsed.reasoning, parsed, d.get("usage"))
+        namespaces = {t.get("name") for t in request_data.get("tools") or [] if t.get("type") == "namespace"}
+        return responses_sse(self.seed.config.model, self.prefix + parsed.reasoning, parsed, d.get("usage"),
+                             namespaces)
+
+
+def _sse_input_tokens(path: Path) -> int | None:
+    for line in path.read_text(errors="replace").splitlines():
+        if line.startswith("data:") and "response.completed" in line:
+            try:
+                return ((json.loads(line[5:]).get("response") or {}).get("usage") or {}).get("input_tokens")
+            except json.JSONDecodeError:
+                return None
+    return None
 
 
 def _export(git_dir: Path, ref: str, dest: Path) -> None:
@@ -227,6 +296,7 @@ async def run_branch(cfg, base_cfg: RunConfig, arm_name: str, rep: int, run_dir:
     seed = Seed(bc.seed_run, bc.request, bc.provider)
     arm = bc.arms[arm_name].model_dump()
     prefix = seed.prefix_for(arm)
+    fidelity = seed.check_fidelity(bc.max_prompt_token_gap)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. work dir at the snapshot before the branch step (+ git history like the seed's)
@@ -260,8 +330,16 @@ async def run_branch(cfg, base_cfg: RunConfig, arm_name: str, rep: int, run_dir:
     rc.run_as_user = agent_user.name if agent_user else None
     rc.codex_prompt_stdin = cfg.isolation.hide_process_args
     rc.work_dir_hint = False
+    # exactly the seed's sampling (None = was not sent), on every request and the prefill
+    seed_sampling = seed.sampling()
+    rc.use_recommended_sampling = False
+    rc.reasoning_effort = seed_sampling["reasoning_effort"]
+    rc.temperature, rc.top_p = seed_sampling["temperature"], seed_sampling["top_p"]
+    rc.codex_config_overrides = [o for o in rc.codex_config_overrides
+                                 if str(o).partition("=")[0].strip() != "model_reasoning_effort"]
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    splice = BranchSplice(seed, prefix, str(work_dir), api_key, arm.get("history_replace"))
+    splice = BranchSplice(seed, prefix, str(work_dir), api_key, arm.get("history_replace"),
+                          max_attempts=bc.max_step_attempts)
     shadow = ShadowGit(work_dir=work_dir, git_dir=run_dir / ".shadow_git")
     shadow.init()
     shadow.commit_baseline()
@@ -300,7 +378,7 @@ async def run_branch(cfg, base_cfg: RunConfig, arm_name: str, rep: int, run_dir:
         "reset_tag": seed.reset_tag, "arm": arm_name, "rep": rep, "arm_spec": arm,
         "prefix": prefix, "original_step_reasoning": seed.original_reasoning,
         "model": seed.config.model, "provider": seed.provider, "support_status": seed.spec.providers[seed.provider],
-        "prefix_steps": len(seed.prefix_steps), **splice.meta,
+        "prefix_steps": len(seed.prefix_steps), "template_fidelity": fidelity, **splice.meta,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }, indent=2, default=str))
 

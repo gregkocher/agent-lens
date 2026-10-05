@@ -16,12 +16,15 @@ and (b) produce parseable actions are supported — see ``SUPPORTED`` and
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class BranchUnsupportedError(ValueError):
@@ -109,14 +112,36 @@ def parse_harmony(text: str) -> ParsedOutput:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class RenderStyle:
+    """How a provider turns a Responses request into chat messages before templating.
+
+    Measured per provider by comparing its input token counts with ours on probe requests
+    (see docs: "prompt fidelity"); the per-branch fidelity check guards the rest.
+    """
+    part_sep: str = ""                 # joins the input_text parts of one message
+    merge_system: str | None = None    # join consecutive system/developer messages with this
+    system_into_first: bool = False    # fold every later system/developer message into the first
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     hf_repo: str                      # chat template source
     reasoning_open: str               # appended after the generation prompt to open the reasoning
     parser: Callable[[str], ParsedOutput]
-    # OpenRouter provider tag -> "verified" (end-to-end branch rollouts tested) or
-    # "prefill-probed" (raw prefill continues in place with markers kept; no full branch yet)
+    # OpenRouter provider tag -> "verified" (end-to-end branch rollouts tested, prompt
+    # rendering matches the provider's), "experimental" (works end to end, but the rendered
+    # prompt differs from the provider's) or "prefill-probed" (raw prefill continues in
+    # place with markers kept; no full branch yet)
     providers: dict[str, str]
     note: str = ""
+    # Recommended sampling (model card); the default for seeds and branches alike.
+    temperature: float | None = None
+    top_p: float | None = None
+    # provider tag -> its RenderStyle (default RenderStyle() for others)
+    styles: dict[str, RenderStyle] = field(default_factory=dict)
+
+    def style_for(self, provider: str | None) -> RenderStyle:
+        return self.styles.get(provider or "", RenderStyle())
 
 
 SUPPORTED: dict[str, ModelSpec] = {
@@ -124,16 +149,33 @@ SUPPORTED: dict[str, ModelSpec] = {
         hf_repo="thinkingmachines/Inkling", reasoning_open="<|content_thinking|>", parser=parse_inkling,
         providers={"together": "verified"},
         note="The only provider accepting raw prompts; it strips special tokens, so the tool "
-             "call is recovered from its JSON."),
+             "call is recovered from its JSON.",
+        temperature=1.0, top_p=1.0,  # no published recommendation: unmodified distribution
+        styles={"together": RenderStyle(part_sep=" ", merge_system="\n\n")}),
     "moonshotai/kimi-k2.6": ModelSpec(
         hf_repo="moonshotai/Kimi-K2.6", reasoning_open="", parser=parse_kimi,
         providers={"crusoe/bf16": "verified", "streamlake/fp8": "prefill-probed",
-                   "parasail/int4": "prefill-probed", "chutes/int4": "prefill-probed"}),
+                   "parasail/int4": "prefill-probed", "chutes/int4": "prefill-probed"},
+        temperature=1.0, top_p=0.95,  # model card, thinking mode
+        styles={"crusoe/bf16": RenderStyle(part_sep="\n")}),
     "openai/gpt-oss-120b": ModelSpec(
         hf_repo="openai/gpt-oss-120b", reasoning_open="<|channel|>analysis<|message|>", parser=parse_harmony,
-        providers={"cerebras/fp16": "verified"},
-        note="DeepInfra was excluded: it sometimes emits the tool call inside the reasoning text."),
+        providers={"cerebras/fp16": "experimental"},
+        note="EXPERIMENTAL: our harmony rendering is ~420 tokens shorter than Cerebras' own "
+             "rendering of the same request (cause unknown; tool schemas suspected), so the "
+             "branch step sees a slightly different prompt than the rest of the rollout. "
+             "DeepInfra was excluded: it sometimes emits the tool call inside the reasoning text.",
+        temperature=1.0, top_p=1.0,  # OpenAI's recommendation
+        # its HF template renders only the FIRST system/developer message and silently
+        # drops later ones
+        styles={"cerebras/fp16": RenderStyle(system_into_first=True, merge_system="\n\n")}),
 }
+
+
+def recommended_sampling(model: str) -> tuple[float | None, float | None]:
+    """(temperature, top_p) recommended for ``model``, or (None, None) if unknown."""
+    spec = SUPPORTED.get(model)
+    return (spec.temperature, spec.top_p) if spec else (None, None)
 
 
 def check_branch_support(engine: str, provider: str, model: str, provider_order: list[str] | None) -> ModelSpec:
@@ -162,6 +204,10 @@ def check_branch_support(engine: str, provider: str, model: str, provider_order:
         raise BranchUnsupportedError(
             f"Provider '{provider_order[0]}' is not verified for raw prefill of {model}; "
             f"use one of: {', '.join(spec.providers)}.")
+    status = spec.providers[provider_order[0]]
+    if status != "verified":
+        logger.warning("Branch rollouts of %s via %s are %s, not verified end to end. %s",
+                       model, provider_order[0], status, spec.note)
     return spec
 
 
@@ -169,14 +215,18 @@ def check_branch_support(engine: str, provider: str, model: str, provider_order:
 # Request rendering (Codex Responses input -> model chat template)
 # ---------------------------------------------------------------------------
 
-def _text(content: Any) -> str:
+def _text(content: Any, sep: str = "") -> str:
     if isinstance(content, str):
         return content
-    return "".join(c.get("text", "") for c in content or [] if isinstance(c, dict))
+    return sep.join(c.get("text", "") for c in content or [] if isinstance(c, dict))
 
 
 def reasoning_text(item: dict) -> str:
     return _text(item.get("content")) or _text(item.get("summary"))
+
+
+# OpenRouter flattens Responses namespace tools to "<namespace>__<tool>" (measured).
+NS_SEP = "__"
 
 
 def tools_to_chat(tools: list[dict] | None) -> list[dict]:
@@ -190,12 +240,16 @@ def tools_to_chat(tools: list[dict] | None) -> list[dict]:
             for sub in t.get("tools") or []:
                 if sub.get("type") == "function":
                     out.append({"type": "function", "function": {
-                        "name": f"{t['name']}.{sub['name']}", "description": sub.get("description", ""),
+                        "name": f"{t['name']}{NS_SEP}{sub['name']}", "description": sub.get("description", ""),
                         "parameters": sub.get("parameters") or {"type": "object", "properties": {}}}})
     return out  # server tools (web_search) have no client schema
 
 
-def request_to_messages(req: dict, drop_past_reasoning: bool = False) -> list[dict]:
+def request_to_messages(req: dict, drop_past_reasoning: bool = False,
+                        style: RenderStyle | None = None) -> list[dict]:
+    """Responses input -> chat messages, the way the serving provider builds them
+    (``style``). Developer messages become system messages."""
+    style = style or RenderStyle()
     msgs: list[dict] = []
     if req.get("instructions"):
         msgs.append({"role": "system", "content": req["instructions"]})
@@ -207,18 +261,30 @@ def request_to_messages(req: dict, drop_past_reasoning: bool = False) -> list[di
             msgs.append(pending)
             pending = None
 
+    def add_system(text: str) -> None:
+        if style.system_into_first and msgs and msgs[0]["role"] == "system":
+            msgs[0]["content"] += (style.merge_system or "") + text
+        elif style.merge_system is not None and msgs and msgs[-1]["role"] == "system":
+            msgs[-1]["content"] += style.merge_system + text
+        else:
+            msgs.append({"role": "system", "content": text})
+
     for it in req.get("input") or []:
         t = it.get("type")
         if t == "message":
             role = it.get("role")
+            text = _text(it.get("content"), style.part_sep)
             if role == "assistant":
                 if pending is None:
                     pending = {"role": "assistant", "content": ""}
-                pending["content"] = (pending.get("content") or "") + _text(it.get("content"))
+                pending["content"] = (pending.get("content") or "") + text
                 flush()
             else:
                 flush()
-                msgs.append({"role": "system" if role == "developer" else role, "content": _text(it.get("content"))})
+                if role in ("developer", "system"):
+                    add_system(text)
+                else:
+                    msgs.append({"role": role, "content": text})
         elif t == "reasoning":
             flush()
             r = "" if drop_past_reasoning else reasoning_text(it)
@@ -231,8 +297,11 @@ def request_to_messages(req: dict, drop_past_reasoning: bool = False) -> list[di
                 args = json.loads(raw or "{}")
             except json.JSONDecodeError:
                 args = {"raw": raw}
+            name = it.get("name")
+            if it.get("namespace"):
+                name = f"{it['namespace']}{NS_SEP}{name}"
             pending.setdefault("tool_calls", []).append(
-                {"id": it.get("call_id"), "type": "function", "function": {"name": it.get("name"), "arguments": args}})
+                {"id": it.get("call_id"), "type": "function", "function": {"name": name, "arguments": args}})
         elif t in ("function_call_output", "custom_tool_call_output"):
             flush()
             out = it.get("output")
@@ -253,14 +322,37 @@ def _tokenizer(repo: str):
     return _TOKENIZERS[repo]
 
 
-def render_prompt(req: dict, spec: ModelSpec, prefix: str, drop_past_reasoning: bool = False) -> tuple[str, int]:
+def request_effort(req: dict) -> str | None:
+    r = req.get("reasoning")
+    return r.get("effort") if isinstance(r, dict) else None
+
+
+def render_chat(req: dict, spec: ModelSpec, drop_past_reasoning: bool = False,
+                provider: str | None = None) -> str:
+    """The request rendered through the model's chat template, up to the generation prompt,
+    the way ``provider`` renders it.
+
+    The request's reasoning effort is passed as the template's ``reasoning_effort`` (used
+    by Inkling and gpt-oss/harmony, ignored elsewhere), as providers do for /responses.
+    """
+    kwargs = {}
+    if request_effort(req):
+        kwargs["reasoning_effort"] = request_effort(req)
+    return _tokenizer(spec.hf_repo).apply_chat_template(
+        request_to_messages(req, drop_past_reasoning, spec.style_for(provider)),
+        tools=tools_to_chat(req.get("tools")) or None,
+        add_generation_prompt=True, tokenize=False, **kwargs)
+
+
+def count_tokens(spec: ModelSpec, text: str) -> int:
+    return len(_tokenizer(spec.hf_repo)(text, add_special_tokens=False)["input_ids"])
+
+
+def render_prompt(req: dict, spec: ModelSpec, prefix: str, drop_past_reasoning: bool = False,
+                  provider: str | None = None) -> tuple[str, int]:
     """The raw prompt for the branch step and its token count."""
-    tok = _tokenizer(spec.hf_repo)
-    prompt = tok.apply_chat_template(request_to_messages(req, drop_past_reasoning),
-                                     tools=tools_to_chat(req.get("tools")) or None,
-                                     add_generation_prompt=True, tokenize=False)
-    prompt = prompt + spec.reasoning_open + prefix
-    return prompt, len(tok(prompt, add_special_tokens=False)["input_ids"])
+    prompt = render_chat(req, spec, drop_past_reasoning, provider) + spec.reasoning_open + prefix
+    return prompt, count_tokens(spec, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +361,14 @@ def render_prompt(req: dict, spec: ModelSpec, prefix: str, drop_past_reasoning: 
 
 async def complete_raw(model: str, provider: str, prompt: str, api_key: str,
                        base_url: str = "https://openrouter.ai/api/v1", max_tokens: int = 32_000,
-                       timeout: float = 900.0) -> dict:
-    body = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
-            "provider": {"order": [provider], "allow_fallbacks": False}}
+                       timeout: float = 900.0, temperature: float | None = None,
+                       top_p: float | None = None) -> dict:
+    body: dict[str, Any] = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
+                            "provider": {"order": [provider], "allow_fallbacks": False}}
+    if temperature is not None:
+        body["temperature"] = temperature
+    if top_p is not None:
+        body["top_p"] = top_p
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.post(f"{base_url}/completions", json=body, headers={"Authorization": f"Bearer {api_key}"})
     r.raise_for_status()
@@ -281,16 +378,25 @@ async def complete_raw(model: str, provider: str, prompt: str, api_key: str,
     return d
 
 
-def responses_sse(model: str, reasoning: str, parsed: ParsedOutput, usage: dict | None) -> bytes:
-    """A Responses API SSE stream carrying the branch step's output items."""
+def responses_sse(model: str, reasoning: str, parsed: ParsedOutput, usage: dict | None,
+                  namespaces: set[str] | frozenset[str] = frozenset()) -> bytes:
+    """A Responses API SSE stream carrying the branch step's output items.
+
+    A call to a flattened namespace tool ("<ns>__<tool>", see NS_SEP) is emitted as a
+    namespaced function call (unverified against Codex: no seed has called one yet).
+    """
     items: list[dict] = [{"id": f"rs_{uuid.uuid4().hex[:12]}", "type": "reasoning", "status": "completed",
                           "summary": [], "content": [{"type": "reasoning_text", "text": reasoning}]}]
     if parsed.message:
         items.append({"id": f"msg_{uuid.uuid4().hex[:12]}", "type": "message", "role": "assistant",
                       "status": "completed", "content": [{"type": "output_text", "text": parsed.message, "annotations": []}]})
     for tc in parsed.tool_calls:
-        items.append({"id": f"fc_{uuid.uuid4().hex[:12]}", "type": "function_call", "status": "completed",
-                      "call_id": f"call_{uuid.uuid4().hex[:20]}", "name": tc["name"], "arguments": tc["arguments"]})
+        call = {"id": f"fc_{uuid.uuid4().hex[:12]}", "type": "function_call", "status": "completed",
+                "call_id": f"call_{uuid.uuid4().hex[:20]}", "name": tc["name"], "arguments": tc["arguments"]}
+        ns, sep, sub = tc["name"].partition(NS_SEP)
+        if sep and ns in namespaces:
+            call.update(name=sub, namespace=ns)
+        items.append(call)
     u = usage or {}
     rid = f"resp_{uuid.uuid4().hex[:16]}"
     evs: list[dict] = [{"type": "response.created",

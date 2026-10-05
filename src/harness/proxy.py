@@ -162,6 +162,20 @@ def _detect_api_format(path: str) -> str | None:
     return None
 
 
+def apply_sampling(request_data: dict, sampling: dict) -> None:
+    """Set temperature/top_p and fill a missing reasoning effort (Responses API body)."""
+    for k in ("temperature", "top_p"):
+        if sampling.get(k) is not None:
+            request_data[k] = sampling[k]
+    effort = sampling.get("reasoning_effort")
+    if effort:
+        r = request_data.get("reasoning")
+        r = dict(r) if isinstance(r, dict) else {}
+        if not r.get("effort"):
+            r["effort"] = effort
+            request_data["reasoning"] = r
+
+
 class CaptureProxy:
     """Reverse proxy that logs API request/response metadata to JSONL.
 
@@ -169,7 +183,8 @@ class CaptureProxy:
     OpenAI Responses API (Codex engine), detected per-request by path.
     """
 
-    def __init__(self, raw_dump_count: int = 0, inject: dict | None = None, intercept=None) -> None:
+    def __init__(self, raw_dump_count: int = 0, inject: dict | None = None, intercept=None,
+                 sampling: dict | None = None) -> None:
         # Optional async ``intercept(request_data, request_index) -> bytes | None``: may edit
         # the request in place (forwarded as edited) or answer it itself by returning a
         # full SSE response body, in which case upstream is not called (branch rollouts).
@@ -177,6 +192,11 @@ class CaptureProxy:
         # Top-level fields set on every API request body (e.g. OpenRouter's
         # ``provider`` routing object, so a run is pinned to one provider).
         self._inject = dict(inject or {})
+        # Responses-API sampling applied to every request (harness.model_limits.
+        # resolve_sampling): temperature/top_p set outright, reasoning effort filled in
+        # when the client didn't ask for one.
+        self._sampling = {k: v for k, v in (sampling or {}).items()
+                          if k in ("temperature", "top_p", "reasoning_effort") and v is not None}
         # Server-side tool types seen in requests. On OpenRouter a server tool in the
         # tool list makes it drop all prior reasoning items, so this is surfaced.
         self.server_tools_seen: set[str] = set()
@@ -259,6 +279,9 @@ class CaptureProxy:
                 # high) when the model didn't already request reasoning.
                 if self._inject:
                     request_data.update(self._inject)
+                    body = json.dumps(request_data).encode()
+                if self._sampling and api_format == "openai_responses":
+                    apply_sampling(request_data, self._sampling)
                     body = json.dumps(request_data).encode()
                 server = _server_tool_types(request_data.get("tools"), api_format)
                 if server - self.server_tools_seen:

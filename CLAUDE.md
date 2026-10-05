@@ -67,6 +67,10 @@ engine: claude_code                     # claude_code (default) | codex
 model: "claude-sonnet-4-20250514"      # engine-appropriate model name
 provider: anthropic                     # claude_code: anthropic|openrouter|bedrock|vertex; codex: openai|openrouter
 provider_order: ["together"]            # openrouter only: pin the upstream provider (proxy-enforced)
+reasoning_effort: high                  # codex: minimal|low|medium|high (default)|xhigh|null (engine default)
+temperature: null                       # codex: null = model's recommended value if known, else not sent
+top_p: null                             # codex: same; both injected by the capture proxy
+codex_model_limits: true                # codex+openrouter: real context window / max output from OpenRouter
 claude_thinking: adaptive               # claude_code: adaptive (default) | off
 codex_reasoning_summary: auto           # codex: auto (default) | none | concise | detailed
 sandbox_mode: workspace-write           # codex only: read-only | workspace-write | danger-full-access
@@ -208,9 +212,31 @@ closed and the agent process/stream is terminated. Implementation: `judge.py`
 (client + verdict parsing + `render_trajectory`); the runner drives cadence and
 early-exit in the event loop.
 
+### Sampling and model limits (Codex)
+
+Every Codex request carries the same explicit sampling, recorded in `run_meta.json`
+(`sampling`): the reasoning effort (Codex `model_reasoning_effort`, default `high` as in the
+main past sweeps; the capture proxy also fills it in if a request lacks it), and
+`temperature`/`top_p` injected by the capture proxy — by default the model's recommended
+values when known (`harness.prefill.recommended_sampling`: Kimi K2.6 1.0/0.95, Inkling and
+gpt-oss 1.0/1.0), otherwise not sent. Branch rollouts copy the seed's exact values to every
+request and to the raw prefill. Runs before 2026-10-05 sent no temperature/top_p, and
+eval-context runs sent no effort.
+
+Codex has no profile for OpenRouter models ("model metadata not found") and assumes a 272k
+window. With `codex_model_limits: true` (default) AgentLens reads the pinned provider's
+`context_length`/`max_completion_tokens` from OpenRouter's endpoint list (the minimum over
+all endpoints when unpinned) and passes `model_context_window`/`model_max_output_tokens`;
+recorded per session in `run_meta.json` (`codex_model_limits`). Explicit
+`codex_config_overrides` always win. Codex 0.142 caps the window at 272k (uses 95% of it),
+so this matters for smaller provider windows (gpt-oss on Cerebras: 131k; Kimi on Crusoe:
+262k), where Codex would otherwise overflow instead of compacting.
+
 ### Shadow git (change tracking)
 
-All file changes in the working directory are tracked automatically via a shadow git repo stored in the run output directory (`.shadow_git/`). The agent never sees this repo — it uses `GIT_DIR`/`GIT_WORK_TREE` env vars to stay invisible.
+All file changes in the working directory are tracked automatically via a shadow git repo stored in the run output directory (`.shadow_git/`). The agent never sees this repo — it uses `GIT_DIR`/`GIT_WORK_TREE` env vars to stay invisible. Compiled artifacts (`*.so`, `*.o`, `build/`, ...) are tracked too (since 2026-10-05), so
+final-score reconstruction and branch/replay restores include extension modules the agent
+built; binary changes appear in `state_changelog.jsonl` as `[binary file: N bytes]`.
 
 This enables:
 - **Full diffs**: every file change is captured, not just declared files
@@ -283,13 +309,29 @@ continuous ids), so events/score/judge/analyze work unchanged; injected vs gener
 is recorded only in `branch_meta.json` (incl. `first_request_matches_seed`).
 `harness branch-points <run> --grep TEXT` finds the request and sentence to branch at.
 
+Fidelity safeguards (all recorded in `branch_meta.json`):
+- **Prompt fidelity**: the prefilled step is rendered by us, every other step by the
+  provider, so the two renderings must agree. Before any rollout the sweep renders the
+  seed's request k and compares its token count with the provider's own `input_tokens`
+  for it (`template_fidelity`); a gap above `branch.max_prompt_token_gap` (default 0)
+  refuses the sweep. Provider conventions were measured and are encoded as a
+  `RenderStyle` per provider (Together joins content parts with a space and merges
+  consecutive system messages with a blank line; Crusoe joins parts with a newline;
+  OpenRouter flattens namespace tools as `ns__tool`).
+- **Sampling**: the seed's reasoning effort, temperature and top_p on every request and on
+  the prefill (`sampling`, `sampling_matches_seed`).
+- **Seam**: trailing whitespace is stripped from the prefix (a dangling space would be
+  its own token where the model would emit e.g. `" The"`).
+- **Parse failures**: a continuation with no parseable action is re-sampled up to
+  `branch.max_step_attempts` (default 3); every try is kept in `attempts`.
+
 Supported (anything else raises `BranchUnsupportedError`):
 
 | Model | Provider (pin) | Status |
 |---|---|---|
-| `thinkingmachines/inkling` | `together` | verified (tool call recovered from JSON; Together strips special tokens) |
-| `moonshotai/kimi-k2.6` | `crusoe/bf16` | verified; `streamlake/fp8`, `parasail/int4`, `chutes/int4` prefill-probed |
-| `openai/gpt-oss-120b` | `cerebras/fp16` | verified (DeepInfra excluded) |
+| `thinkingmachines/inkling` | `together` | verified, prompt rendering exact (tool call recovered from JSON; Together strips special tokens) |
+| `moonshotai/kimi-k2.6` | `crusoe/bf16` | verified, prompt rendering exact; `streamlake/fp8`, `parasail/int4`, `chutes/int4` prefill-probed (rendering not measured) |
+| `openai/gpt-oss-120b` | `cerebras/fp16` | experimental: our harmony rendering is ~50–420 tokens off Cerebras' own, so the fidelity check refuses it unless `max_prompt_token_gap` is raised (DeepInfra excluded) |
 
 Not supported: the claude_code engine (future work), closed models (OpenAI, Gemini,
 Anthropic: reasoning hidden/summarized/encrypted), Kimi K2-thinking, GLM-5.3, Qwen3 and

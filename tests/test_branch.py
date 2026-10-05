@@ -79,7 +79,7 @@ def test_unsupported_combinations_raise_clearly(engine, provider, model, order, 
 def test_supported_combination():
     assert check_branch_support("codex", "openrouter", "thinkingmachines/inkling", ["together"]).providers["together"] == "verified"
     assert check_branch_support("codex", "openrouter", "moonshotai/kimi-k2.6", ["crusoe/bf16"]).providers["crusoe/bf16"] == "verified"
-    assert check_branch_support("codex", "openrouter", "openai/gpt-oss-120b", ["cerebras/fp16"]).providers["cerebras/fp16"] == "verified"
+    assert check_branch_support("codex", "openrouter", "openai/gpt-oss-120b", ["cerebras/fp16"]).providers["cerebras/fp16"] == "experimental"
     with pytest.raises(BranchUnsupportedError, match="not verified"):
         check_branch_support("codex", "openrouter", "openai/gpt-oss-120b", ["deepinfra/bf16"])
 
@@ -133,8 +133,9 @@ def test_branch_sweep_validation():
 REASONING = "Look at the code. Actually, let me think about whether I can cheat. No, do it properly."
 
 
-def _sse_items(items):
+def _sse_items(items, input_tokens=100):
     evs = [{"type": "response.output_item.done", "output_index": i, "item": it} for i, it in enumerate(items)]
+    evs.append({"type": "response.completed", "response": {"usage": {"input_tokens": input_tokens}}})
     return "".join(f"data: {json.dumps(e)}\n\n" for e in evs)
 
 
@@ -187,7 +188,8 @@ def test_seed_locates_branch_step_and_arms(seed_run):
     assert seed.branch_step_id == 3 and seed.reset_tag == "_step_1_2" and seed.provider == "together"
     assert [s["step_id"] for s in seed.prefix_steps] == [1, 2]
     assert seed.prefix_steps[1]["reasoning_content"] == "first look"      # recovered for the judge
-    assert seed.prefix_for({"prefix_until": "Actually,"}) == "Look at the code. "
+    assert seed.prefix_for({"prefix_until": "Actually,"}) == "Look at the code."   # trailing space stripped
+    assert seed.prefix_for({"prefix_until": "Actually,", "append": " Wait.\n\n"}) == "Look at the code.  Wait."
     assert seed.prefix_for({"prefix_through": "cheat."}) == "Look at the code. Actually, let me think about whether I can cheat."
     assert seed.prefix_for({"full_original": True, "append": " Hmm."}) == REASONING + " Hmm."
     with pytest.raises(ValueError, match="not found"):
@@ -204,7 +206,7 @@ def test_splice_answers_first_request_and_forwards_later(seed_run, monkeypatch):
     new_cwd = "/tmp/ws/bbbbbbbbbbbb"
     calls = {}
 
-    def fake_render(req, spec, prefix, drop_past_reasoning=False):
+    def fake_render(req, spec, prefix, drop_past_reasoning=False, provider=None):
         calls["prefix"] = prefix
         return "PROMPT", 42
 
@@ -224,8 +226,66 @@ def test_splice_answers_first_request_and_forwards_later(seed_run, monkeypatch):
     assert splice.meta["action_parsed"] and calls == {"prefix": prefix, "provider": "together"}
     rec = parse_responses_sse(_write(run / "x.txt", sse.decode()), 1)
     assert rec.text == prefix + " carefully." and rec.n_actions == 1
+    assert splice.meta["n_attempts"] == 1
     later = {"input": req["input"] + [_m("developer", "p"), _m("user", RESUME_MARKER), {"type": "function_call_output", "output": "ok"}]}
     assert asyncio.run(splice(later, 2)) is None and RESUME_MARKER not in json.dumps(later)
+
+
+def _splice_with(seed_run, monkeypatch, texts, **req_extra):
+    from pipeline import branch
+    run, old_cwd = seed_run
+    seed = branch.Seed(run, 2)
+    seen = []
+
+    async def fake_complete(model, provider, prompt, api_key, **kw):
+        seen.append(kw)
+        return {"choices": [{"text": texts[min(len(seen), len(texts)) - 1], "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 42}}
+
+    monkeypatch.setattr(branch, "render_prompt", lambda *a, **k: ("PROMPT", 42))
+    monkeypatch.setattr(branch, "complete_raw", fake_complete)
+    splice = branch.BranchSplice(seed, "Look.", "/tmp/ws/bbbbbbbbbbbb", "key")
+    req = {"input": json.loads(json.dumps(seed.request["input"]).replace(old_cwd, "/tmp/ws/bbbbbbbbbbbb")), **req_extra}
+    asyncio.run(splice(req, 1))
+    return splice, seen
+
+
+GOOD = ' ok.exec_command{"name":"exec_command","args":{"cmd":"pytest"}}'
+
+
+def test_splice_resamples_unparsed_action(seed_run, monkeypatch):
+    splice, seen = _splice_with(seed_run, monkeypatch, [" I will run", GOOD])
+    assert splice.meta["n_attempts"] == 2 and splice.meta["action_parsed"] is True
+    assert [a["action_parsed"] for a in splice.meta["attempts"]] == [False, True]
+    assert splice.meta["tool_calls"][0]["name"] == "exec_command"
+
+
+def test_splice_gives_up_after_max_attempts(seed_run, monkeypatch):
+    splice, seen = _splice_with(seed_run, monkeypatch, [" no action"])
+    assert splice.meta["n_attempts"] == 3 and splice.meta["action_parsed"] is False and len(seen) == 3
+
+
+def test_splice_uses_request_sampling(seed_run, monkeypatch):
+    splice, seen = _splice_with(seed_run, monkeypatch, [GOOD], temperature=0.7, top_p=0.9,
+                                reasoning={"effort": "high"})
+    assert seen == [{"temperature": 0.7, "top_p": 0.9}]
+    assert splice.meta["sampling"] == {"reasoning_effort": "high", "temperature": 0.7, "top_p": 0.9}
+    assert splice.meta["sampling_matches_seed"] is False   # the fixture seed sent none
+
+
+def test_seed_fidelity_check(seed_run, monkeypatch):
+    from pipeline import branch
+    run, _ = seed_run
+    seed = branch.Seed(run, 2)
+    assert seed.provider_input_tokens == 100
+    monkeypatch.setattr(branch, "render_chat", lambda *a, **k: "X")
+    monkeypatch.setattr(branch, "count_tokens", lambda spec, text: 100)
+    assert seed.check_fidelity(0) == {"rendered_tokens": 100, "provider_tokens": 100, "gap": 0}
+    seed._fidelity = None
+    monkeypatch.setattr(branch, "count_tokens", lambda spec, text: 96)
+    with pytest.raises(BranchUnsupportedError, match="gap -4"):
+        seed.check_fidelity(0)
+    assert seed.check_fidelity(4)["gap"] == -4
 
 
 def test_full_diff_is_against_seed_baseline(seed_run, tmp_path):

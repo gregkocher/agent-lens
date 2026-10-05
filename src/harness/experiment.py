@@ -321,12 +321,15 @@ def _build_run_meta(
                 **({"judge_flagged": r.judge_flagged} if r.judge_verdict_count else {}),
                 **({"judge_early_exit": r.judge_early_exit} if r.judge_early_exit else {}),
                 **({"judge_verdict_count": r.judge_verdict_count} if r.judge_verdict_count else {}),
+                **({"sampling": r.sampling} if r.sampling else {}),
+                **({"codex_model_limits": r.codex_model_limits} if r.codex_model_limits else {}),
                 "error": r.error,
                 "started_at": r.started_at,
                 "finished_at": r.finished_at,
             }
             for r in results
         ],
+        "sampling": next((r.sampling for r in results if r.sampling), None),
         "started_at": results[0].started_at if results else None,
         "finished_at": results[-1].finished_at if results else None,
         "total_steps": sum(r.step_count for r in results),

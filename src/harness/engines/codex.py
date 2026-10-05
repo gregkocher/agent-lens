@@ -319,6 +319,20 @@ class CodexEngine(Engine):
         reasoning_summary = spec.extra.get("codex_reasoning_summary", "none")
         if reasoning_summary and reasoning_summary != "none":
             common += ["-c", f'model_reasoning_summary="{reasoning_summary}"']
+        overrides = [str(o) for o in spec.extra.get("codex_config_overrides") or []]
+
+        def overridden(key: str) -> bool:
+            return any(o.partition("=")[0].strip() == key for o in overrides)
+
+        effort = spec.extra.get("codex_reasoning_effort")
+        if effort and not overridden("model_reasoning_effort"):
+            common += ["-c", f'model_reasoning_effort="{effort}"']
+        # Real limits for models Codex has no profile for (harness.model_limits).
+        limits = spec.extra.get("codex_model_limits") or {}
+        if limits.get("context_window") and not overridden("model_context_window"):
+            common += ["-c", f"model_context_window={int(limits['context_window'])}"]
+        if limits.get("max_output_tokens") and not overridden("model_max_output_tokens"):
+            common += ["-c", f"model_max_output_tokens={int(limits['max_output_tokens'])}"]
         # Verbatim `-c key=value` overrides. Additive escape hatch for models Codex
         # ships no profile for (it otherwise guesses metadata and won't emit reasoning
         # summaries): e.g. model_supports_reasoning_summaries / model_context_window.

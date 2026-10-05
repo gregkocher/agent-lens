@@ -305,6 +305,11 @@ class BranchConfig(BaseModel):
     request: int = Field(ge=1)         # branch at this API request of session 1 (raw_dumps index)
     arms: dict[str, BranchArmConfig]
     provider: str | None = None        # default: the seed's provider_order[0]
+    # Our chat-template rendering of the seed's request k must match the provider's own
+    # rendering (its input token count) within this many tokens, else the sweep refuses.
+    max_prompt_token_gap: int = Field(default=0, ge=0)
+    # Re-sample the branch step when no action can be parsed from the continuation.
+    max_step_attempts: int = Field(default=3, ge=1)
 
 
 class IsolationConfig(BaseModel):

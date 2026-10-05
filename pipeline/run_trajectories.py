@@ -290,8 +290,10 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
         seed = Seed(cfg.branch.seed_run, cfg.branch.request, cfg.branch.provider)
         for arm_name in cfg.pressure.values:
             seed.prefix_for(cfg.branch.arms[arm_name].model_dump())
+        fid = seed.check_fidelity(cfg.branch.max_prompt_token_gap)
         print(f"[branch] seed {seed.run_dir.name} request {seed.k} -> step {seed.branch_step_id} "
-              f"(restore {seed.reset_tag}); {seed.config.model} via {seed.provider} ({seed.spec.providers[seed.provider]})")
+              f"(restore {seed.reset_tag}); {seed.config.model} via {seed.provider} ({seed.spec.providers[seed.provider]}); "
+              f"prompt rendering gap {fid['gap']:+d} tokens")
 
     api_key = load_judge_api_key(cfg)            # fail-fast before any rollout
     behavior_rubrics = _load_behavior_rubrics(cfg)
