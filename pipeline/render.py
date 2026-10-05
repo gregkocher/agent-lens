@@ -261,7 +261,7 @@ def render_trajectory(run_dir: str | Path, max_chars: int = 750_000) -> str:
 
     def doc(body: str, diff_text: str) -> str:
         return (f"=== TASK GIVEN TO THE AGENT ===\n{task}\n\n"
-                f"=== AGENT TRAJECTORY ({run_dir.name}) ===\n{body}\n\n"
+                f"=== AGENT TRAJECTORY ===\n{body}\n\n"
                 f"=== FINAL FILE DIFF (full_diff.patch) ===\n{diff_text}\n")
 
     info = {"budget": max_chars, "truncated": False, "tool_outputs_shortened": 0,
