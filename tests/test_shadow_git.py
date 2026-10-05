@@ -285,13 +285,32 @@ class TestBinarySafety:
         out = shadow_git.show_file("baseline", "blob.bin")   # must not raise
         assert out is not None                                # decoded with errors="replace"
 
-    def test_compiled_so_is_ignored_and_snapshot_survives(self, shadow_git_with_baseline,
-                                                          tmp_work_dir: Path):
+    def test_compiled_artifacts_are_tracked(self, shadow_git_with_baseline, tmp_work_dir: Path):
+        """Final-score reconstruction and branch restores need the built extension."""
         sg = shadow_git_with_baseline
-        # agent compiles an extension + writes its python wrapper
         (tmp_work_dir / "cache_ext.so").write_bytes(b"\xcf\x7fELF\x00\x01binary\xff")
+        (tmp_work_dir / "build" / "temp").mkdir(parents=True)
+        (tmp_work_dir / "build" / "temp" / "cache.o").write_bytes(b"\x7fELF\x00obj")
         (tmp_work_dir / "cache.py").write_text("print('ok')\n")
         sg.commit_snapshot("after")                          # must not raise on the binary
         tree = sg._git("ls-tree", "-r", "--name-only", "after").stdout
-        assert "cache.py" in tree                            # source tracked
-        assert "cache_ext.so" not in tree                    # binary ignored, not tracked
+        assert "cache.py" in tree
+        assert "cache_ext.so" in tree
+        assert "build/temp/cache.o" in tree
+        out = tmp_work_dir.parent / "restored"
+        sg.add_worktree(out, "after")
+        assert (out / "cache_ext.so").read_bytes() == b"\xcf\x7fELF\x00\x01binary\xff"
+
+    def test_binary_changed_names(self, shadow_git_with_baseline, tmp_work_dir: Path):
+        sg = shadow_git_with_baseline
+        (tmp_work_dir / "ext.so").write_bytes(b"\x00\x01\x02")
+        (tmp_work_dir / "a b.txt").write_text("text\n")
+        assert set(sg.diff_working_names()) == {"ext.so", "a b.txt"}
+        assert sg.binary_changed_names() == {"ext.so"}
+
+    def test_rename_reports_both_paths(self, shadow_git_with_baseline, tmp_work_dir: Path):
+        sg = shadow_git_with_baseline
+        (tmp_work_dir / "old_name.py").write_text("x = 1\n" * 20)
+        sg.commit_snapshot("s1")
+        (tmp_work_dir / "old_name.py").rename(tmp_work_dir / "new_name.py")
+        assert set(sg.diff_working_names()) == {"old_name.py", "new_name.py"}

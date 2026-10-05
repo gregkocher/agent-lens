@@ -15,7 +15,9 @@ Outputs:
 
 Limitations: files matched by the shadow git exclude list (src/harness/shadow_git.py
 DEFAULT_IGNORE — __pycache__, .venv, outputs/, *.pt, ...) were never tracked and so
-are absent from the reconstruction; compiled *.so artifacts ARE tracked. A run whose
+are absent from the reconstruction. Compiled artifacts (*.so, *.o, build/) are tracked
+since 2026-10-05; runs recorded before that lack them, so C-extension solutions from
+those runs score command_failed (the module is missing). A run whose
 score depends on an excluded file will report command_failed — inspect raw_output.
 """
 

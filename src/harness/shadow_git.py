@@ -17,13 +17,16 @@ __all__ = ["ShadowGit"]
 
 logger = logging.getLogger(__name__)
 
-# Files/dirs to exclude from tracking
 # The work tree may be owned by an isolated agent user (harness.isolation) while the
 # shadow repo is driven by the orchestrator; git >= 2.35.2 refuses that ("dubious
 # ownership") unless the path is marked safe. Passed via env so no global config changes.
 _SAFE_DIRECTORY = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory",
                    "GIT_CONFIG_VALUE_0": "*"}
 
+# Files/dirs to exclude from tracking. Compiled artifacts (*.so, *.o, build/, ...) are
+# deliberately TRACKED: final-score reconstruction and branch/replay restores must see
+# the extension modules an agent built, or scoring fails and restored workspaces differ
+# from what the agent left behind. Binary content is kept out of write events (state.py).
 DEFAULT_IGNORE = """\
 .git
 __pycache__
@@ -43,11 +46,6 @@ data
 *.jpg
 *.npy
 *.npz
-*.so
-*.o
-*.dylib
-*.pyd
-build
 *.egg-info
 .pytest_cache
 """
@@ -69,6 +67,7 @@ class ShadowGit:
         "-c", "tag.gpgsign=false",
         "-c", "user.name=agentlens-shadow",
         "-c", "user.email=shadow@agentlens.local",
+        "-c", "core.quotePath=false",  # raw UTF-8 path names, consistent with -z output
     ]
 
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -88,7 +87,7 @@ class ShadowGit:
             # Decode as text but never crash on binary output: `git show HEAD:<file>`
             # on a compiled artifact (e.g. a Cython/C .so the agent built) emits raw
             # bytes that strict UTF-8 would reject. errors="replace" keeps write-tracking
-            # alive; such binaries are also excluded via DEFAULT_IGNORE below.
+            # alive; binary write events are recorded as placeholders (state.py).
             encoding="utf-8",
             errors="replace",
             timeout=120,
@@ -155,8 +154,23 @@ class ShadowGit:
     def diff_working_names(self) -> list[str]:
         """Get list of changed files in working tree (uncommitted)."""
         self._git("add", "-A")
-        result = self._git("diff", "--cached", "--name-only", check=False)
+        # --no-renames: a rename is reported as delete + add, so both paths get events
+        result = self._git("diff", "--cached", "--no-renames", "--name-only", check=False)
         return [f for f in result.stdout.strip().splitlines() if f]
+
+    def binary_changed_names(self) -> set[str]:
+        """Staged paths git treats as binary (numstat reports ``-  -`` for them)."""
+        result = self._git("diff", "--cached", "--no-renames", "--numstat", "-z", check=False)
+        out: set[str] = set()
+        for rec in result.stdout.split("\0"):
+            parts = rec.split("\t", 2)
+            if len(parts) == 3 and parts[0] == "-" and parts[1] == "-":
+                out.add(parts[2])
+        return out
+
+    def blob_size(self, ref: str, path: str) -> int | None:
+        result = self._git("cat-file", "-s", f"{ref}:{path}", check=False)
+        return int(result.stdout.strip()) if result.returncode == 0 else None
 
     def show_file(self, ref: str, path: str) -> str | None:
         """Get file content at a specific ref. Returns None if not found."""

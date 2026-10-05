@@ -152,3 +152,20 @@ class TestSaveChangelog:
         out = tmp_path / "deep" / "nested" / "changelog.jsonl"
         sm.save_changelog(out)
         assert out.exists()
+
+
+class TestBinaryWriteEvents:
+    def test_binary_write_recorded_as_placeholder(self, tmp_work_dir: Path, shadow_git_with_baseline):
+        sm = StateManager(work_dir=tmp_work_dir, shadow_git=shadow_git_with_baseline)
+        (tmp_work_dir / "ext.so").write_bytes(b"\x7fELF\x00" + b"\xff" * 95)
+        [ev] = sm.check_for_writes(1, 1)
+        assert ev.file_path == "ext.so"
+        assert ev.content_before == ""
+        assert ev.content_after == "[binary file: 100 bytes]"
+        (tmp_work_dir / "ext.so").write_bytes(b"\x7fELF\x00" + b"\xfe" * 10)
+        [ev] = sm.check_for_writes(1, 2)
+        assert ev.content_before == "[binary file: 100 bytes]"
+        assert ev.content_after == "[binary file: 15 bytes]"
+        (tmp_work_dir / "ext.so").unlink()
+        [ev] = sm.check_for_writes(1, 3)
+        assert ev.content_after == ""

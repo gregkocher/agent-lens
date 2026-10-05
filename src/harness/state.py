@@ -80,9 +80,21 @@ class StateManager:
         if not changed_files:
             return []
 
+        binary = self.shadow_git.binary_changed_names()
         new_events: list[WriteEvent] = []
         for file_path in changed_files:
             full_path = self.work_dir / file_path
+
+            if file_path in binary:
+                # Compiled artifacts etc.: content lives in the shadow git; the event
+                # only records that the file changed (and its sizes).
+                size_before = self.shadow_git.blob_size("HEAD", file_path)
+                before = "" if size_before is None else f"[binary file: {size_before} bytes]"
+                after = (f"[binary file: {full_path.stat().st_size} bytes]"
+                         if full_path.exists() else "")
+                event = self._create_write_event(session_index, step_id, file_path, before, after)
+                new_events.append(event)
+                continue
 
             # Get content before (from git index / HEAD)
             before = self.shadow_git.show_file("HEAD", file_path)
