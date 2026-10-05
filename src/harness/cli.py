@@ -136,6 +136,50 @@ def collect(
     typer.echo(f"\nDone: {ok}/{len(files)} ingested into {runs_dir}/")
 
 
+@app.command(name="branch-points")
+def branch_points(
+    run_dir: Annotated[Path, typer.Argument(help="Run directory (pipeline trajectory dir or harness run dir)")],
+    grep: Annotated[Optional[str], typer.Option(help="Only requests whose reasoning contains this text")] = None,
+    width: Annotated[int, typer.Option(help="Preview width")] = 160,
+) -> None:
+    """List a run's model requests you can branch from (pipeline `branch:` sweeps).
+
+    For each API request of session 1: the trajectory step it produced, the kind of
+    reasoning (raw / summary / encrypted) and a preview; with --grep, the matching text
+    in context. Also says whether this run's model/provider supports branch rollouts.
+    """
+    from harness.config import load_config
+    from harness.prefill import BranchUnsupportedError, check_branch_support
+    from harness.reasoning_capture import attach_reasoning, records_from_raw_dumps
+
+    session = run_dir / "session_01"
+    cfg = load_config(run_dir / "config.yaml")
+    try:
+        spec = check_branch_support(cfg.engine, cfg.provider, cfg.model, cfg.provider_order)
+        typer.echo(f"{cfg.model} via {cfg.provider_order[0]}: branch rollouts supported "
+                   f"({spec.providers[cfg.provider_order[0]]})")
+    except BranchUnsupportedError as e:
+        typer.echo(f"NOT branchable as is: {e}")
+    records = records_from_raw_dumps(session)
+    steps = json.loads((session / "trajectory.json").read_text()).get("steps") or []
+    where = attach_reasoning(json.loads(json.dumps(steps)), records)["record_steps"]
+    shown = 0
+    for r in records:
+        text = r.text
+        if grep:
+            i = text.find(grep)
+            if i < 0:
+                continue
+            lo = max(0, i - width // 2)
+            preview = ("…" if lo else "") + text[lo:i + len(grep) + width // 2].replace("\n", " ") + "…"
+        else:
+            preview = text[:width].replace("\n", " ")
+        typer.echo(f"request {r.request_index:3d}  step {str(where.get(r.request_index, '-')):>4}  "
+                   f"[{r.kind or 'none'}]  {preview}")
+        shown += 1
+    typer.echo(f"{shown} request(s)" + (f" matching {grep!r}" if grep else ""))
+
+
 @app.command(name="list")
 def list_runs(
     runs_dir: Annotated[Path, typer.Option(help="Runs directory")] = Path("runs"),

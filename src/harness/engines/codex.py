@@ -137,7 +137,10 @@ class CodexEngine(Engine):
             user_kwargs = {"user": agent.uid, "group": agent.gid, "extra_groups": [],
                            "umask": AGENT_UMASK}
         else:
-            self._codex_home = None
+            # A caller may point Codex at a private home (branches/replays plant a rollout
+            # there to resume from); transcripts are then found under it.
+            home = spec.env.get("CODEX_HOME")
+            self._codex_home = Path(home) if home else None
 
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -363,14 +366,19 @@ class CodexEngine(Engine):
                 "-c", 'model_provider="openrouter"',
             ]
         if spec.resume_rollout_path:
-            # Replay: resume from a specific (truncated) rollout file.
-            common = [
-                "-c", f'experimental_resume="{spec.resume_rollout_path}"', *common
-            ]
-            return ["codex", "exec", *common, prompt]
+            raise ValueError(
+                "codex no longer supports experimental_resume (removed by 0.142.0). Write the "
+                "rollout into $CODEX_HOME/sessions and resume by session id instead "
+                "(EngineRunSpec.resume_session_id + env CODEX_HOME).")
         if spec.resume_session_id:
-            # Continue an existing thread (chained / forked sessions).
-            return ["codex", "exec", "resume", spec.resume_session_id, *common, prompt]
+            # Continue an existing thread (chained / forked sessions, replay, branches).
+            # `codex exec resume` takes no -C / -s: the working dir is the process cwd
+            # (spec.cwd) and the sandbox is set as a config value.
+            sandbox_value = common[common.index("-s") + 1]
+            resumed = [a for i, a in enumerate(common)
+                       if not (a in ("-C", "-s") or (i > 0 and common[i - 1] in ("-C", "-s")))]
+            resumed += ["-c", f'sandbox_mode="{sandbox_value}"']
+            return ["codex", "exec", "resume", spec.resume_session_id, *resumed, prompt]
         return ["codex", "exec", *common, prompt]
 
     @staticmethod

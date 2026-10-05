@@ -217,6 +217,14 @@ PRESSURE_VARS: dict[str, PressureVar] = {
         axis_label="rollout token budget", tag="k", short="tokens", fractional=True,
         fraction_axis_label="fraction of token budget used (output tokens so far / limit)",
         tick_prefix=""),
+    "branch_arm": PressureVar(
+        # Branch rollouts (pipeline/branch.py): the arms are edits of one seed step's
+        # reasoning; values are arm KEYS of SweepConfig.branch.arms. Codex + open models only
+        # (harness.prefill.SUPPORTED). Categorical, so fractional=False.
+        name="branch_arm", runconfig_field="__branch_arm__",
+        engines=frozenset({"codex"}), realized_metric="num_turns",
+        axis_label="branch arm", tag="a", short="arm", fractional=False,
+        fraction_axis_label="", tick_prefix=""),
     "prompt_variant": PressureVar(
         # Sweep the USER PROMPT WORDING instead of a resource cap. Values are variant KEYS
         # (strings); the exact prompt text for each lives in SweepConfig.prompt_variants and
@@ -271,6 +279,34 @@ def check_pressure_engine_compat(pressure: PressureConfig, engine: str) -> None:
             f"for claude_code use budget_usd or max_turns.")
 
 
+class BranchArmConfig(BaseModel):
+    """How one arm edits the branch step's reasoning (exactly one base, + optional append).
+    The model continues from the resulting prefix."""
+
+    prefix: str | None = None          # literal reasoning prefix
+    prefix_until: str | None = None    # original reasoning up to (excluding) this text
+    prefix_through: str | None = None  # original reasoning up to (including) this text
+    full_original: bool = False        # the whole original reasoning (null branch / control)
+    append: str = ""                   # text added after the prefix (e.g. an inserted sentence)
+    history_replace: list[dict[str, str]] = Field(default_factory=list)  # [{old, new}] in earlier items
+
+    @model_validator(mode="after")
+    def _one_base(self):
+        n = sum(x is not None for x in (self.prefix, self.prefix_until, self.prefix_through)) + int(self.full_original)
+        if n != 1:
+            raise ValueError("a branch arm needs exactly one of: prefix, prefix_until, prefix_through, full_original")
+        return self
+
+
+class BranchConfig(BaseModel):
+    """Branch rollouts from one seed run (pipeline/branch.py)."""
+
+    seed_run: str                      # seed run dir (pipeline trajectory dir or harness run dir)
+    request: int = Field(ge=1)         # branch at this API request of session 1 (raw_dumps index)
+    arms: dict[str, BranchArmConfig]
+    provider: str | None = None        # default: the seed's provider_order[0]
+
+
 class IsolationConfig(BaseModel):
     """Per-run OS isolation (harness.isolation). Takes effect only on Linux as root
     (RunPod); elsewhere it is skipped with a warning and runs behave as before."""
@@ -299,6 +335,7 @@ class SweepConfig(BaseModel):
     # the agent sees its cwd (pwd, and the engines inject it into context), so a path like
     # pipeline_runs/<experiment>/work_dirs/bp_<arm>_r1 would leak the condition.
     work_root: str = "/tmp/ws"
+    branch: BranchConfig | None = None
     isolation: IsolationConfig = Field(default_factory=IsolationConfig)
     realism: RealismConfig = Field(default_factory=RealismConfig)
 
@@ -357,6 +394,18 @@ class SweepConfig(BaseModel):
                     f"for: {missing} (keys present: {sorted(self.prompt_variants)}).")
         elif self.prompt_variants:
             raise ValueError("prompt_variants is only valid with pressure.variable: prompt_variant")
+        return self
+
+    @model_validator(mode="after")
+    def _check_branch(self) -> "SweepConfig":
+        if self.pressure.variable == "branch_arm":
+            if self.branch is None:
+                raise ValueError("pressure.variable 'branch_arm' needs a branch: section (seed_run, request, arms)")
+            missing = [v for v in self.pressure.values if v not in self.branch.arms]
+            if missing:
+                raise ValueError(f"branch.arms has no arm named {missing} (arms: {sorted(self.branch.arms)})")
+        elif self.branch is not None:
+            raise ValueError("a branch: section requires pressure.variable: branch_arm")
         return self
 
     @field_validator("n_reps", "n_trajectory_workers")

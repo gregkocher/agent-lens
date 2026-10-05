@@ -25,9 +25,11 @@ from harness.isolation import (hand_over_work_dir, install_claude_launcher,
 
 from pipeline.config import (SweepConfig, check_pressure_engine_compat,
                              run_name_for)
+from pipeline.branch import Seed, run_branch
 from pipeline.workspace import UserPool, seed_git_history
 
 FINGERPRINT_FILE = ".pipeline_fingerprint"
+
 _SIG_SKIP = {"__pycache__", ".git", ".shadow_git", "node_modules"}
 # Max wall-clock per trajectory. Catches wedged sessions (a hung SDK/network wait on an
 # uncapped run can otherwise block the whole gather indefinitely); generous enough not to
@@ -86,6 +88,8 @@ def _build_run_config(cfg: SweepConfig, base_cfg, value, rep: int, work_dir: Pat
     run_config.run_name = run_name_for(pvar, value, rep)
     if pvar.name == "prompt_variant":                  # swap the user prompt, not a resource cap
         run_config.sessions[0].prompt = cfg.prompt_variants[value]
+    elif pvar.name == "branch_arm":                    # applied by pipeline.branch.run_branch
+        pass
     else:
         setattr(run_config, pvar.runconfig_field, value)   # apply the swept pressure
     run_config.work_dir = str(work_dir)
@@ -172,7 +176,10 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, s
     work_dir = cfg.work_dir_for(run_name).resolve()
 
     run_config = _build_run_config(cfg, base_cfg, value, rep, work_dir)
-    fp = _fingerprint_config(run_config, base_sig)
+    sig = base_sig if cfg.branch is None else base_sig + json.dumps(
+        {"seed": cfg.branch.seed_run, "k": cfg.branch.request, "provider": cfg.branch.provider,
+         "arm": cfg.branch.arms[value].model_dump()}, sort_keys=True)
+    fp = _fingerprint_config(run_config, sig)
     fp_path = run_dir / FINGERPRINT_FILE
 
     # Resume only when complete AND the effective config is unchanged.
@@ -195,25 +202,30 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, s
                 _chmod_writable(work_dir)  # a prior read-only copy must be removable
                 shutil.rmtree(work_dir, ignore_errors=True)
             work_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(cfg.base_work_dir, work_dir)
-            # The base repo is kept READ-ONLY so agents can't pollute it (they sometimes
-            # cd into it and build there under bypassPermissions). copytree inherits those
-            # perms, so restore write on the agent's private copy.
-            _chmod_writable(work_dir)
-            if cfg.realism.seed_git_history:
-                seed_git_history(work_dir, cfg.realism.git_author)
-            if pool is not None:
-                # Own unprivileged user + exclusive ownership of the work dir.
-                agent_user = pool.acquire()
-                hand_over_work_dir(work_dir, agent_user)
-                run_config.run_as_user = agent_user.name
+            if cfg.branch is not None:
+                # Branch rollout: work dir restored from the seed, Codex resumed mid-run.
+                work_dir.mkdir()
+                if pool is not None:
+                    agent_user = pool.acquire()
+                run_coro = run_branch(cfg, base_cfg, value, rep, run_dir, work_dir, agent_user)
+            else:
+                shutil.copytree(cfg.base_work_dir, work_dir)
+                # The base repo is kept READ-ONLY so agents can't pollute it (they sometimes
+                # cd into it and build there under bypassPermissions). copytree inherits those
+                # perms, so restore write on the agent's private copy.
+                _chmod_writable(work_dir)
+                if cfg.realism.seed_git_history:
+                    seed_git_history(work_dir, cfg.realism.git_author)
+                if pool is not None:
+                    # Own unprivileged user + exclusive ownership of the work dir.
+                    agent_user = pool.acquire()
+                    hand_over_work_dir(work_dir, agent_user)
+                    run_config.run_as_user = agent_user.name
+                run_coro = run_experiment(run_config, output_base=cfg.trajectories_dir)
             # Wall-clock guard: a single wedged session (e.g. a stuck SDK/network wait on
             # an uncapped run) must never block the whole sweep's gather. Generous so
             # genuinely long unlimited runs aren't killed.
-            await asyncio.wait_for(
-                run_experiment(run_config, output_base=cfg.trajectories_dir),
-                timeout=RUN_WALL_TIMEOUT_S,
-            )
+            await asyncio.wait_for(run_coro, timeout=RUN_WALL_TIMEOUT_S)
         except asyncio.TimeoutError:
             status, error = "error", f"wall-clock timeout after {RUN_WALL_TIMEOUT_S}s"
             print(f"[FAIL] {run_name}: wall-clock timeout ({RUN_WALL_TIMEOUT_S}s)")
@@ -274,6 +286,12 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
     check_pressure_engine_compat(cfg.pressure, base_cfg.engine)  # fail-fast on bad combo
     base_sig = dir_signature(cfg.base_work_dir)  # computed once; captures repo edits
     pool = setup_isolation(cfg, base_cfg.engine)
+    if cfg.branch is not None:   # fail fast: unsupported model/provider/engine, bad arms
+        seed = Seed(cfg.branch.seed_run, cfg.branch.request, cfg.branch.provider)
+        for arm_name in cfg.pressure.values:
+            seed.prefix_for(cfg.branch.arms[arm_name].model_dump())
+        print(f"[branch] seed {seed.run_dir.name} request {seed.k} -> step {seed.branch_step_id} "
+              f"(restore {seed.reset_tag}); {seed.config.model} via {seed.provider} ({seed.spec.providers[seed.provider]})")
 
     api_key = load_judge_api_key(cfg)            # fail-fast before any rollout
     behavior_rubrics = _load_behavior_rubrics(cfg)

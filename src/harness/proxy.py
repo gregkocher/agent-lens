@@ -169,7 +169,11 @@ class CaptureProxy:
     OpenAI Responses API (Codex engine), detected per-request by path.
     """
 
-    def __init__(self, raw_dump_count: int = 0, inject: dict | None = None) -> None:
+    def __init__(self, raw_dump_count: int = 0, inject: dict | None = None, intercept=None) -> None:
+        # Optional async ``intercept(request_data, request_index) -> bytes | None``: may edit
+        # the request in place (forwarded as edited) or answer it itself by returning a
+        # full SSE response body, in which case upstream is not called (branch rollouts).
+        self._intercept = intercept
         # Top-level fields set on every API request body (e.g. OpenRouter's
         # ``provider`` routing object, so a run is pinned to one provider).
         self._inject = dict(inject or {})
@@ -262,6 +266,12 @@ class CaptureProxy:
                         "Request carries server-side tool(s) %s: on OpenRouter these make "
                         "prior reasoning get dropped from the request", sorted(server))
                 self.server_tools_seen |= server
+                if self._intercept is not None:
+                    answered = await self._intercept(request_data, request_index)
+                    body = json.dumps(request_data).encode()
+                    if answered is not None:
+                        return await self._answer_locally(
+                            request, request_data, body, answered, api_format, request_index, t0)
                 effort = os.environ.get("AGENTLENS_INJECT_REASONING")
                 if (
                     effort
@@ -377,6 +387,25 @@ class CaptureProxy:
                     logger.info("Raw dump saved: request/response %d", idx)
 
                 return response
+
+    async def _answer_locally(self, request: web.Request, request_data: dict, body: bytes,
+                              answer: bytes, api_format: str | None, request_index: int,
+                              t0: float) -> web.Response:
+        """Return an intercept-provided response, captured exactly like a forwarded one."""
+        meta = (_parse_openai_responses_sse(answer) if api_format == "openai_responses"
+                else _parse_sse_response(answer))
+        self._log_exchange(request_data, meta, api_format, request_index, status_code=200,
+                           latency_ms=round((time.perf_counter() - t0) * 1000, 1))
+        if self._log_path and self._raw_dump_count and request_index <= self._raw_dump_count:
+            raw_dir = self._log_path.parent / "raw_dumps"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            (raw_dir / f"request_{request_index:03d}.json").write_bytes(body)
+            (raw_dir / f"request_{request_index:03d}_headers.json").write_text(json.dumps(
+                {"method": request.method, "path": request.path, "target": "local:intercept"}, indent=2))
+            (raw_dir / f"response_{request_index:03d}.txt").write_bytes(answer)
+            (raw_dir / f"response_{request_index:03d}_headers.json").write_text(json.dumps(
+                {"status": 200, "headers": {"content-type": "text/event-stream"}}, indent=2))
+        return web.Response(body=answer, content_type="text/event-stream")
 
     def _log_exchange(
         self,

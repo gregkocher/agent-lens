@@ -316,7 +316,8 @@ def attach_reasoning(steps: list[dict], records: list[ResponseRecord], window: i
     next matched step so no reasoning is dropped). Steps that already have reasoning from
     the engine stream keep it. Mutates ``steps``; returns coverage stats."""
     stats = {"records": len(records), "with_reasoning": sum(1 for r in records if r.reasoning),
-             "attached": 0, "steps_filled": 0, "kinds": {}, "unmatched_records": 0}
+             "attached": 0, "steps_filled": 0, "kinds": {}, "unmatched_records": 0,
+             "record_steps": {}}  # request_index -> step_id of the response's first action
     # Reasoning the engine stream already carried (e.g. Claude Code emits thinking as its
     # own step before the tool-call step): never copy it a second time.
     stats["_present"] = {_norm(s.get("reasoning_content") or "")[:400] for s in steps if s.get("reasoning_content")}
@@ -332,6 +333,7 @@ def attach_reasoning(steps: list[dict], records: list[ResponseRecord], window: i
         if j is None:
             continue
         group = records[p:j + 1]
+        stats["record_steps"][records[j].request_index] = step.get("step_id")
         p = j + 1
         used = 1
         _apply(step, group, stats)

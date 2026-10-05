@@ -74,7 +74,7 @@ def seed_git_history(work_dir: Path, author: str, now: datetime | None = None) -
                GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
 
     def git(*args: str, **extra: str) -> None:
-        subprocess.run(["git", *args], cwd=work_dir, env={**env, **extra}, check=True,
+        subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=work_dir, env={**env, **extra}, check=True,
                        capture_output=True, text=True)
 
     git("init", "-q")

@@ -108,6 +108,14 @@ def work_dir_hint(run_config: RunConfig, cwd: str) -> str | None:
     )
 
 
+def _is_startup_notice(step: dict) -> bool:
+    """An engine notice step (Codex emits its warnings as an ``error`` pseudo tool call),
+    not a model action."""
+    tcs = step.get("tool_calls") or []
+    return (step.get("source") == "agent" and bool(tcs) and all(tc.get("function_name") == "error" for tc in tcs)
+            and not (step.get("message") or "").strip() and not step.get("reasoning_content"))
+
+
 async def run_session(
     session_config: SessionConfig,
     run_config: RunConfig,
@@ -118,8 +126,18 @@ async def run_session(
     prompt_override: str | AsyncIterable[dict[str, Any]] | None = None,
     cwd_override: str | None = None,
     resume_rollout_path: str | None = None,
+    proxy_intercept=None,
+    step_offset: int = 0,
+    prefix_steps: list[dict] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> SessionResult:
-    """Run a single agent session and save outputs."""
+    """Run a single agent session and save outputs.
+
+    Branch rollouts (pipeline.branch) additionally pass: ``proxy_intercept`` (edits /
+    answers API requests in the capture proxy), ``step_offset`` + ``prefix_steps`` (the
+    seed's steps before the branch point, so the saved trajectory is the FULL trajectory
+    with continuous step ids), and ``extra_env`` (e.g. a private CODEX_HOME to resume from).
+    """
     started_at = datetime.now(timezone.utc).isoformat()
     session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,7 +165,24 @@ async def run_session(
         capture_subagents=capture_subagents,
     )
 
+    def full_steps(traj_dict: dict) -> tuple[list[dict], dict[int, int]]:
+        """Session steps as saved, plus {session step id: saved step id}. For branch
+        rollouts the seed's ``prefix_steps`` are prepended and the session's steps follow
+        with continuous ids; the engine's start-up notices on resume (e.g. Codex's
+        model-metadata warning, already present in the prefix) are dropped so the splice
+        leaves no seam. ATIF requires ids from 1 while building, hence post hoc."""
+        steps = list(traj_dict.get("steps") or [])
+        if prefix_steps:
+            while steps and _is_startup_notice(steps[0]):
+                steps.pop(0)
+        id_map: dict[int, int] = {}
+        for i, st in enumerate(steps, start=step_offset + 1):
+            id_map[st.get("step_id", 0)] = i
+            st["step_id"] = i
+        return list(prefix_steps or []) + steps, id_map
+
     provider_env = build_provider_env(run_config)
+    provider_env.update(extra_env or {})
 
     setting_sources = None
     if run_config.load_project_settings:
@@ -182,14 +217,14 @@ async def run_session(
             from harness.engines.codex import codex_upstream
 
             upstream_base, _, _ = codex_upstream(run_config.provider, run_config.base_url)
-            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject)
+            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject, intercept=proxy_intercept)
             port = await proxy.start(upstream_base, session_dir / "api_captures.jsonl")
             # Codex appends `/responses` to its provider base_url; the proxy
             # forwards that path onto the resolved upstream base.
             capture_base_url = f"http://127.0.0.1:{port}"
         else:
             target_url = get_target_url(run_config.provider, run_config.base_url)
-            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject)
+            proxy = CaptureProxy(raw_dump_count=9999, inject=proxy_inject, intercept=proxy_intercept)
             port = await proxy.start(target_url, session_dir / "api_captures.jsonl")
             provider_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
 
@@ -292,7 +327,7 @@ async def run_session(
                     with contextlib.suppress(Exception):
                         enrich_trajectory_reasoning(snap, session_dir, run_config.engine, run_config.model)
                     transcript_text, render_info = render_trajectory_with_info(
-                        snap.get("steps") or [],
+                        full_steps(snap)[0],
                         include_reasoning=run_config.judge.include_reasoning,
                         max_chars=run_config.judge.max_input_chars,
                     )
@@ -410,6 +445,9 @@ async def run_session(
             (session_dir / "reasoning_capture.json").write_text(json.dumps(stats, indent=2))
         except Exception:
             logger.exception("Reasoning enrichment failed; saving trajectory without it")
+        if prefix_steps or step_offset:
+            traj_dict["steps"], id_map = full_steps(traj_dict)
+            (session_dir / "step_id_map.json").write_text(json.dumps(id_map))
         traj_path = session_dir / "trajectory.json"
         with open(traj_path, "w") as f:
             json.dump(traj_dict, f, indent=2)
