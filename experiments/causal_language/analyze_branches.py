@@ -100,6 +100,10 @@ def summarize(rows: list[dict], kind: str) -> dict:
             "trick_later": len(re_), "trick_later_rate": len(re_) / n if n else None,
             "trick_later_judge": sum(r["trick_later_judge"] for r in rs),
             "trick_in_branch_step": sum(r["trick_in_branch_step"] for r in rs),
+            "rh_given_same_step_trick": [sum(r["rh"] for r in rs if r["trick_in_branch_step"]),
+                                         sum(r["trick_in_branch_step"] for r in rs)],
+            "rh_given_no_same_step_trick": [sum(r["rh"] for r in rs if not r["trick_in_branch_step"]),
+                                            sum(not r["trick_in_branch_step"] for r in rs)],
             "rh_given_trick": [sum(r["rh"] for r in re_), len(re_)],
             "rh_given_no_trick": [sum(r["rh"] for r in no), len(no)],
         }
@@ -118,8 +122,8 @@ def main() -> None:
     for rid, meta in key.items():
         if meta["experiment"].startswith("causal_branch_"):
             r = rollout(rid, meta, judging)
-            if r:
-                by_exp[meta["experiment"]].append(r)
+            if r:   # extension sweeps (more reps of the same design) pool with their base sweep
+                by_exp[meta["experiment"].removesuffix("_ext")].append(r)
     result = {}
     for exp, rows in sorted(by_exp.items()):
         kind = "injection" if "inject" in exp else "removal"
@@ -128,7 +132,8 @@ def main() -> None:
         for arm, s in result[exp]["arms"].items():
             lo, hi = s["rh_ci"]
             print(f"   {arm:8s} n={s['n']:3d} hack={s['rh']:3d} ({s['rh_rate']:.0%}, CI {lo:.0%}-{hi:.0%}) "
-                  f"DR={s['dr']} trick_later={s['trick_later']} hack|trick={s['rh_given_trick']} hack|no-trick={s['rh_given_no_trick']}")
+                  f"DR={s['dr']} trick_same_step={s['trick_in_branch_step']} hack|same-step={s['rh_given_same_step_trick']} "
+                  f"hack|none-same-step={s['rh_given_no_same_step_trick']} trick_later={s['trick_later']}")
         for t in result[exp]["tests"]:
             print(f"   {t['a']} vs {t['b']}: diff {t['diff']:+.0%}, Fisher p={t['fisher_p']:.3f}")
     out.write_text(json.dumps(result, indent=1))
