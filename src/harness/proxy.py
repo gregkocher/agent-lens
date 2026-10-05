@@ -11,10 +11,12 @@ Sits between the Claude Agent SDK and the real API to capture:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -176,6 +178,29 @@ def apply_sampling(request_data: dict, sampling: dict) -> None:
             request_data["reasoning"] = r
 
 
+_RETRY_STATUSES = {429, 503}
+_MAX_UPSTREAM_RETRIES = 30
+
+
+def _retry_wait(body: bytes, headers, attempt: int) -> float:
+    """Seconds to wait before retrying a throttled request: the provider's hint if any
+    (OpenRouter's metadata.retry_after_seconds or a Retry-After header), else exponential
+    backoff; capped at 60 s, with jitter so concurrent runs don't retry in lockstep."""
+    hint = None
+    try:
+        meta = (json.loads(body or b"{}").get("error") or {}).get("metadata") or {}
+        hint = meta.get("retry_after_seconds")
+    except Exception:
+        pass
+    if hint is None:
+        try:
+            hint = float(headers.get("Retry-After"))
+        except (TypeError, ValueError):
+            hint = None
+    base = max(float(hint or 0), min(60.0, 2.0 ** attempt))
+    return min(60.0, base) * random.uniform(1.0, 1.5)
+
+
 class CaptureProxy:
     """Reverse proxy that logs API request/response metadata to JSONL.
 
@@ -200,6 +225,8 @@ class CaptureProxy:
         # Server-side tool types seen in requests. On OpenRouter a server tool in the
         # tool list makes it drop all prior reasoning items, so this is surfaced.
         self.server_tools_seen: set[str] = set()
+        # Throttled upstream responses retried by the proxy (see _RETRY_STATUSES).
+        self.upstream_retries = 0
         self._target_url: str = ""
         self._log_path: Path | None = None
         self._site: web.TCPSite | None = None
@@ -321,9 +348,23 @@ class CaptureProxy:
         )
 
         async with ClientSession() as session:
-            async with session.request(
-                request.method, target, headers=headers, data=body
-            ) as resp:
+            # Transient upstream throttling (e.g. OpenRouter's "temporarily rate-limited
+            # upstream" 429 from a provider's shared pool) is retried HERE, invisibly to
+            # the agent: the engine's own few retries would otherwise give up and truncate
+            # the run. Only the final response is passed through and recorded.
+            retries = 0
+            while True:
+                resp = await session.request(request.method, target, headers=headers, data=body)
+                if resp.status not in _RETRY_STATUSES or retries >= _MAX_UPSTREAM_RETRIES:
+                    break
+                wait = _retry_wait(await resp.read(), resp.headers, retries)
+                resp.release()
+                retries += 1
+                logger.warning("upstream %s on request %s; retry %d in %.1fs",
+                               resp.status, request_index, retries, wait)
+                await asyncio.sleep(wait)
+            self.upstream_retries += retries
+            async with resp:
                 # Build response, preserving status and safe headers
                 response = web.StreamResponse(status=resp.status)
                 for k, v in resp.headers.items():
@@ -369,6 +410,7 @@ class CaptureProxy:
                             request_data, response_meta, api_format, request_index,
                             status_code=resp.status,
                             latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+                            upstream_retries=retries,
                         )
                     except Exception:
                         logger.exception("Failed to log API exchange")
@@ -438,6 +480,7 @@ class CaptureProxy:
         request_index: int | None = None,
         status_code: int | None = None,
         latency_ms: float | None = None,
+        upstream_retries: int = 0,
     ) -> None:
         """Log combined request + response metadata to JSONL.
 
@@ -508,6 +551,8 @@ class CaptureProxy:
             },
             "message_count": message_count,
         }
+        if upstream_retries:
+            entry["upstream_retries"] = upstream_retries
 
         # System prompt: full on first appearance, hash-only on repeat
         if system_hash not in self._seen_system_hashes:
