@@ -46,14 +46,16 @@ def fisher_two_sided(a: int, b: int, c: int, d: int) -> float:
 def rollout(rid: str, meta: dict, judging: Path) -> dict | None:
     vf = judging / "verdicts" / f"{rid}.json"
     rd = Path(meta["run_dir"])
-    if not vf.exists() or not (rd / "branch_meta.json").exists():
+    if not (rd / "branch_meta.json").exists():
         return None
-    v = json.loads(vf.read_text())
     bm = json.loads((rd / "branch_meta.json").read_text())
     hdr = rd / "session_01" / "raw_dumps" / "request_001_headers.json"
     target = json.loads(hdr.read_text()).get("target") if hdr.exists() else None
-    if "continuation" not in bm or target != "local:intercept":
+    if "continuation" not in bm or target != "local:intercept":   # checked before the verdict: invalid runs are not judged
         return {"invalid": True, "experiment": meta["experiment"], "run": meta["run_name"]}
+    if not vf.exists():
+        return None
+    v = json.loads(vf.read_text())
     prefix, k = bm["prefix"], bm["branch_step_id"]
     cont = bm.get("continuation") or ""
     later = [q for q in v.get("framing_language") or []
@@ -124,6 +126,7 @@ def main() -> None:
     key = json.loads(key_file.read_text())
     by_exp = defaultdict(list)
     invalid = defaultdict(list)
+    unjudged = []
     for rid, meta in key.items():
         if meta["experiment"].startswith("causal_branch_"):
             r = rollout(rid, meta, judging)
@@ -131,6 +134,10 @@ def main() -> None:
                 invalid[meta["experiment"].removesuffix("_ext")].append(r["run"])
             elif r:   # extension sweeps (more reps of the same design) pool with their base sweep
                 by_exp[meta["experiment"].removesuffix("_ext")].append(r)
+            else:
+                unjudged.append(f"{meta['experiment']}/{meta['run_name']}")
+    if unjudged:
+        print(f"WARNING: {len(unjudged)} valid rollouts have no verdict yet: {sorted(unjudged)}")
     result = {}
     for exp, rows in sorted(by_exp.items()):
         kind = "injection" if "inject" in exp else "removal"
