@@ -207,8 +207,8 @@ class BranchSplice:
     async def __call__(self, request_data: dict, request_index: int) -> bytes | None:
         request_data["input"] = self._edit(strip_resume_additions(
             request_data.get("input") or [], len(self.seed.request.get("input") or [])))
-        self.n += 1
-        if self.n > 1:
+        if self.n >= 1:
+            self.n += 1
             return None   # forwarded to the pinned provider (capture proxy injects the pin)
         got = request_data["input"]
         self.meta["first_request_matches_seed"] = got == self.expected
@@ -228,8 +228,8 @@ class BranchSplice:
         # rollout on a broken step: re-sample it, up to max_attempts, and record every try.
         attempts = []
         for _ in range(self.max_attempts):
-            d = await complete_raw(self.seed.config.model, self.seed.provider, prompt, self.api_key,
-                                   temperature=sampling["temperature"], top_p=sampling["top_p"])
+            d = await _complete_with_retry(self.seed.config.model, self.seed.provider, prompt, self.api_key,
+                                           temperature=sampling["temperature"], top_p=sampling["top_p"])
             text = d["choices"][0].get("text") or ""
             parsed = self.seed.spec.parser(text)
             attempts.append({"continuation": text, "action_parsed": parsed.complete,
@@ -243,9 +243,27 @@ class BranchSplice:
             "n_attempts": len(attempts), "attempts": attempts,
             "tool_calls": parsed.tool_calls, "message": parsed.message, "served_by": d.get("provider"),
         })
+        self.n = 1   # the branch step is answered; every later request is forwarded
         namespaces = {t.get("name") for t in request_data.get("tools") or [] if t.get("type") == "namespace"}
         return responses_sse(self.seed.config.model, self.prefix + parsed.reasoning, parsed, d.get("usage"),
                              namespaces)
+
+
+async def _complete_with_retry(*args, attempts: int = 12, **kwargs) -> dict:
+    """complete_raw with backoff on transient failures (provider 429s from shared pools,
+    5xx, timeouts, empty choices). Raises after ``attempts`` tries; the proxy then fails
+    the request and the client retries it."""
+    import asyncio
+    import random
+
+    for i in range(attempts):
+        try:
+            return await complete_raw(*args, **kwargs)
+        except Exception:
+            if i == attempts - 1:
+                raise
+            await asyncio.sleep(min(60.0, 2.0 ** i) * random.uniform(1.0, 1.5))
+    raise RuntimeError("unreachable")
 
 
 def _sse_input_tokens(path: Path) -> int | None:

@@ -51,7 +51,9 @@ def main() -> None:
     ap.add_argument("--phase", choices=["all", "run", "events", "score", "judge", "analyze"], default="all")
     ap.add_argument("--shard", help="i/n: run only every n-th run starting at i (0-based), e.g. to give "
                     "each host its own runs so concurrent agents never share a machine")
+    ap.add_argument("--runs", help="comma-separated run names: run only these (e.g. to redo invalid runs)")
     args = ap.parse_args()
+    only = set(args.runs.split(",")) if args.runs else None
     shard = None
     if args.shard:
         i, n = (int(x) for x in args.shard.split("/"))
@@ -77,7 +79,7 @@ def main() -> None:
 
     if args.phase in ("all", "run"):
         print("\n===== PHASE 1: run trajectories =====")
-        asyncio.run(run_all_trajectories(cfg, shard))
+        asyncio.run(run_all_trajectories(cfg, shard, only))
     if args.phase in ("all", "events"):
         print("\n===== PHASE events: mechanical hack-event detection =====")
         detect_all(cfg)

@@ -269,7 +269,8 @@ def setup_isolation(cfg: SweepConfig, engine: str) -> UserPool | None:
     return UserPool()
 
 
-async def run_all_trajectories(cfg: SweepConfig, shard: tuple[int, int] | None = None) -> list[dict]:
+async def run_all_trajectories(cfg: SweepConfig, shard: tuple[int, int] | None = None,
+                               only: set[str] | None = None) -> list[dict]:
     """Roll out every (pressure value, rep) trajectory AND judge each one as it completes.
 
     Rollout (Anthropic) and judging (OpenRouter) use separate semaphores and APIs, so
@@ -328,6 +329,8 @@ async def run_all_trajectories(cfg: SweepConfig, shard: tuple[int, int] | None =
         combos = [(value, rep)
                   for rep in range(1, cfg.n_reps + 1)
                   for value in cfg.pressure.values]
+        if only:   # re-run just these runs (e.g. invalid ones), by run name
+            combos = [(v, r) for v, r in combos if run_name_for(cfg.pressure.var, v, r) in only]
         if shard is not None:   # this host runs every n-th combo (one host per shard)
             i, n = shard
             combos = combos[i::n]

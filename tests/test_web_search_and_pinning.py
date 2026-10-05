@@ -127,3 +127,31 @@ def test_retry_wait_uses_provider_hint():
     assert 7.0 <= _retry_wait(body, {}, 0) <= 10.5
     assert 1.0 <= _retry_wait(b"", {}, 0) <= 1.5          # no hint: 2**0 backoff
     assert _retry_wait(b"", {}, 20) <= 90                  # capped (60 s x jitter)
+
+
+def test_proxy_fails_request_when_intercept_raises(tmp_path):
+    forwarded = []
+
+    async def upstream(request):
+        forwarded.append(1)
+        return web.Response(text="data: {}\n\n", content_type="text/event-stream")
+
+    async def boom(request_data, idx):
+        raise RuntimeError("prefill failed")
+
+    async def go():
+        app = web.Application()
+        app.router.add_post("/v1/responses", upstream)
+        runner = web.AppRunner(app); await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0); await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        proxy = CaptureProxy(raw_dump_count=10, intercept=boom)
+        pport = await proxy.start(f"http://127.0.0.1:{port}", tmp_path / "api_captures.jsonl")
+        import httpx
+        async with httpx.AsyncClient() as c:
+            r = await c.post(f"http://127.0.0.1:{pport}/v1/responses", json={"model": "m", "input": []})
+        await proxy.stop(); await runner.cleanup()
+        return r
+
+    r = asyncio.run(go())
+    assert r.status_code == 502 and forwarded == []   # never forwarded unedited

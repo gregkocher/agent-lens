@@ -317,7 +317,15 @@ class CaptureProxy:
                         "prior reasoning get dropped from the request", sorted(server))
                 self.server_tools_seen |= server
                 if self._intercept is not None:
-                    answered = await self._intercept(request_data, request_index)
+                    try:
+                        answered = await self._intercept(request_data, request_index)
+                    except Exception as exc:
+                        # Never fall through to forwarding the request unedited (for a
+                        # branch rollout that would skip the edited step and leak the
+                        # resume marker): fail it, and the client retries the same request.
+                        logger.exception("request intercept failed; returning 502")
+                        return web.json_response(
+                            {"error": {"message": f"intercept failed: {exc!r}"[:500], "code": 502}}, status=502)
                     body = json.dumps(request_data).encode()
                     if answered is not None:
                         return await self._answer_locally(

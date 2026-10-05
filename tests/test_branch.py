@@ -309,3 +309,35 @@ def test_codex_resume_argv():
     assert 'sandbox_mode="danger-full-access"' in argv and argv[-1] == "-"
     with pytest.raises(ValueError, match="experimental_resume"):
         CodexEngine()._build_argv(EngineRunSpec(prompt="p", model="m", cwd="/w", resume_rollout_path="/x"), "p")
+
+
+def test_splice_retries_prefill_and_fails_without_consuming_the_step(seed_run, monkeypatch):
+    """A failing raw completion is retried; if it keeps failing the splice raises and the NEXT
+    request is intercepted again (never forwarded unedited)."""
+    from pipeline import branch
+    run, old_cwd = seed_run
+    seed = branch.Seed(run, 2)
+    calls = []
+
+    async def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("429 upstream")
+        return {"choices": [{"text": GOOD}], "usage": {}}
+
+    async def no_sleep(_):
+        return None
+    monkeypatch.setattr(branch, "render_prompt", lambda *a, **k: ("PROMPT", 42))
+    monkeypatch.setattr(branch, "complete_raw", flaky)
+    monkeypatch.setattr("asyncio.sleep", no_sleep)
+    splice = branch.BranchSplice(seed, "Look.", "/tmp/ws/bbbbbbbbbbbb", "key")
+    req = {"input": json.loads(json.dumps(seed.request["input"]).replace(old_cwd, "/tmp/ws/bbbbbbbbbbbb"))}
+    assert asyncio.run(splice(dict(req), 1)) is not None and len(calls) == 3 and splice.n == 1
+
+    async def dead(*a, **k):
+        raise RuntimeError("down")
+    monkeypatch.setattr(branch, "complete_raw", dead)
+    splice2 = branch.BranchSplice(seed, "Look.", "/tmp/ws/bbbbbbbbbbbb", "key")
+    with pytest.raises(RuntimeError):
+        asyncio.run(splice2(dict(req), 1))
+    assert splice2.n == 0          # the next (retried) request is intercepted again
