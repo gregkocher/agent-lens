@@ -34,7 +34,7 @@ echo "=== [5/6] codex CLI ==="
 if command -v codex >/dev/null 2>&1; then
   echo "codex present: $(codex --version 2>&1 | head -1)"
 elif command -v npm >/dev/null 2>&1; then
-  npm install -g @openai/codex >/dev/null 2>&1 && echo "codex via npm: $(codex --version 2>&1 | head -1)"
+  npm install -g @openai/codex@0.142.0 >/dev/null 2>&1 && echo "codex via npm: $(codex --version 2>&1 | head -1)"
 else
   # fallback: release binary. The CLI asset is EXACTLY codex-<triple>.tar.gz
   # (NOT bwrap-/codex-app-server-/codex-package-/codex-responses-api-proxy-).
