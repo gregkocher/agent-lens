@@ -25,7 +25,7 @@ if [ ! -d /root/agent-lens ]; then
   git clone --depth 1 -b main https://github.com/gregkocher/agent-lens.git
 fi
 cd /root/agent-lens
-git rev-parse --short HEAD
+git rev-parse --short HEAD 2>/dev/null || echo "(no .git: shipped working tree)"
 
 echo "=== [4/6] python deps (uv sync) ==="
 uv sync 2>&1 | tail -3
