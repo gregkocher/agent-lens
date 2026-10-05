@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -271,7 +272,9 @@ def write_truncated_rollout(
     """
     out_dir = sessions_root / date_path
     out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / f"rollout-{new_session_id}.jsonl"
+    # Codex finds a session by id from files named rollout-<timestamp>-<id>.jsonl.
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+    dest = out_dir / f"rollout-{stamp}-{new_session_id}.jsonl"
 
     with open(dest, "w") as f:
         for entry in entries:

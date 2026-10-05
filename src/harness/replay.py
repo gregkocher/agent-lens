@@ -583,7 +583,6 @@ async def _run_codex_replay(
         work_dir=Path(config.work_dir).resolve(), git_dir=source_shadow_git_dir
     )
 
-    sessions_root = Path.home() / ".codex" / "sessions"
     source_name = source_run_dir.name
     typer.echo(
         f"Replaying codex session {session_index} from turn {turn_index} "
@@ -603,7 +602,7 @@ async def _run_codex_replay(
                     rep=rep, worktree_dir=wt, source_run_dir=source_run_dir,
                     source_name=source_name, config=config, session_config=session_config,
                     session_index=session_index, turn_index=turn_index, count=count,
-                    transcript_path=transcript_path, sessions_root=sessions_root,
+                    transcript_path=transcript_path,
                     prompt_override=prompt_override, output_base=output_base, reset_tag=reset_tag,
                     truncate_fn=truncate_codex_rollout, write_fn=write_truncated_rollout,
                 )
@@ -628,10 +627,15 @@ async def _run_codex_replay(
 
 async def _run_codex_replicate(
     rep, worktree_dir, source_run_dir, source_name, config, session_config,
-    session_index, turn_index, count, transcript_path, sessions_root,
+    session_index, turn_index, count, transcript_path,
     prompt_override, output_base, reset_tag, truncate_fn, write_fn,
 ) -> Path:
-    """Run one Codex replay replicate in an isolated worktree."""
+    """Run one Codex replay replicate in an isolated worktree.
+
+    The truncated rollout goes into a private CODEX_HOME and Codex resumes it by id
+    (``codex exec resume``). Without a prompt override, the resume marker and the
+    context Codex re-injects on resume are stripped by the capture proxy, so the model
+    sees exactly the original history (harness.resume)."""
     new_session_id = str(uuid_mod.uuid4())
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
     run_name = f"replay_{source_name}_s{session_index}_t{turn_index}_r{rep:02d}_{timestamp}"
@@ -639,7 +643,9 @@ async def _run_codex_replicate(
     replay_session_dir = replay_run_dir / f"session_{session_index:02d}"
     replay_session_dir.mkdir(parents=True)
 
-    resume_rollout_path: str | None = None
+    resume_id: str | None = None
+    intercept = None
+    codex_home = replay_run_dir / "codex_home"
     if turn_index == 1:
         prompt = (
             f"{session_config.prompt}\n\n{prompt_override}" if prompt_override else session_config.prompt
@@ -647,11 +653,21 @@ async def _run_codex_replicate(
     else:
         truncated = truncate_fn(transcript_path, turn_index)
         date_path = datetime.now(timezone.utc).strftime("%Y/%m/%d")
-        rollout = write_fn(truncated, new_session_id, sessions_root, date_path)
-        resume_rollout_path = str(rollout)
+        write_fn(truncated, new_session_id, codex_home / "sessions", date_path)
+        auth = Path.home() / ".codex" / "auth.json"   # subscription logins live in CODEX_HOME
+        if auth.exists():
+            shutil.copy2(auth, codex_home / "auth.json")
+        resume_id = new_session_id
         _save_truncated_copy(truncated, replay_session_dir / "source_rollout_truncated.jsonl")
-        # Codex resume requires a continuation prompt; default to a neutral nudge.
-        prompt = prompt_override or "Continue from where the previous session left off."
+        if prompt_override:
+            prompt = prompt_override
+        elif config.capture_api_requests:
+            from harness.resume import RESUME_MARKER, ResumeStrip
+            prompt = RESUME_MARKER
+            intercept = ResumeStrip(keep=sum(1 for e in truncated if e.get("type") == "response_item"))
+        else:
+            # Without the capture proxy the resume prompt reaches the model; keep it neutral.
+            prompt = "Continue from where the previous session left off."
 
     replay_shadow_git = ShadowGit(work_dir=worktree_dir, git_dir=replay_run_dir / ".shadow_git")
     replay_shadow_git.init()
@@ -662,7 +678,8 @@ async def _run_codex_replicate(
         result = await run_session(
             session_config=session_config, run_config=config, session_dir=replay_session_dir,
             state_manager=state, prompt_override=prompt, cwd_override=str(worktree_dir),
-            resume_rollout_path=resume_rollout_path,
+            resume_session_id=resume_id, proxy_intercept=intercept,
+            extra_env={"CODEX_HOME": str(codex_home)},
         )
     except Exception as e:
         logger.exception("Codex replay replicate %d crashed", rep)
