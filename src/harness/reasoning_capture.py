@@ -33,7 +33,7 @@ class ResponseRecord:
 
     request_index: int
     reasoning: list[tuple[str, str]] = field(default_factory=list)  # (kind, text)
-    anchors: list[str] = field(default_factory=list)  # normalized action texts
+    anchors: list[tuple[str, str]] = field(default_factory=list)  # ("call"|"msg", normalized text)
     has_action: bool = False
     n_actions: int = 0  # tool calls + assistant messages in this response
 
@@ -96,25 +96,41 @@ def _anchors(obj: Any) -> list[str]:
     return [a for a in (_norm(s) for s in _strings_in(obj)) if a]
 
 
-def _step_strings(step: dict) -> list[str]:
-    """Normalized strings a step exposes: its message, every tool-call string argument,
-    and shell commands with the engine's ``/bin/bash -lc '...'`` wrapper removed."""
-    out = [_norm(step.get("message") or "")]
+def _step_keys(step: dict) -> list[tuple[str, str]]:
+    """Typed, normalized keys a step exposes: ("msg", its message), ("call", each tool-call
+    string argument, plus shell commands with the engine's ``/bin/bash -lc '...'``
+    wrapper removed), and ("patch", file name) for engine file-change steps, which carry
+    only the paths a patch touched."""
+    out: list[tuple[str, str]] = []
+    if (step.get("message") or "").strip():
+        out.append(("msg", _norm(step["message"])))
     for tc in step.get("tool_calls") or []:
+        if tc.get("function_name") == "file_change":
+            for ch in (tc.get("arguments") or {}).get("changes") or []:
+                name = str(ch.get("path", "")).rsplit("/", 1)[-1]
+                if name:
+                    out.append(("patch", _norm(name)))
+            continue
         for s in _strings_in(tc.get("arguments")):
-            out.append(_norm(s))
+            out.append(("call", _norm(s)))
             m = _SHELL_WRAP.match(s)
             if m:
-                out.append(_norm(m.group("body")))
-    return [x for x in out if x]
+                out.append(("call", _norm(m.group("body"))))
+    return [(k, v) for k, v in out if v]
 
 
-def _matches(record: ResponseRecord, step_strings: list[str]) -> bool:
-    """Full-content match (exact, or containment for strings >= 12 chars), so long shared
-    prefixes such as ``cd /long/work/dir && ...`` cannot cause false matches."""
-    for a in record.anchors:
-        for b in step_strings:
-            if a == b or (len(a) >= 12 and a in b) or (len(b) >= 12 and b in a):
+def _matches(record: ResponseRecord, keys: list[tuple[str, str]]) -> bool:
+    """Same-type, full-content match: messages to messages and tool calls to tool calls
+    (exact, or containment for strings >= 12 chars, so long shared prefixes such as
+    ``cd /long/work/dir && ...`` cannot cause false matches); a file-change step matches a
+    tool call that carries a patch for that file. Paths merely MENTIONED in a message
+    never anchor a step."""
+    for k, b in keys:
+        for ka, a in record.anchors:
+            if k == "patch":
+                if ka == "call" and "beginpatch" in a and b in a:
+                    return True
+            elif k == ka and (a == b or (len(a) >= 12 and a in b) or (len(b) >= 12 and b in a)):
                 return True
     return False
 
@@ -157,13 +173,13 @@ def _record_from_responses_item(rec: ResponseRecord, item: dict) -> None:
     elif t in ("function_call", "custom_tool_call", "local_shell_call"):
         rec.has_action = True
         rec.n_actions += 1
-        rec.anchors.extend(_anchors(item.get("arguments") or item.get("input") or item.get("action") or ""))
+        rec.anchors.extend(("call", a) for a in _anchors(item.get("arguments") or item.get("input") or item.get("action") or ""))
     elif t == "message" and item.get("role", "assistant") == "assistant":
         txt = _texts(item.get("content"))
         if txt.strip():
             rec.has_action = True
             rec.n_actions += 1
-            rec.anchors.append(_norm(txt))
+            rec.anchors.append(("msg", _norm(txt)))
 
 
 def parse_responses_sse(path: Path, request_index: int) -> ResponseRecord:
@@ -203,11 +219,11 @@ def parse_anthropic_sse(path: Path, request_index: int) -> ResponseRecord:
         elif bt == "tool_use":
             rec.has_action = True
             rec.n_actions += 1
-            rec.anchors.extend(_anchors(b["_text"] or b.get("input") or ""))
+            rec.anchors.extend(("call", a) for a in _anchors(b["_text"] or b.get("input") or ""))
         elif bt == "text" and b["_text"].strip():
             rec.has_action = True
             rec.n_actions += 1
-            rec.anchors.append(_norm(b["_text"]))
+            rec.anchors.append(("msg", _norm(b["_text"])))
     return rec
 
 
@@ -301,11 +317,14 @@ def attach_reasoning(steps: list[dict], records: list[ResponseRecord], window: i
     the engine stream keep it. Mutates ``steps``; returns coverage stats."""
     stats = {"records": len(records), "with_reasoning": sum(1 for r in records if r.reasoning),
              "attached": 0, "steps_filled": 0, "kinds": {}, "unmatched_records": 0}
+    # Reasoning the engine stream already carried (e.g. Claude Code emits thinking as its
+    # own step before the tool-call step): never copy it a second time.
+    stats["_present"] = {_norm(s.get("reasoning_content") or "")[:400] for s in steps if s.get("reasoning_content")}
     p = 0
     used = 0  # actions of records[p - 1] already matched to steps
     action_steps = [s for s in steps if _is_action_step(s)]
     for step in action_steps:
-        strs = _step_strings(step)
+        strs = _step_keys(step)
         if p > 0 and used < records[p - 1].n_actions and _matches(records[p - 1], strs):
             used += 1
             continue  # another action of the same response (e.g. message + call, 2 calls)
@@ -317,31 +336,39 @@ def attach_reasoning(steps: list[dict], records: list[ResponseRecord], window: i
         used = 1
         _apply(step, group, stats)
     leftover = [r for r in records[p:] if r.reasoning]
-    if leftover and action_steps:
-        _apply(action_steps[-1], leftover, stats)
+    if leftover and action_steps:  # e.g. a final response with no action: keep its reasoning
+        _apply(action_steps[-1], leftover, stats, append=True)
     stats["unmatched_records"] = len(records) - p
+    stats.pop("_present", None)
     return stats
 
 
-def _apply(step: dict, group: list[ResponseRecord], stats: dict) -> None:
+def _apply(step: dict, group: list[ResponseRecord], stats: dict, append: bool = False) -> None:
     with_r = [r for r in group if r.reasoning]
     if not with_r:
         return
     stats["attached"] += len(with_r)
-    if (step.get("reasoning_content") or "").strip():
+    present = stats.get("_present") or set()
+    with_r = [r for r in with_r if not (r.text and _norm(r.text)[:400] in present)]
+    if not with_r:
+        return
+    existing = (step.get("reasoning_content") or "").strip()
+    if existing and not append:
         return  # the engine already surfaced this step's reasoning
     text = "\n\n".join(r.text for r in with_r if r.text)
     kind = max((r.kind for r in with_r), key=lambda k: _KIND_RANK[k])
     if text:
-        step["reasoning_content"] = (step.get("reasoning_content") or "") + text
-    step.setdefault("extra", {})["reasoning_kind"] = kind
+        step["reasoning_content"] = (existing + "\n\n" + text) if existing else text
+    prev = (step.get("extra") or {}).get("reasoning_kind")
+    if prev is None or _KIND_RANK[kind] > _KIND_RANK.get(prev, 0):
+        step.setdefault("extra", {})["reasoning_kind"] = kind
     stats["steps_filled"] += 1
     stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1
 
 
 # Providers whose readable reasoning text is a model-written summary of hidden thinking,
 # even when delivered in the raw ``reasoning_text`` field.
-_SUMMARY_MODELS = re.compile(r"(^|/)(gemini|gpt-|o[1-9]|codex)", re.I)
+_SUMMARY_MODELS = re.compile(r"(^|/)(gemini|gpt-(?!oss)|o[1-9]|codex)", re.I)  # gpt-oss: raw CoT
 
 
 def enrich_trajectory_reasoning(traj: dict, session_dir: Path, engine: str,

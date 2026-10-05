@@ -138,6 +138,9 @@ def test_summary_models_relabelled(tmp_path):
     traj = {"steps": [_step(1, "ls -la")]}
     enrich_trajectory_reasoning(traj, tmp_path, "codex", model="thinkingmachines/inkling")
     assert traj["steps"][0]["extra"]["reasoning_kind"] == "raw"
+    traj = {"steps": [_step(1, "ls -la")]}
+    enrich_trajectory_reasoning(traj, tmp_path, "codex", model="openai/gpt-oss-120b")
+    assert traj["steps"][0]["extra"]["reasoning_kind"] == "raw"
 
 
 def test_anthropic_thinking_parsed(tmp_path):
@@ -200,3 +203,44 @@ def test_pipeline_render_full_then_budgeted(tmp_path):
     assert len(out) <= 40_000 and info["truncated"] and info["tool_outputs_shortened"] == 1
     assert "T" * 6_000 in out and "TOOL RESULT: tiny" in out and "diff --git a/cache.py" in out
     assert info["steps_omitted"] == 0 and info["diff_chars_omitted"] == 0
+
+
+def test_patch_via_shell_and_paths_mentioned_in_messages(tmp_path):
+    # GLM applies patches through a shell heredoc; Codex reports a file_change step that
+    # carries only the path, and the NEXT response's message mentions the same path.
+    patch = "cd /w && apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: cache.py\n+x = 1\n*** End Patch\nPATCH"
+    _write_dumps(tmp_path, [
+        [_reason(text="R1"), _msg("Replacing the hot path now."), _call(patch)],
+        [_reason(text="R2"), _msg("Implemented /w/cache.py; running the suite."), _call("python3 /w/test_cache.py")],
+    ])
+    steps = [_step(1, msg="Replacing the hot path now."),
+             {"step_id": 2, "source": "agent", "tool_calls": [{"function_name": "file_change",
+                "arguments": {"changes": [{"path": "/w/cache.py", "kind": "add"}]}}]},
+             _step(3, msg="Implemented /w/cache.py; running the suite."),
+             _step(4, "python3 /w/test_cache.py")]
+    attach_reasoning(steps, records_from_raw_dumps(tmp_path))
+    assert [s.get("reasoning_content") for s in steps] == ["R1", None, "R2", None]
+
+
+def test_engine_thinking_not_duplicated_onto_tool_step(tmp_path):
+    # Claude Code emits the thinking as its own step, then the tool_use as another step.
+    evs = [{"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}},
+           {"type": "content_block_delta", "index": 0, "delta": {"thinking": "plan the read"}},
+           {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use"}},
+           {"type": "content_block_delta", "index": 1, "delta": {"partial_json": '{"file_path": "/w/cache_starter.py"}'}}]
+    raw = tmp_path / "raw_dumps"; raw.mkdir()
+    (raw / "request_001.json").write_text(json.dumps({"messages": []}))
+    (raw / "request_001_headers.json").write_text(json.dumps({"path": "/v1/messages"}))
+    (raw / "response_001.txt").write_text("".join(f"data: {json.dumps(e)}\n\n" for e in evs))
+    steps = [{"step_id": 1, "source": "agent", "reasoning_content": "plan the read"},
+             {"step_id": 2, "source": "agent", "tool_calls": [{"function_name": "Read",
+                "arguments": {"file_path": "/w/cache_starter.py"}}]}]
+    attach_reasoning(steps, records_from_raw_dumps(tmp_path))
+    assert steps[1].get("reasoning_content") is None
+
+
+def test_final_reasoning_without_action_is_kept(tmp_path):
+    _write_dumps(tmp_path, [[_reason(text="first"), _call("ls -la")], [_reason(text="final thoughts, no action")]])
+    steps = [_step(1, "ls -la")]
+    stats = attach_reasoning(steps, records_from_raw_dumps(tmp_path))
+    assert steps[0]["reasoning_content"] == "first\n\nfinal thoughts, no action" and stats["unmatched_records"] == 1
