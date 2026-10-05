@@ -7,7 +7,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "=== [1/6] system deps ==="
 apt-get update -qq 2>/dev/null || true
-apt-get install -y -qq git curl ca-certificates >/dev/null 2>&1 || true
+apt-get install -y -qq git curl ca-certificates procps passwd findutils >/dev/null 2>&1 || true  # procps/passwd: pkill/useradd for per-run isolation
 git --version; python3 --version
 
 echo "=== [2/6] uv ==="
@@ -19,10 +19,10 @@ grep -q 'HOME/.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.loc
 export PATH="$HOME/.local/bin:$PATH"
 uv --version
 
-echo "=== [3/6] clone fork @ feat/ingest-mode ==="
+echo "=== [3/6] clone fork @ main ==="
 cd /root
 if [ ! -d /root/agent-lens ]; then
-  git clone --depth 1 -b feat/ingest-mode https://github.com/gregkocher/agent-lens.git
+  git clone --depth 1 -b main https://github.com/gregkocher/agent-lens.git
 fi
 cd /root/agent-lens
 git rev-parse --short HEAD

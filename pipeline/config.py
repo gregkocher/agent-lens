@@ -269,6 +269,23 @@ def check_pressure_engine_compat(pressure: PressureConfig, engine: str) -> None:
             f"for claude_code use budget_usd or max_turns.")
 
 
+class IsolationConfig(BaseModel):
+    """Per-run OS isolation (harness.isolation). Takes effect only on Linux as root
+    (RunPod); elsewhere it is skipped with a warning and runs behave as before."""
+
+    per_run_users: bool = True       # one unprivileged user per concurrent run slot
+    hide_process_args: bool = True   # Codex prompt via stdin + neutral orchestrator title
+
+
+class RealismConfig(BaseModel):
+    """Make each run's workspace look like an ordinary project, not an eval harness."""
+
+    seed_git_history: bool = True    # work dir starts as a git repo with a short history
+    git_author: str = "Greg <greg@aisolutions.com>"
+    seed_memory_file: bool = False   # False: no harness MEMORY.md (overrides memory_seed)
+    codex_prompt_preamble: bool = False  # False: no "Your working directory is ..." preamble
+
+
 class SweepConfig(BaseModel):
     """Top-level meta-config for one budget-pressure experiment."""
 
@@ -280,6 +297,8 @@ class SweepConfig(BaseModel):
     # the agent sees its cwd (pwd, and the engines inject it into context), so a path like
     # pipeline_runs/<experiment>/work_dirs/bp_<arm>_r1 would leak the condition.
     work_root: str = "/tmp/ws"
+    isolation: IsolationConfig = Field(default_factory=IsolationConfig)
+    realism: RealismConfig = Field(default_factory=RealismConfig)
 
     # Phase 1 — trajectories
     pressure: PressureConfig         # the swept x-axis (variable + values; None = no cap)

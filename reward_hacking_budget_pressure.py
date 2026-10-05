@@ -42,7 +42,7 @@ from pipeline.config import load_sweep_config
 from pipeline.events import detect_all
 from pipeline.final_score import score_all
 from pipeline.judge import judge_all
-from pipeline.run_trajectories import run_all_trajectories
+from pipeline.run_trajectories import isolation_active, run_all_trajectories
 
 
 def main() -> None:
@@ -58,6 +58,13 @@ def main() -> None:
 
     cfg = load_sweep_config(config_path)
     cfg.out.mkdir(parents=True, exist_ok=True)
+    if cfg.isolation.hide_process_args and isolation_active(cfg):
+        # Agents can list processes; don't let ours name the experiment/config. Only
+        # under isolation (agent users cannot signal root processes). The title also
+        # avoids "python": a root-level `pkill python3` (e.g. from a non-isolated sweep
+        # wrongly sharing the host) would otherwise match it.
+        from setproctitle import setproctitle
+        setproctitle("worker")
     print(f"Experiment: {cfg.experiment_name}  |  phase: {args.phase}  |  output: {cfg.out}")
 
     if args.phase in ("all", "run"):

@@ -20,9 +20,12 @@ from pathlib import Path
 
 from harness.config import SessionMode, load_config
 from harness.experiment import run_experiment
+from harness.isolation import (hand_over_work_dir, install_claude_launcher,
+                               isolation_supported, prepare_work_root)
 
 from pipeline.config import (SweepConfig, check_pressure_engine_compat,
                              run_name_for)
+from pipeline.workspace import UserPool, seed_git_history
 
 FINGERPRINT_FILE = ".pipeline_fingerprint"
 _SIG_SKIP = {"__pycache__", ".git", ".shadow_git", "node_modules"}
@@ -72,6 +75,7 @@ def _fingerprint_config(run_config, base_sig: str) -> str:
     d = run_config.model_dump()
     d.pop("run_name", None)
     d.pop("work_dir", None)
+    d.pop("run_as_user", None)  # which pooled user ran it is not part of the condition
     payload = json.dumps(d, sort_keys=True, default=str) + "\x00" + base_sig
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -97,6 +101,14 @@ def _build_run_config(cfg: SweepConfig, base_cfg, value, rep: int, work_dir: Pat
         run_config.model = cfg.agent_model
     if cfg.agent_provider:
         run_config.provider = cfg.agent_provider
+    # Realism / isolation knobs (pipeline-level; see RealismConfig / IsolationConfig).
+    if not cfg.realism.seed_memory_file:
+        run_config.memory_seed = None
+    if run_config.engine == "codex":
+        if not cfg.realism.codex_prompt_preamble:
+            run_config.work_dir_hint = False
+        if cfg.isolation.hide_process_args:
+            run_config.codex_prompt_stdin = True
     # agent_provider override bypasses RunConfig validation (model_copy doesn't
     # re-validate); re-check the one cross-field constraint that matters for routing.
     if run_config.engine == "codex" and run_config.provider not in ("openai", "openrouter"):
@@ -151,7 +163,8 @@ def _manifest_row(cfg: SweepConfig, value, rep: int, run_name: str, run_dir: Pat
     return row
 
 
-async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, sem: asyncio.Semaphore) -> dict:
+async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, sem: asyncio.Semaphore,
+                   pool: UserPool | None = None) -> dict:
     run_name = run_name_for(cfg.pressure.var, value, rep)
     run_dir = cfg.trajectories_dir / run_name
     work_dir = cfg.work_dir_for(run_name).resolve()
@@ -169,6 +182,7 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, s
         val_str = "uncapped" if value is None else str(value)
         print(f"[run ] {run_name}  {cfg.pressure.variable}={val_str}  work_dir={work_dir}")
         status, error = "ok", None
+        agent_user = None
         try:
             # Work-dir setup lives INSIDE the try: a copytree/chmod failure becomes a
             # per-run error row instead of an exception that sinks the whole gather.
@@ -184,6 +198,13 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, s
             # cd into it and build there under bypassPermissions). copytree inherits those
             # perms, so restore write on the agent's private copy.
             _chmod_writable(work_dir)
+            if cfg.realism.seed_git_history:
+                seed_git_history(work_dir, cfg.realism.git_author)
+            if pool is not None:
+                # Own unprivileged user + exclusive ownership of the work dir.
+                agent_user = pool.acquire()
+                hand_over_work_dir(work_dir, agent_user)
+                run_config.run_as_user = agent_user.name
             # Wall-clock guard: a single wedged session (e.g. a stuck SDK/network wait on
             # an uncapped run) must never block the whole sweep's gather. Generous so
             # genuinely long unlimited runs aren't killed.
@@ -200,12 +221,38 @@ async def _run_one(cfg: SweepConfig, base_cfg, base_sig: str, value, rep: int, s
         finally:
             # work_dir copy is disposable — outputs are saved under run_dir.
             shutil.rmtree(work_dir, ignore_errors=True)
+            if agent_user is not None:
+                pool.release(agent_user)  # kills leftovers, wipes its home
 
     row = _manifest_row(cfg, value, rep, run_name, run_dir, status, error)
     if row["status"] == "ok" and run_dir.exists():
         fp_path.write_text(fp)  # stamp only successful, complete runs
     print(f"[done] {run_name}  status={row['status']}  cost={row['cost_usd']}  steps={row['steps']}")
     return row
+
+
+def isolation_active(cfg: SweepConfig) -> bool:
+    return cfg.isolation.per_run_users and isolation_supported()
+
+
+def setup_isolation(cfg: SweepConfig, engine: str) -> UserPool | None:
+    """Prepare per-run OS isolation, or explain why it is off. Returns the user pool."""
+    if not cfg.isolation.per_run_users:
+        if isolation_supported():
+            print("[isolation] WARNING: per_run_users is off and we are root: agents run as "
+                  "root with full access to this host (other sweeps, the checkout, keys). "
+                  "Never share a host between isolated and non-isolated sweeps.")
+        return None
+    if not isolation_supported():
+        print("[isolation] per_run_users requested but needs Linux + root; running agents "
+              "as the current user (no OS isolation).")
+        return None
+    prepare_work_root(Path(cfg.work_root))
+    if engine == "claude_code":
+        import claude_agent_sdk
+        install_claude_launcher(Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude")
+    print(f"[isolation] agents run as pooled unprivileged users under {cfg.work_root}")
+    return UserPool()
 
 
 async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
@@ -224,6 +271,7 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
     base_cfg = load_config(cfg.base_task_config)
     check_pressure_engine_compat(cfg.pressure, base_cfg.engine)  # fail-fast on bad combo
     base_sig = dir_signature(cfg.base_work_dir)  # computed once; captures repo edits
+    pool = setup_isolation(cfg, base_cfg.engine)
 
     api_key = load_judge_api_key(cfg)            # fail-fast before any rollout
     behavior_rubrics = _load_behavior_rubrics(cfg)
@@ -235,7 +283,7 @@ async def run_all_trajectories(cfg: SweepConfig) -> list[dict]:
 
     async with httpx.AsyncClient(timeout=cfg.judge.request_timeout) as client:
         async def _run_and_judge(value, rep) -> dict:
-            row = await _run_one(cfg, base_cfg, base_sig, value, rep, sem)
+            row = await _run_one(cfg, base_cfg, base_sig, value, rep, sem, pool)
             # Incremental manifest: rewrite after every finished run so a killed or
             # partial phase 1 still supports events/score/judge/analyze on whatever
             # completed. The final canonical-order write below overwrites this.
