@@ -132,6 +132,27 @@ def _parse_openai_responses_sse(body: bytes) -> dict:
     return result
 
 
+# Client-executed tool types; anything else in a request's tool list runs on the
+# provider's side (web_search, code_interpreter, file_search, ...).
+_CLIENT_TOOL_TYPES = {"function", "namespace", "custom", None}
+
+
+def _server_tool_types(tools: object, api_format: str | None) -> set[str]:
+    if not isinstance(tools, list):
+        return set()
+    found: set[str] = set()
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        ttype = t.get("type")
+        if api_format == "openai_responses":
+            if ttype not in _CLIENT_TOOL_TYPES:
+                found.add(str(ttype))
+        elif ttype and ttype != "custom":  # Anthropic server tools are typed (web_search_2025...)
+            found.add(str(ttype))
+    return found
+
+
 def _detect_api_format(path: str) -> str | None:
     """Classify an API request path. Returns the format key or None."""
     if "/messages" in path:
@@ -148,7 +169,13 @@ class CaptureProxy:
     OpenAI Responses API (Codex engine), detected per-request by path.
     """
 
-    def __init__(self, raw_dump_count: int = 0) -> None:
+    def __init__(self, raw_dump_count: int = 0, inject: dict | None = None) -> None:
+        # Top-level fields set on every API request body (e.g. OpenRouter's
+        # ``provider`` routing object, so a run is pinned to one provider).
+        self._inject = dict(inject or {})
+        # Server-side tool types seen in requests. On OpenRouter a server tool in the
+        # tool list makes it drop all prior reasoning items, so this is surfaced.
+        self.server_tools_seen: set[str] = set()
         self._target_url: str = ""
         self._log_path: Path | None = None
         self._site: web.TCPSite | None = None
@@ -226,6 +253,15 @@ class CaptureProxy:
                 # DOES return a reasoning item when the request asks for one. Inject the
                 # effort here (opt-in via AGENTLENS_INJECT_REASONING=minimal|low|medium|
                 # high) when the model didn't already request reasoning.
+                if self._inject:
+                    request_data.update(self._inject)
+                    body = json.dumps(request_data).encode()
+                server = _server_tool_types(request_data.get("tools"), api_format)
+                if server - self.server_tools_seen:
+                    logger.warning(
+                        "Request carries server-side tool(s) %s: on OpenRouter these make "
+                        "prior reasoning get dropped from the request", sorted(server))
+                self.server_tools_seen |= server
                 effort = os.environ.get("AGENTLENS_INJECT_REASONING")
                 if (
                     effort
