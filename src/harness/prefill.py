@@ -64,6 +64,18 @@ def parse_inkling(text: str) -> ParsedOutput:
     return ParsedOutput(reasoning=reasoning, tool_calls=[{"name": name, "arguments": json.dumps(args)}])
 
 
+def parse_inkling_rest(text: str) -> ParsedOutput:
+    """What Inkling writes after its reasoning block (stage 2 of a staged branch step):
+    an optional visible message, then optionally ``<name>{"name": ..., "args": ...}``
+    (special tokens stripped). Everything before the tool call is the message; a turn
+    with only a message (e.g. a final answer or a refusal) is a complete action."""
+    p = parse_inkling(text)
+    if p.complete:
+        return ParsedOutput(reasoning="", tool_calls=p.tool_calls, message=p.reasoning.strip())
+    message = text.strip()
+    return ParsedOutput(reasoning="", message=message, complete=bool(message))
+
+
 _KIMI_CALL = re.compile(r"<\|tool_call_begin\|>\s*([^<]+?)\s*<\|tool_call_argument_begin\|>(.*?)<\|tool_call_end\|>", re.S)
 
 
@@ -139,6 +151,12 @@ class ModelSpec:
     top_p: float | None = None
     # provider tag -> its RenderStyle (default RenderStyle() for others)
     styles: dict[str, RenderStyle] = field(default_factory=dict)
+    # Special token that closes the reasoning block. When set (and the provider honors it as
+    # a stop sequence), the branch step is generated in two stages so that reasoning, visible
+    # message and tool call are split exactly even though the provider strips special tokens:
+    # stage 1 stops at the close, stage 2 continues after it; ``rest_parser`` reads stage 2.
+    reasoning_close: str = ""
+    rest_parser: Callable[[str], ParsedOutput] | None = None
 
     def style_for(self, provider: str | None) -> RenderStyle:
         return self.styles.get(provider or "", RenderStyle())
@@ -147,6 +165,7 @@ class ModelSpec:
 SUPPORTED: dict[str, ModelSpec] = {
     "thinkingmachines/inkling": ModelSpec(
         hf_repo="thinkingmachines/Inkling", reasoning_open="<|content_thinking|>", parser=parse_inkling,
+        reasoning_close="<|end_message|>", rest_parser=parse_inkling_rest,
         providers={"together": "verified"},
         note="The only provider accepting raw prompts; it strips special tokens, so the tool "
              "call is recovered from its JSON.",
@@ -364,9 +383,11 @@ def render_prompt(req: dict, spec: ModelSpec, prefix: str, drop_past_reasoning: 
 async def complete_raw(model: str, provider: str, prompt: str, api_key: str,
                        base_url: str = "https://openrouter.ai/api/v1", max_tokens: int = 32_000,
                        timeout: float = 900.0, temperature: float | None = None,
-                       top_p: float | None = None) -> dict:
+                       top_p: float | None = None, stop: list[str] | None = None) -> dict:
     body: dict[str, Any] = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
                             "provider": {"order": [provider], "allow_fallbacks": False}}
+    if stop:
+        body["stop"] = stop
     if temperature is not None:
         body["temperature"] = temperature
     if top_p is not None:

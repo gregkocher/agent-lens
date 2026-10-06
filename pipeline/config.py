@@ -287,14 +287,22 @@ class BranchArmConfig(BaseModel):
     prefix_until: str | None = None    # original reasoning up to (excluding) this text
     prefix_through: str | None = None  # original reasoning up to (including) this text
     full_original: bool = False        # the whole original reasoning (null branch / control)
+    # Mechanism control: no prefill at all. The branch request is forwarded to the provider's
+    # normal (chat) path, so the rollout differs from an empty-prefix arm only in who answers
+    # the branch step: the provider's own rendering + parsing vs our raw-completion prefill.
+    passthrough: bool = False
     append: str = ""                   # text added after the prefix (e.g. an inserted sentence)
     history_replace: list[dict[str, str]] = Field(default_factory=list)  # [{old, new}] in earlier items
 
     @model_validator(mode="after")
     def _one_base(self):
-        n = sum(x is not None for x in (self.prefix, self.prefix_until, self.prefix_through)) + int(self.full_original)
+        n = (sum(x is not None for x in (self.prefix, self.prefix_until, self.prefix_through))
+             + int(self.full_original) + int(self.passthrough))
         if n != 1:
-            raise ValueError("a branch arm needs exactly one of: prefix, prefix_until, prefix_through, full_original")
+            raise ValueError("a branch arm needs exactly one of: prefix, prefix_until, prefix_through, "
+                             "full_original, passthrough")
+        if self.passthrough and (self.append or self.history_replace):
+            raise ValueError("a passthrough arm edits nothing (no append / history_replace)")
         return self
 
 

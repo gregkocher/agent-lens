@@ -143,6 +143,8 @@ class Seed:
 
     def prefix_for(self, arm: dict) -> str:
         r = self.original_reasoning
+        if arm.get("passthrough"):
+            return ""
         if arm.get("prefix") is not None:
             base = arm["prefix"]
         elif arm.get("full_original"):
@@ -188,8 +190,10 @@ class BranchSplice:
     """Capture-proxy intercept for one branch rollout (see module docstring, step 3)."""
 
     def __init__(self, seed: Seed, prefix: str, new_cwd: str, api_key: str,
-                 history_replace: list[dict] | None = None, max_attempts: int = 3):
+                 history_replace: list[dict] | None = None, max_attempts: int = 3,
+                 passthrough: bool = False):
         self.seed, self.prefix, self.api_key = seed, prefix, api_key
+        self.passthrough = passthrough
         self.max_attempts = max_attempts
         self.history_replace = history_replace or []
         self.expected = self._edit(json.loads(json.dumps(seed.request["input"]).replace(seed.old_cwd, new_cwd)))
@@ -203,6 +207,9 @@ class BranchSplice:
         for r in self.history_replace:
             s = s.replace(json.dumps(r["old"])[1:-1], json.dumps(r["new"])[1:-1])
         return json.loads(s)
+
+    async def _generate(self, prompt: str, sampling: dict):
+        return await _staged_or_single(self, prompt, sampling)
 
     async def __call__(self, request_data: dict, request_index: int) -> bytes | None:
         request_data["input"] = self._edit(strip_resume_additions(
@@ -222,17 +229,18 @@ class BranchSplice:
                     "temperature": request_data.get("temperature"), "top_p": request_data.get("top_p")}
         self.meta["sampling"] = sampling
         self.meta["sampling_matches_seed"] = sampling == self.seed.sampling()
+        if self.passthrough:   # mechanism control: the provider answers the branch step itself
+            self.meta["passthrough"] = True
+            self.n = 1
+            return None
         prompt, n_tok = render_prompt(request_data, self.seed.spec, self.prefix, drop_past_reasoning=drop,
                                       provider=self.seed.provider)
         # A continuation without a parseable action (cut off, malformed call) would end the
         # rollout on a broken step: re-sample it, up to max_attempts, and record every try.
         attempts = []
         for _ in range(self.max_attempts):
-            d = await _complete_with_retry(self.seed.config.model, self.seed.provider, prompt, self.api_key,
-                                           temperature=sampling["temperature"], top_p=sampling["top_p"])
-            text = d["choices"][0].get("text") or ""
-            parsed = self.seed.spec.parser(text)
-            attempts.append({"continuation": text, "action_parsed": parsed.complete,
+            d, text, parsed, staged = await self._generate(prompt, sampling)
+            attempts.append({"continuation": text, "action_parsed": parsed.complete, "staged": staged,
                              "finish_reason": d["choices"][0].get("finish_reason"),
                              "served_by": d.get("provider")})
             if parsed.complete:
@@ -243,10 +251,38 @@ class BranchSplice:
             "n_attempts": len(attempts), "attempts": attempts,
             "tool_calls": parsed.tool_calls, "message": parsed.message, "served_by": d.get("provider"),
         })
+        self.meta["staged"] = staged
         self.n = 1   # the branch step is answered; every later request is forwarded
         namespaces = {t.get("name") for t in request_data.get("tools") or [] if t.get("type") == "namespace"}
         return responses_sse(self.seed.config.model, self.prefix + parsed.reasoning, parsed, d.get("usage"),
                              namespaces)
+
+
+async def _staged_or_single(splice: "BranchSplice", prompt: str, sampling: dict):
+    spec, seed = splice.seed.spec, splice.seed
+    kw = {"temperature": sampling["temperature"], "top_p": sampling["top_p"]}
+    close = spec.reasoning_close
+    if not (close and spec.rest_parser):
+        d = await _complete_with_retry(seed.config.model, seed.provider, prompt, splice.api_key, **kw)
+        text = d["choices"][0].get("text") or ""
+        return d, text, spec.parser(text), False
+    # Stage 1: the reasoning, up to (not including) its closing token.
+    d1 = await _complete_with_retry(seed.config.model, seed.provider, prompt, splice.api_key, stop=[close], **kw)
+    reasoning = d1["choices"][0].get("text") or ""
+    one_shot = spec.parser(reasoning)
+    if d1["choices"][0].get("finish_reason") != "stop" or one_shot.complete:
+        # the stop did not fire (cut off, or the provider ignored it): single-shot parse
+        return d1, reasoning, one_shot, False
+    # Stage 2: everything after the reasoning block (message and/or tool call, or nothing).
+    d2 = await _complete_with_retry(seed.config.model, seed.provider, prompt + reasoning + close,
+                                    splice.api_key, **kw)
+    rest = d2["choices"][0].get("text") or ""
+    parsed = spec.rest_parser(rest)
+    parsed.reasoning = reasoning
+    u1, u2 = d1.get("usage") or {}, d2.get("usage") or {}
+    d = {**d2, "usage": {"prompt_tokens": u1.get("prompt_tokens"),
+                         "completion_tokens": (u1.get("completion_tokens") or 0) + (u2.get("completion_tokens") or 0)}}
+    return d, reasoning + close + rest, parsed, True
 
 
 async def _complete_with_retry(*args, attempts: int = 12, **kwargs) -> dict:
@@ -357,7 +393,7 @@ async def run_branch(cfg, base_cfg: RunConfig, arm_name: str, rep: int, run_dir:
                                  if str(o).partition("=")[0].strip() != "model_reasoning_effort"]
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     splice = BranchSplice(seed, prefix, str(work_dir), api_key, arm.get("history_replace"),
-                          max_attempts=bc.max_step_attempts)
+                          max_attempts=bc.max_step_attempts, passthrough=bool(arm.get("passthrough")))
     shadow = ShadowGit(work_dir=work_dir, git_dir=run_dir / ".shadow_git")
     shadow.init()
     shadow.commit_baseline()

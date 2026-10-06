@@ -253,22 +253,44 @@ def _splice_with(seed_run, monkeypatch, texts, **req_extra):
 GOOD = ' ok.exec_command{"name":"exec_command","args":{"cmd":"pytest"}}'
 
 
-def test_splice_resamples_unparsed_action(seed_run, monkeypatch):
-    splice, seen = _splice_with(seed_run, monkeypatch, [" I will run", GOOD])
+def test_splice_resamples_empty_turn(seed_run, monkeypatch):
+    # stage 1 = reasoning, stage 2 = nothing at all (no message, no call): re-sampled
+    splice, seen = _splice_with(seed_run, monkeypatch, [" I will run", "", " I will run", GOOD])
     assert splice.meta["n_attempts"] == 2 and splice.meta["action_parsed"] is True
     assert [a["action_parsed"] for a in splice.meta["attempts"]] == [False, True]
-    assert splice.meta["tool_calls"][0]["name"] == "exec_command"
+    assert splice.meta["tool_calls"][0]["name"] == "exec_command" and splice.meta["staged"] is True
 
 
 def test_splice_gives_up_after_max_attempts(seed_run, monkeypatch):
-    splice, seen = _splice_with(seed_run, monkeypatch, [" no action"])
-    assert splice.meta["n_attempts"] == 3 and splice.meta["action_parsed"] is False and len(seen) == 3
+    splice, seen = _splice_with(seed_run, monkeypatch, [" thinking", ""] * 3)
+    assert splice.meta["n_attempts"] == 3 and splice.meta["action_parsed"] is False and len(seen) == 6
+
+
+def test_splice_staged_splits_message_and_tool_call(seed_run, monkeypatch):
+    splice, seen = _splice_with(seed_run, monkeypatch, [" Let me test it.", "I'll run the tests now." + GOOD.strip()[3:]])
+    assert splice.meta["staged"] is True and splice.meta["n_attempts"] == 1
+    assert splice.meta["message"] == "I'll run the tests now."
+    assert splice.meta["tool_calls"][0]["name"] == "exec_command"
+    assert seen[0]["stop"] == ["<|end_message|>"] and "stop" not in seen[1]
+
+
+def test_splice_accepts_a_text_only_answer(seed_run, monkeypatch):
+    # a refusal / final answer without a tool call is a valid turn, not a parse failure
+    splice, seen = _splice_with(seed_run, monkeypatch, [" This asks me to game it.", "I can't do that."])
+    assert splice.meta["action_parsed"] is True and splice.meta["n_attempts"] == 1
+    assert splice.meta["message"] == "I can't do that." and splice.meta["tool_calls"] == []
+
+
+def test_splice_falls_back_when_stop_not_honored(seed_run, monkeypatch):
+    # the stop sequence did not fire: the whole turn came back in stage 1 -> single-shot parse
+    splice, seen = _splice_with(seed_run, monkeypatch, [GOOD])
+    assert splice.meta["staged"] is False and len(seen) == 1 and splice.meta["action_parsed"] is True
 
 
 def test_splice_uses_request_sampling(seed_run, monkeypatch):
     splice, seen = _splice_with(seed_run, monkeypatch, [GOOD], temperature=0.7, top_p=0.9,
                                 reasoning={"effort": "high"})
-    assert seen == [{"temperature": 0.7, "top_p": 0.9}]
+    assert seen == [{"temperature": 0.7, "top_p": 0.9, "stop": ["<|end_message|>"]}]
     assert splice.meta["sampling"] == {"reasoning_effort": "high", "temperature": 0.7, "top_p": 0.9}
     assert splice.meta["sampling_matches_seed"] is False   # the fixture seed sent none
 
@@ -341,3 +363,35 @@ def test_splice_retries_prefill_and_fails_without_consuming_the_step(seed_run, m
     with pytest.raises(RuntimeError):
         asyncio.run(splice2(dict(req), 1))
     assert splice2.n == 0          # the next (retried) request is intercepted again
+
+
+def test_passthrough_arm_validation():
+    br = {"seed_run": "x", "request": 4, "arms": {"pt": {"passthrough": True}}}
+    cfg = _sweep(pressure={"variable": "branch_arm", "values": ["pt"]}, branch=br)
+    assert cfg.branch.arms["pt"].passthrough is True
+    with pytest.raises(ValueError, match="exactly one"):
+        _sweep(pressure={"variable": "branch_arm", "values": ["a"]},
+               branch={**br, "arms": {"a": {"passthrough": True, "prefix": ""}}})
+    with pytest.raises(ValueError, match="edits nothing"):
+        _sweep(pressure={"variable": "branch_arm", "values": ["a"]},
+               branch={**br, "arms": {"a": {"passthrough": True, "append": " x"}}})
+
+
+def test_splice_passthrough_forwards_the_branch_request(seed_run, monkeypatch):
+    from pipeline import branch
+    run, old_cwd = seed_run
+    seed = branch.Seed(run, 2)
+
+    async def no_prefill(*a, **k):
+        raise AssertionError("passthrough must not prefill")
+
+    monkeypatch.setattr(branch, "complete_raw", no_prefill)
+    assert seed.prefix_for({"passthrough": True}) == ""
+    splice = branch.BranchSplice(seed, "", "/tmp/ws/bbbbbbbbbbbb", "key", passthrough=True)
+    expected = json.loads(json.dumps(seed.request["input"]).replace(old_cwd, "/tmp/ws/bbbbbbbbbbbb"))
+    req = {"input": expected + [_m("developer", "p"), _m("user", RESUME_MARKER)]}
+    assert asyncio.run(splice(req, 1)) is None            # forwarded to the provider's chat path
+    assert req["input"] == expected and RESUME_MARKER not in json.dumps(req)
+    assert splice.meta["passthrough"] is True and splice.meta["first_request_matches_seed"] is True
+    assert "continuation" not in splice.meta and splice.n == 1
+    assert asyncio.run(splice({"input": expected + [_m("user", RESUME_MARKER)]}, 2)) is None

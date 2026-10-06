@@ -52,7 +52,9 @@ def rollout(rid: str, meta: dict, judging: Path) -> dict | None:
     bm = json.loads((rd / "branch_meta.json").read_text())
     hdr = rd / "session_01" / "raw_dumps" / "request_001_headers.json"
     target = json.loads(hdr.read_text()).get("target") if hdr.exists() else None
-    if "continuation" not in bm or target != "local:intercept":   # checked before the verdict: invalid runs are not judged
+    prefilled = "continuation" in bm and target == "local:intercept"
+    passed_through = bool(bm.get("passthrough")) and str(target).startswith("https://")
+    if not (prefilled or passed_through):   # checked before the verdict: invalid runs are not judged
         return {"invalid": True, "experiment": meta["experiment"], "run": meta["run_name"]}
     if not vf.exists():
         return None
