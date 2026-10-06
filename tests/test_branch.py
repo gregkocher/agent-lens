@@ -254,17 +254,55 @@ def _splice_with(seed_run, monkeypatch, texts, **req_extra):
 GOOD = ' ok.exec_command{"name":"exec_command","args":{"cmd":"pytest"}}'
 
 
-def test_splice_resamples_empty_turn(seed_run, monkeypatch):
-    # stage 1 = reasoning, stage 2 = nothing at all (no message, no call): re-sampled
-    splice, seen = _splice_with(seed_run, monkeypatch, [" I will run", "", " I will run", GOOD])
-    assert splice.meta["n_attempts"] == 2 and splice.meta["action_parsed"] is True
+def test_splice_accepts_a_reasoning_only_turn(seed_run, monkeypatch):
+    # stage 1 = reasoning, stage 2 = nothing (the turn ends after thinking): a valid turn,
+    # answered as reasoning only, as the provider's chat path would
+    from harness.reasoning_capture import parse_responses_sse
+    splice, seen = _splice_with(seed_run, monkeypatch, [" Nothing more to do.", ""])
+    assert splice.meta["action_parsed"] is True and splice.meta["n_attempts"] == 1
+    assert splice.meta["message"] == "" and splice.meta["tool_calls"] == [] and len(seen) == 2
+
+
+def test_splice_resamples_a_cut_off_stage_two(seed_run, monkeypatch):
+    from pipeline import branch
+    run, old_cwd = seed_run
+    seed = branch.Seed(run, 2)
+    texts = [(" Let me write it.", "stop"), ('exec_command{"name":"exec_command","args":{"cmd":"cat > a', "length"),
+             (" Let me write it.", "stop"), (GOOD.strip()[3:], "stop")]
+    seen = []
+
+    async def fake_complete(model, provider, prompt, api_key, **kw):
+        t, fr = texts[len(seen)]
+        seen.append(kw)
+        return {"choices": [{"text": t, "finish_reason": fr}], "usage": {"prompt_tokens": 42}}
+
+    monkeypatch.setattr(branch, "render_prompt", lambda *a, **k: ("PROMPT", 42))
+    monkeypatch.setattr(branch, "complete_raw", fake_complete)
+    splice = branch.BranchSplice(seed, "Look.", "/tmp/ws/bbbbbbbbbbbb", "key")
+    req = {"input": json.loads(json.dumps(seed.request["input"]).replace(old_cwd, "/tmp/ws/bbbbbbbbbbbb"))}
+    asyncio.run(splice(req, 1))
     assert [a["action_parsed"] for a in splice.meta["attempts"]] == [False, True]
-    assert splice.meta["tool_calls"][0]["name"] == "exec_command" and splice.meta["staged"] is True
+    assert splice.meta["tool_calls"][0]["name"] == "exec_command" and splice.meta["message"] == ""
 
 
 def test_splice_gives_up_after_max_attempts(seed_run, monkeypatch):
-    splice, seen = _splice_with(seed_run, monkeypatch, [" thinking", ""] * 3)
-    assert splice.meta["n_attempts"] == 3 and splice.meta["action_parsed"] is False and len(seen) == 6
+    # stage 1 never reaches the end of the reasoning (cut off by max_tokens): no action, 3 tries
+    from pipeline import branch
+    run, old_cwd = seed_run
+    seed = branch.Seed(run, 2)
+    seen = []
+
+    async def fake_complete(model, provider, prompt, api_key, **kw):
+        seen.append(kw)
+        return {"choices": [{"text": " still thinking", "finish_reason": "length"}], "usage": {}}
+
+    monkeypatch.setattr(branch, "render_prompt", lambda *a, **k: ("PROMPT", 42))
+    monkeypatch.setattr(branch, "complete_raw", fake_complete)
+    splice = branch.BranchSplice(seed, "Look.", "/tmp/ws/bbbbbbbbbbbb", "key")
+    req = {"input": json.loads(json.dumps(seed.request["input"]).replace(old_cwd, "/tmp/ws/bbbbbbbbbbbb"))}
+    asyncio.run(splice(req, 1))
+    assert splice.meta["n_attempts"] == 3 and splice.meta["action_parsed"] is False and len(seen) == 3
+    assert splice.meta["staged"] is False
 
 
 def test_splice_staged_splits_message_and_tool_call(seed_run, monkeypatch):

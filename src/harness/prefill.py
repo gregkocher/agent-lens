@@ -68,13 +68,14 @@ def parse_inkling(text: str) -> ParsedOutput:
 def parse_inkling_rest(text: str) -> ParsedOutput:
     """What Inkling writes after its reasoning block (stage 2 of a staged branch step):
     an optional visible message, then optionally ``<name>{"name": ..., "args": ...}``
-    (special tokens stripped). Everything before the tool call is the message; a turn
-    with only a message (e.g. a final answer or a refusal) is a complete action."""
+    (special tokens stripped). Everything before the tool call is the message. Every
+    shape is a valid turn, as on the provider's chat path: a message only (final answer,
+    refusal), or nothing at all (the turn ends after the reasoning). Whether stage 2
+    ended normally (not cut off) is checked by the caller."""
     p = parse_inkling(text)
     if p.complete:
         return ParsedOutput(reasoning="", tool_calls=p.tool_calls, message=p.reasoning.strip())
-    message = text.strip()
-    return ParsedOutput(reasoning="", message=message, complete=bool(message))
+    return ParsedOutput(reasoning="", message=text.strip())
 
 
 _KIMI_CALL = re.compile(r"<\|tool_call_begin\|>\s*([^<]+?)\s*<\|tool_call_argument_begin\|>(.*?)<\|tool_call_end\|>", re.S)

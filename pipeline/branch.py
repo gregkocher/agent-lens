@@ -279,6 +279,8 @@ async def _staged_or_single(splice: "BranchSplice", prompt: str, sampling: dict)
     rest = d2["choices"][0].get("text") or ""
     parsed = spec.rest_parser(rest)
     parsed.reasoning = reasoning
+    if d2["choices"][0].get("finish_reason") != "stop":
+        parsed.complete = False   # cut off (e.g. a truncated tool call): re-sample, never guess
     u1, u2 = d1.get("usage") or {}, d2.get("usage") or {}
     d = {**d2, "usage": {"prompt_tokens": u1.get("prompt_tokens"),
                          "completion_tokens": (u1.get("completion_tokens") or 0) + (u2.get("completion_tokens") or 0)}}
