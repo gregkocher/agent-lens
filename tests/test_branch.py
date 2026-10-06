@@ -28,8 +28,9 @@ from harness.shadow_git import ShadowGit
 def test_parse_inkling_stripped_tokens():
     p = parse_inkling('so I will list.exec_command{"name":"exec_command","args":{"cmd":"ls -la"}}')
     assert p.complete and p.reasoning == "so I will list." and p.tool_calls[0]["name"] == "exec_command"
-    assert json.loads(p.tool_calls[0]["arguments"]) == {"cmd": "ls -la"}
+    assert p.tool_calls[0]["arguments"] == '{"cmd":"ls -la"}'   # byte-identical to the model's text
     assert not parse_inkling("just thinking, no action").complete
+    assert not parse_inkling('x.exec_command{"name":"exec_command","args":{"cmd": "ls}}').complete
 
 
 def test_parse_kimi_with_spaced_markers():

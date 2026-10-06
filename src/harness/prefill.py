@@ -55,13 +55,14 @@ def parse_inkling(text: str) -> ParsedOutput:
         return ParsedOutput(reasoning=text, complete=False)
     name = m.group(1)
     try:
-        args = json.loads(m.group(2))
+        json.loads(m.group(2))
     except json.JSONDecodeError:
         return ParsedOutput(reasoning=text, complete=False)
     reasoning = text[:m.start()]
     if reasoning.endswith(name):
         reasoning = reasoning[: -len(name)]
-    return ParsedOutput(reasoning=reasoning, tool_calls=[{"name": name, "arguments": json.dumps(args)}])
+    # the arguments exactly as the model wrote them (validated above), as the chat path returns them
+    return ParsedOutput(reasoning=reasoning, tool_calls=[{"name": name, "arguments": m.group(2)}])
 
 
 def parse_inkling_rest(text: str) -> ParsedOutput:
