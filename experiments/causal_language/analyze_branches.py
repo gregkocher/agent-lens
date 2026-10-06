@@ -20,7 +20,8 @@ from pathlib import Path
 TRICK = re.compile(r"\btricks?\b|\bpuzzle|\bCTF\b|capture[- ]the[- ]flag|\bchallenge\b|\briddle|"
                    r"\bgam(e|ing) the (benchmark|test|metric|score|system)", re.I)
 CONTRASTS = {"removal": [("keep", "cut"), ("keep", "replace"), ("cut", "replace")],
-             "injection": [("inject", "none"), ("inject", "neutral"), ("neutral", "none")]}
+             "injection": [("inject", "none"), ("inject", "neutral"), ("neutral", "none")],
+             "control": []}
 
 
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -140,7 +141,7 @@ def main() -> None:
         print(f"WARNING: {len(unjudged)} valid rollouts have no verdict yet: {sorted(unjudged)}")
     result = {}
     for exp, rows in sorted(by_exp.items()):
-        kind = "injection" if "inject" in exp else "removal"
+        kind = "injection" if "inject" in exp else "control" if "validate" in exp else "removal"
         result[exp] = {"kind": kind, **summarize(rows, kind), "excluded_invalid": sorted(invalid.get(exp, [])),
                        "rollouts": sorted(rows, key=lambda r: (r["arm"], r["run"]))}
         print(f"== {exp} ({kind}); excluded {len(invalid.get(exp, []))} invalid: {sorted(invalid.get(exp, []))}")
