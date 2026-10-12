@@ -310,37 +310,47 @@ def _is_action_step(step: dict) -> bool:
     return bool((step.get("message") or "").strip())
 
 
-def attach_reasoning(steps: list[dict], records: list[ResponseRecord], window: int = 12) -> dict:
-    """Attach each record's reasoning to the step carrying its action (monotonic
-    alignment by action content; unmatched reasoning-only records roll forward onto the
-    next matched step so no reasoning is dropped). Steps that already have reasoning from
-    the engine stream keep it. Mutates ``steps``; returns coverage stats."""
+def attach_reasoning(steps: list[dict], records: list[ResponseRecord], window: int = 12,
+                     back: int = 8) -> dict:
+    """Attach each record's reasoning to the step carrying its action. Steps that already
+    have reasoning from the engine stream keep it. Mutates ``steps``; returns coverage stats.
+
+    Matching is by action content, request by request: each record takes the EARLIEST
+    unused action step that matches it, searched from ``back`` steps before the previous
+    match to ``window`` steps after it. Steps can be recorded out of request order (Codex
+    emits a command when it FINISHES, so a long-running command lands after commands
+    issued later); a strictly monotonic walk would then match a later identical command
+    (e.g. a repeated test run) and pile the skipped responses' reasoning onto one wrong
+    step. Records that match no step (reasoning only, or an action that never surfaced)
+    roll forward onto the next matched step, so no reasoning is dropped.
+    """
     stats = {"records": len(records), "with_reasoning": sum(1 for r in records if r.reasoning),
              "attached": 0, "steps_filled": 0, "kinds": {}, "unmatched_records": 0,
              "record_steps": {}}  # request_index -> step_id of the response's first action
     # Reasoning the engine stream already carried (e.g. Claude Code emits thinking as its
     # own step before the tool-call step): never copy it a second time.
     stats["_present"] = {_norm(s.get("reasoning_content") or "")[:400] for s in steps if s.get("reasoning_content")}
-    p = 0
-    used = 0  # actions of records[p - 1] already matched to steps
     action_steps = [s for s in steps if _is_action_step(s)]
-    for step in action_steps:
-        strs = _step_keys(step)
-        if p > 0 and used < records[p - 1].n_actions and _matches(records[p - 1], strs):
-            used += 1
-            continue  # another action of the same response (e.g. message + call, 2 calls)
-        j = next((k for k in range(p, min(len(records), p + window)) if _matches(records[k], strs)), None)
-        if j is None:
+    keys = [_step_keys(s) for s in action_steps]
+    used: set[int] = set()
+    pending: list[ResponseRecord] = []
+    last = -1
+    for rec in records:
+        lo, hi = max(0, last - back), min(len(action_steps), last + 1 + window)
+        cands = [i for i in range(lo, hi) if i not in used and _matches(rec, keys[i])] if rec.n_actions else []
+        if not cands:
+            pending.append(rec)
             continue
-        group = records[p:j + 1]
-        stats["record_steps"][records[j].request_index] = step.get("step_id")
-        p = j + 1
-        used = 1
-        _apply(step, group, stats)
-    leftover = [r for r in records[p:] if r.reasoning]
+        first = cands[0]
+        used.update(cands[:max(1, rec.n_actions)])   # e.g. message + call of one response
+        stats["record_steps"][rec.request_index] = action_steps[first].get("step_id")
+        _apply(action_steps[first], pending + [rec], stats)
+        pending = []
+        last = max(last, first)
+    leftover = [r for r in pending if r.reasoning]
     if leftover and action_steps:  # e.g. a final response with no action: keep its reasoning
         _apply(action_steps[-1], leftover, stats, append=True)
-    stats["unmatched_records"] = len(records) - p
+    stats["unmatched_records"] = len(pending)
     stats.pop("_present", None)
     return stats
 

@@ -244,3 +244,22 @@ def test_final_reasoning_without_action_is_kept(tmp_path):
     steps = [_step(1, "ls -la")]
     stats = attach_reasoning(steps, records_from_raw_dumps(tmp_path))
     assert steps[0]["reasoning_content"] == "first\n\nfinal thoughts, no action" and stats["unmatched_records"] == 1
+
+
+def test_alignment_tolerates_out_of_order_steps(tmp_path):
+    # Codex records a command when it FINISHES: the long test run issued by request 2 lands
+    # after the commands of requests 3-4. The run is repeated by request 5. A monotonic walk
+    # matched step "test" to request 5 and piled R3-R5 onto it; each response must keep its own.
+    _write_dumps(tmp_path, [
+        [_reason(text="R1"), _call("cat cache.py")],
+        [_reason(text="R2"), _call("timeout 60 python3 test_cache.py")],
+        [_reason(text="R3"), _call("cat > a.py")],
+        [_reason(text="R4"), _call("ls")],
+        [_reason(text="R5"), _call("timeout 60 python3 test_cache.py")],
+    ])
+    steps = [_step(1, "cat cache.py"), _step(2, "cat > a.py"), _step(3, "ls"),
+             _step(4, "timeout 60 python3 test_cache.py"), _step(5, "timeout 60 python3 test_cache.py")]
+    stats = attach_reasoning(steps, records_from_raw_dumps(tmp_path))
+    got = {s["step_id"]: s.get("reasoning_content") for s in steps}
+    assert got == {1: "R1", 2: "R3", 3: "R4", 4: "R2", 5: "R5"}
+    assert stats["record_steps"] == {1: 1, 2: 4, 3: 2, 4: 3, 5: 5} and stats["unmatched_records"] == 0

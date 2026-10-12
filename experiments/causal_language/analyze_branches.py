@@ -143,7 +143,7 @@ def main() -> None:
         print(f"WARNING: {len(unjudged)} valid rollouts have no verdict yet: {sorted(unjudged)}")
     result = {}
     for exp, rows in sorted(by_exp.items()):
-        kind = "injection" if "inject" in exp else "control" if "validate" in exp else "removal"
+        kind = "injection" if "inject" in exp else "control" if any(t in exp for t in ("validate", "passthrough", "req1")) else "removal"
         result[exp] = {"kind": kind, **summarize(rows, kind), "excluded_invalid": sorted(invalid.get(exp, [])),
                        "rollouts": sorted(rows, key=lambda r: (r["arm"], r["run"]))}
         print(f"== {exp} ({kind}); excluded {len(invalid.get(exp, []))} invalid: {sorted(invalid.get(exp, []))}")
