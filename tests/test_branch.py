@@ -182,6 +182,21 @@ def seed_run(tmp_path):
     return run, old_cwd
 
 
+def test_seed_prefix_replaces_stale_reasoning(seed_run):
+    """Reasoning saved in the seed's trajectory (e.g. from an older alignment, possibly from
+    requests after the branch point) must not survive into the prefix the judge reads."""
+    from pipeline.branch import Seed
+    run, _ = seed_run
+    tp = run / "session_01" / "trajectory.json"
+    traj = json.loads(tp.read_text())
+    for s in traj["steps"]:
+        s["reasoning_content"] = "reasoning from a later request"
+    tp.write_text(json.dumps(traj))
+    seed = Seed(run, 2)
+    assert seed.prefix_steps[1]["reasoning_content"] == "first look"
+    assert all("later request" not in (s.get("reasoning_content") or "") for s in seed.prefix_steps)
+
+
 def test_seed_locates_branch_step_and_arms(seed_run):
     from pipeline.branch import Seed
     run, old_cwd = seed_run

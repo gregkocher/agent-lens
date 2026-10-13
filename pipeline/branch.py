@@ -132,8 +132,14 @@ class Seed:
         if step_id is None:
             raise ValueError(f"could not locate the trajectory step produced by request {self.k}")
         self.branch_step_id: int = step_id
-        # Seed steps before the branch point, with their reasoning recovered.
+        # Seed steps before the branch point, with their reasoning recovered from the requests
+        # before k only. Reasoning already in the seed's trajectory is dropped first: it may come
+        # from an older alignment that put later requests' reasoning on these steps, and
+        # attach_reasoning never overwrites a step that already has reasoning.
         self.prefix_steps = [s for s in json.loads(json.dumps(steps)) if s.get("step_id", 0) < step_id]
+        for s in self.prefix_steps:
+            s.pop("reasoning_content", None)
+            (s.get("extra") or {}).pop("reasoning_kind", None)
         attach_reasoning(self.prefix_steps, records_from_raw_dumps(self.session)[: self.k - 1])
         tags = subprocess.run(["git", "--git-dir", str(self.run_dir / ".shadow_git"), "tag"],
                               capture_output=True, text=True, check=True).stdout.split()
