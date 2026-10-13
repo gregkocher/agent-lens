@@ -190,7 +190,7 @@ def test_seed_locates_branch_step_and_arms(seed_run):
     assert [s["step_id"] for s in seed.prefix_steps] == [1, 2]
     assert seed.prefix_steps[1]["reasoning_content"] == "first look"      # recovered for the judge
     assert seed.prefix_for({"prefix_until": "Actually,"}) == "Look at the code."   # trailing space stripped
-    assert seed.prefix_for({"prefix_until": "Actually,", "append": " Wait.\n\n"}) == "Look at the code.  Wait."
+    assert seed.prefix_for({"prefix_until": "Actually,", "append": " Wait.\n\n"}) == "Look at the code. Wait."   # no doubled separator at the seam
     assert seed.prefix_for({"prefix_through": "cheat."}) == "Look at the code. Actually, let me think about whether I can cheat."
     assert seed.prefix_for({"full_original": True, "append": " Hmm."}) == REASONING + " Hmm."
     with pytest.raises(ValueError, match="not found"):
@@ -434,3 +434,16 @@ def test_splice_passthrough_forwards_the_branch_request(seed_run, monkeypatch):
     assert splice.meta["passthrough"] is True and splice.meta["first_request_matches_seed"] is True
     assert "continuation" not in splice.meta and splice.n == 1
     assert asyncio.run(splice({"input": expected + [_m("user", RESUME_MARKER)]}, 2)) is None
+
+
+def test_prefix_seam_has_no_doubled_separator(seed_run):
+    from pipeline import branch
+    run, _ = seed_run
+    seed = branch.Seed(run, 2)
+    r = seed.original_reasoning
+    cut = seed.prefix_for({"prefix_until": "Actually,"})
+    rep = seed.prefix_for({"prefix_until": "Actually,", "append": " Let me look at the code."})
+    assert rep == r[: r.find("Actually,")] + "Let me look at the code." and "  " not in rep
+    assert cut == r[: r.find("Actually,")].rstrip()
+    ins = seed.prefix_for({"prefix_through": "Look at the code.", "append": " New sentence."})
+    assert ins.endswith("Look at the code. New sentence.")

@@ -161,9 +161,15 @@ class Seed:
             base = r[: i + len(arm["prefix_through"])]
         else:
             raise ValueError("a branch arm needs one of: prefix, full_original, prefix_until, prefix_through")
+        append = arm.get("append") or ""
+        if append and base[-1:].isspace():
+            # base already ends with the original separator before the cut sentence (e.g. a
+            # space or a blank line): keep it and drop the inserted sentence's own leading
+            # whitespace, so the seam never gets a doubled separator.
+            append = append.lstrip()
         # Trailing whitespace would be its own token(s) where the model would naturally
         # emit e.g. " The" next, an unnatural tokenization at the seam.
-        return (base + (arm.get("append") or "")).rstrip()
+        return (base + append).rstrip()
 
     def truncated_rollout(self, new_cwd: str) -> tuple[list[dict], str]:
         need = len(self.request.get("input") or [])
