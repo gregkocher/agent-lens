@@ -14,7 +14,7 @@ pressure:
   - onpol4
   - nonseq
   - handpick
-n_reps: 20
+n_reps: 60
 n_trajectory_workers: 1
 branch:
   seed_run: pipeline_runs/causal_seeds_inkling_lru/trajectories/bp_poutcome_focus_r5
