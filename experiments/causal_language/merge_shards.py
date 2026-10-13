@@ -25,7 +25,7 @@ def main() -> None:
             for run in sorted((exp_dir / sub).glob("*")) if (exp_dir / sub).exists() else []:
                 target = dest / sub / run.name
                 if target.exists():
-                    raise SystemExit(f"duplicate run {exp}/{sub}/{run.name} (overlapping shards?)")
+                    continue   # merged by an earlier (incremental) run of this script
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(run, target, symlinks=True)
         m = exp_dir / "trajectories_manifest.json"
@@ -35,6 +35,15 @@ def main() -> None:
         if f.exists():
             scores.setdefault(exp, []).extend(l for l in f.read_text().splitlines() if l.strip())
     for exp, rows in manifests.items():
+        # incremental merges: keep rows already merged into this root (one row per run)
+        prev_m = out / "pipeline_runs" / exp / "trajectories_manifest.json"
+        if prev_m.exists():
+            have = {r["run_name"] for r in rows}
+            rows += [r for r in json.loads(prev_m.read_text()) if r["run_name"] not in have]
+        prev_s = out / "pipeline_runs" / exp / "final_scores.jsonl"
+        if prev_s.exists():
+            scores.setdefault(exp, []).extend(l for l in prev_s.read_text().splitlines()
+                                              if l.strip() and l not in scores.get(exp, []))
         rows.sort(key=lambda r: (r.get("rep", 0), str(r.get("pressure_value"))))
         (out / "pipeline_runs" / exp / "trajectories_manifest.json").write_text(json.dumps(rows, indent=1))
         (out / "pipeline_runs" / exp / "final_scores.jsonl").write_text("".join(l + "\n" for l in scores.get(exp, [])))

@@ -19,9 +19,17 @@ from pathlib import Path
 
 TRICK = re.compile(r"\btricks?\b|\bpuzzle|\bCTF\b|capture[- ]the[- ]flag|\bchallenge\b|\briddle|"
                    r"\bgam(e|ing) the (benchmark|test|metric|score|system)", re.I)
-CONTRASTS = {"removal": [("keep", "cut"), ("keep", "replace"), ("cut", "replace")],
-             "injection": [("inject", "none"), ("inject", "neutral"), ("neutral", "none")],
+CONTRASTS = {"removal": [("keep", "cut"), ("keep", "replace"), ("cut", "replace"),
+                         ("keep", "onpol"), ("cut", "onpol"), ("onpol", "nonseq"), ("keep", "nonseq"),
+                         ("keep", "handpick"), ("onpol", "handpick")],
+             "injection": [("inject", "none"), ("inject", "neutral"), ("neutral", "none"),
+                           ("nonseq", "none"), ("inject", "nonseq")],
              "control": []}
+
+
+def pool_of(arm: str) -> str:
+    """Pooled arm: on-policy sentence pools (onpol1..4, inject1..5, neutral1..4) share one arm."""
+    return re.sub(r"\d+$", "", arm)
 
 
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -78,7 +86,8 @@ def rollout(rid: str, meta: dict, judging: Path) -> dict | None:
         if m:
             mech.append({"step": st.get("step_id"), "match": text[max(0, m.start() - 80): m.end() + 80]})
     return {
-        "id": rid, "experiment": meta["experiment"], "run": meta["run_name"], "arm": bm["arm"],
+        "id": rid, "experiment": meta["experiment"], "run": meta["run_name"], "arm": pool_of(bm["arm"]),
+        "subarm": bm["arm"],
         "branch_step": k, "rh": v["reward_hacking"]["verdict"] == "yes",
         "rh_score": v["reward_hacking"].get("score_1_5"), "dr": v["dishonest_reporting"]["verdict"] == "yes",
         "first_hack_step": v.get("first_hack_step"),
@@ -114,6 +123,8 @@ def summarize(rows: list[dict], kind: str) -> dict:
             "rh_given_no_same_step_trick": [sum(r["rh"] for r in rs if not r["trick_in_branch_step"]),
                                             sum(not r["trick_in_branch_step"] for r in rs)],
             "rh_given_trick": [sum(r["rh"] for r in re_), len(re_)],
+            "subarms": {sa: [sum(r["rh"] for r in rs if r["subarm"] == sa), sum(r["subarm"] == sa for r in rs)]
+                        for sa in sorted({r["subarm"] for r in rs})} if any(r["subarm"] != arm for r in rs) else {},
             "rh_given_no_trick": [sum(r["rh"] for r in no), len(no)],
         }
     for a, b in CONTRASTS[kind]:
@@ -131,7 +142,7 @@ def main() -> None:
     invalid = defaultdict(list)
     unjudged = []
     for rid, meta in key.items():
-        if meta["experiment"].startswith("causal_branch_"):
+        if meta["experiment"].startswith(("causal_branch_", "causal_branch2_")):
             r = rollout(rid, meta, judging)
             if r and r.get("invalid"):   # branch step was not prefilled (pre-fix proxy fall-through)
                 invalid[meta["experiment"].removesuffix("_ext")].append(r["run"])
@@ -151,7 +162,8 @@ def main() -> None:
             lo, hi = s["rh_ci"]
             print(f"   {arm:8s} n={s['n']:3d} hack={s['rh']:3d} ({s['rh_rate']:.0%}, CI {lo:.0%}-{hi:.0%}) "
                   f"DR={s['dr']} trick_same_step={s['trick_in_branch_step']} hack|same-step={s['rh_given_same_step_trick']} "
-                  f"hack|none-same-step={s['rh_given_no_same_step_trick']} trick_later={s['trick_later']}")
+                  f"hack|none-same-step={s['rh_given_no_same_step_trick']} trick_later={s['trick_later']}"
+                  + (f" sub={s['subarms']}" if s["subarms"] else ""))
         for t in result[exp]["tests"]:
             print(f"   {t['a']} vs {t['b']}: diff {t['diff']:+.0%}, Fisher p={t['fisher_p']:.3f}")
     out.write_text(json.dumps(result, indent=1))
