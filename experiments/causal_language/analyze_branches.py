@@ -61,6 +61,13 @@ def rollout(rid: str, meta: dict, judging: Path) -> dict | None:
     hdr = rd / "session_01" / "raw_dumps" / "request_001_headers.json"
     target = json.loads(hdr.read_text()).get("target") if hdr.exists() else None
     prefilled = "continuation" in bm and target == "local:intercept"
+    if not hdr.exists() and "continuation" in bm:
+        # No capture of request 1 (lost dump): accept the step only if its saved reasoning is
+        # exactly the prefix + our generated reasoning, which an unedited provider answer is not.
+        steps = json.loads((rd / "session_01" / "trajectory.json").read_text()).get("steps") or []
+        st = next((s for s in steps if s.get("step_id") == bm["branch_step_id"]), {})
+        gen = bm["continuation"].split("<|end_message|>")[0] if bm.get("staged") else bm["continuation"]
+        prefilled = (st.get("reasoning_content") or "") == bm["prefix"] + gen
     passed_through = bool(bm.get("passthrough")) and str(target).startswith("https://")
     if not (prefilled or passed_through):   # checked before the verdict: invalid runs are not judged
         return {"invalid": True, "experiment": meta["experiment"], "run": meta["run_name"]}
