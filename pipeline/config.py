@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -362,6 +363,9 @@ class SweepConfig(BaseModel):
     # OpenRouter provider pin (e.g. ["together"]): every request of every run is served by
     # the same upstream, so seeds and branch rollouts are directly comparable.
     agent_provider_order: list[str] | None = None
+    # Codex: have the capture proxy request reasoning summaries ("auto" | "concise" |
+    # "detailed") on every request (RunConfig.codex_inject_reasoning_summary).
+    agent_reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
 
     # Only used when pressure.variable == 'prompt_variant': maps each variant key listed in
     # pressure.values to the EXACT session-prompt text for that arm (the only thing differing

@@ -80,6 +80,22 @@ def test_proxy_apply_sampling():
     req = {"reasoning": None}
     apply_sampling(req, {"reasoning_effort": "high"})
     assert req == {"reasoning": {"effort": "high"}}
+    # opt-in summary request: filled when missing, the client's own summary is kept
+    req = {"reasoning": {"effort": "high"}}
+    apply_sampling(req, {"reasoning_effort": "high", "reasoning_summary": "detailed"})
+    assert req == {"reasoning": {"effort": "high", "summary": "detailed"}}
+    req = {"reasoning": {"effort": "high", "summary": "auto"}}
+    apply_sampling(req, {"reasoning_summary": "detailed"})
+    assert req["reasoning"]["summary"] == "auto"
+
+
+def test_resolve_sampling_reasoning_summary_opt_in():
+    assert "reasoning_summary" not in model_limits.resolve_sampling(_rc())
+    s = model_limits.resolve_sampling(_rc(codex_inject_reasoning_summary="detailed"))
+    assert s["reasoning_summary"] == "detailed"
+    # needs the capture proxy to be injected at all
+    s = model_limits.resolve_sampling(_rc(codex_inject_reasoning_summary="detailed", capture_api_requests=False))
+    assert "reasoning_summary" not in s
 
 
 # --- Codex model limits -----------------------------------------------------

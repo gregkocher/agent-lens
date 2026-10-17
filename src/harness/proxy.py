@@ -165,16 +165,18 @@ def _detect_api_format(path: str) -> str | None:
 
 
 def apply_sampling(request_data: dict, sampling: dict) -> None:
-    """Set temperature/top_p and fill a missing reasoning effort (Responses API body)."""
+    """Set temperature/top_p and fill a missing reasoning effort / summary (Responses API body)."""
     for k in ("temperature", "top_p"):
         if sampling.get(k) is not None:
             request_data[k] = sampling[k]
-    effort = sampling.get("reasoning_effort")
-    if effort:
+    for key, field in (("reasoning_effort", "effort"), ("reasoning_summary", "summary")):
+        value = sampling.get(key)
+        if not value:
+            continue
         r = request_data.get("reasoning")
         r = dict(r) if isinstance(r, dict) else {}
-        if not r.get("effort"):
-            r["effort"] = effort
+        if not r.get(field):
+            r[field] = value
             request_data["reasoning"] = r
 
 
@@ -221,7 +223,8 @@ class CaptureProxy:
         # resolve_sampling): temperature/top_p set outright, reasoning effort filled in
         # when the client didn't ask for one.
         self._sampling = {k: v for k, v in (sampling or {}).items()
-                          if k in ("temperature", "top_p", "reasoning_effort") and v is not None}
+                          if k in ("temperature", "top_p", "reasoning_effort", "reasoning_summary")
+                          and v is not None}
         # Server-side tool types seen in requests. On OpenRouter a server tool in the
         # tool list makes it drop all prior reasoning items, so this is surfaced.
         self.server_tools_seen: set[str] = set()

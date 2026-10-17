@@ -93,7 +93,10 @@ def resolve_sampling(rc) -> dict:
         p = rp if p is None else p
     if not rc.capture_api_requests:
         t = p = None
-    return {"reasoning_effort": effort, "temperature": t, "top_p": p, "source": source}
+    out = {"reasoning_effort": effort, "temperature": t, "top_p": p, "source": source}
+    if rc.codex_inject_reasoning_summary and rc.capture_api_requests:
+        out["reasoning_summary"] = rc.codex_inject_reasoning_summary
+    return out
 
 
 def resolve_codex_limits(rc) -> dict | None:

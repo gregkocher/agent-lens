@@ -107,6 +107,8 @@ def _build_run_config(cfg: SweepConfig, base_cfg, value, rep: int, work_dir: Pat
         run_config.provider = cfg.agent_provider
     if cfg.agent_provider_order:
         run_config.provider_order = list(cfg.agent_provider_order)
+    if cfg.agent_reasoning_summary:
+        run_config.codex_inject_reasoning_summary = cfg.agent_reasoning_summary
     # Realism / isolation knobs (pipeline-level; see RealismConfig / IsolationConfig).
     if not cfg.realism.seed_memory_file:
         run_config.memory_seed = None

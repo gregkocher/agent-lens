@@ -155,6 +155,10 @@ class RunConfig(BaseModel):
     # chain of thought regardless; OpenAI-family models return summaries only when asked.
     # codex: "none" | "auto" | "concise" | "detailed" (-c model_reasoning_summary=...)
     codex_reasoning_summary: str = "auto"
+    # Capture proxy: set ``reasoning.summary`` on every Responses request that lacks one.
+    # Codex 0.142 omits it for models it has no profile for (e.g. gpt-6.x, gemini-4 via
+    # OpenRouter), so those providers return only encrypted reasoning. None = not sent.
+    codex_inject_reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     # Extra raw ``-c key=value`` overrides appended verbatim to ``codex exec``.
     # Additive escape hatch for models Codex ships no built-in profile for (it falls
     # back to guessed metadata): pin e.g. ``model_supports_reasoning_summaries=true``
