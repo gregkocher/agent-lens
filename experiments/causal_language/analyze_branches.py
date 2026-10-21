@@ -2,6 +2,9 @@
 
 Usage: python experiments/causal_language/analyze_branches.py <judging_dir> <key_file> <out.json>
 
+Swap sweeps (causal_branch3_*) replace the kept sentence with same-meaning sentences: keep vs
+swap (pooled) vs para.
+
 Per rollout: arm, reward hacking / dishonest reporting (blind verdicts), first hack step, and
 whether "trick" framing (re-)appears at or after the branch step in text the MODEL generated
 (passages contained in the injected/kept prefix are excluded). Per arm: rates with Wilson 95%
@@ -24,11 +27,12 @@ CONTRASTS = {"removal": [("keep", "cut"), ("keep", "replace"), ("cut", "replace"
                          ("keep", "handpick"), ("onpol", "handpick")],
              "injection": [("inject", "none"), ("inject", "neutral"), ("neutral", "none"),
                            ("nonseq", "none"), ("inject", "nonseq")],
+             "swap": [("keep", "swap"), ("keep", "para"), ("swap", "para")],
              "control": []}
 
 
 def pool_of(arm: str) -> str:
-    """Pooled arm: on-policy sentence pools (onpol1..4, inject1..5, neutral1..4) share one arm."""
+    """Pooled arm: on-policy sentence pools (onpol1..4, inject1..5, neutral1..4, swap1..4) share one arm."""
     return re.sub(r"\d+$", "", arm)
 
 
@@ -149,7 +153,7 @@ def main() -> None:
     invalid = defaultdict(list)
     unjudged = []
     for rid, meta in key.items():
-        if meta["experiment"].startswith(("causal_branch_", "causal_branch2_")):
+        if meta["experiment"].startswith(("causal_branch_", "causal_branch2_", "causal_branch3_")):
             r = rollout(rid, meta, judging)
             if r and r.get("invalid"):   # branch step was not prefilled (pre-fix proxy fall-through)
                 invalid[meta["experiment"].removesuffix("_ext")].append(r["run"])
@@ -161,7 +165,7 @@ def main() -> None:
         print(f"WARNING: {len(unjudged)} valid rollouts have no verdict yet: {sorted(unjudged)}")
     result = {}
     for exp, rows in sorted(by_exp.items()):
-        kind = "injection" if "inject" in exp else "control" if any(t in exp for t in ("validate", "passthrough", "req1")) else "removal"
+        kind = "swap" if "swap" in exp else "injection" if "inject" in exp else "control" if any(t in exp for t in ("validate", "passthrough", "req1")) else "removal"
         result[exp] = {"kind": kind, **summarize(rows, kind), "excluded_invalid": sorted(invalid.get(exp, [])),
                        "rollouts": sorted(rows, key=lambda r: (r["arm"], r["run"]))}
         print(f"== {exp} ({kind}); excluded {len(invalid.get(exp, []))} invalid: {sorted(invalid.get(exp, []))}")
