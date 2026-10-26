@@ -6,6 +6,7 @@ import json, re, sys
 from pathlib import Path
 
 from pipeline.render import render_trajectory
+from harness.resume import RESUME_MARKER, is_resume_marker
 
 out_dir = Path(sys.argv[1])
 ok_all = True
@@ -43,7 +44,10 @@ for rd in sorted((out_dir / "trajectories").glob("bp_*")):
         "ids_continuous_from_1": [s["step_id"] for s in steps] == list(range(1, len(steps) + 1)),
         "seed_prefix_identical": [(s["step_id"], s.get("tool_calls")) for s in steps[: bm["prefix_steps"]]]
                                  == [(s["step_id"], s.get("tool_calls")) for s in seed_steps[: bm["prefix_steps"]]],
-        "no_marker_in_trajectory": "__agentlens_branch_resume__" not in text and "__agentlens_branch_resume__" not in rendered,
+        "no_marker_in_trajectory": not any(s.get("source") == "user" and str(s.get("message") or "").strip() == RESUME_MARKER
+                                           for s in steps),
+        "no_marker_in_requests": not any(is_resume_marker(it) for b in later for it in b.get("input") or []
+                                         if isinstance(it, dict)),
         "first_request_answered_locally": hdr1.get("target") == "local:intercept",
         "later_requests_pinned": all((b.get("provider") or {}).get("order") == [bm["provider"]] for b in later),
         "no_server_tools": all(t.get("type") in ("function", "namespace", "custom") for b in later for t in b.get("tools") or []),

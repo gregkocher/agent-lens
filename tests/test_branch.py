@@ -99,6 +99,10 @@ def test_strip_resume_additions():
     assert strip_resume_additions(resumed, keep=3) == history
     assert strip_resume_additions(later, keep=3) == history + [{"type": "function_call", "name": "x"}]
     assert strip_resume_additions(history, keep=3) == history          # no marker: untouched
+    # the marker text inside the resumed history is never touched; only the appended prompt is
+    hist2 = [_m("developer", "perms"), _m("user", RESUME_MARKER), _m("user", "task")]
+    assert strip_resume_additions(hist2 + [_m("developer", "p2"), _m("user", RESUME_MARKER)], keep=3) == hist2
+    assert "agentlens" not in RESUME_MARKER.lower() and "branch" not in RESUME_MARKER.lower()
 
 
 def test_startup_notice_detection():

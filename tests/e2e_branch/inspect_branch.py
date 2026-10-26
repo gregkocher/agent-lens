@@ -22,6 +22,7 @@ import re
 from pathlib import Path
 
 from harness.prefill import SUPPORTED, count_tokens, render_chat, render_prompt
+from harness.resume import is_resume_marker
 
 OK, BAD = "OK ", "!! "
 
@@ -198,10 +199,12 @@ def main() -> None:
         print(f"    {OK if ids == list(range(ids[0], ids[0] + len(ids))) else BAD}step ids continuous {ids[0]}..{ids[-1]}")
 
     # 8. hygiene
-    blob = "".join(p.read_text(errors="replace") for p in sorted(raw.glob("request_*.json"))
-                   if re.fullmatch(r"request_\d+\.json", p.name))
+    reqs = [json.loads(p.read_text()) for p in sorted(raw.glob("request_*.json"))
+            if re.fullmatch(r"request_\d+\.json", p.name)]
+    blob = "".join(json.dumps(r) for r in reqs)
+    marker = any(is_resume_marker(it) for r in reqs for it in r.get("input") or [] if isinstance(it, dict))
     print("\n[8] hygiene")
-    print(f"    {OK if '__agentlens_branch_resume__' not in blob else BAD}no resume marker in any forwarded request")
+    print(f"    {OK if not marker else BAD}no resume marker in any forwarded request")
     seed_meta = Path(bm["seed_run"]) / "run_meta.json"   # absent when inspecting off the pod
     old = (json.loads(seed_meta.read_text()).get("work_dir") or "") if seed_meta.exists() else ""
     print(f"    {OK if not old or old not in blob else BAD}seed work dir not leaked ({old})")
