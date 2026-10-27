@@ -1,12 +1,12 @@
 """Sample Inkling's own next sentences at a branch cut point (on-policy candidate pools).
 
 Usage (repo root, on a pod, OPENROUTER_API_KEY set):
-  python experiments/causal_language/sample_next_sentences.py <sweep.yaml> <arm> <n> <out.jsonl>
+  python experiments/causal_language/sample_next_sentences.py <sweep.yaml> <arm> <n> <out.jsonl> [k_sentences]
 
 The arm's prefix (e.g. the `cut` arm of a removal sweep, or the `none` arm of an injection
 sweep) is rendered exactly as a branch step would be, and the reasoning is continued n times
 with the seed's sampling (stage 1 of the staged prefill, stopped at the end of the reasoning).
-Each line: the first two sentences the model wrote after the prefix, plus the raw head.
+Each line: the first k sentences (default 2) the model wrote after the prefix, plus the raw head.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ def first_sentences(text: str, k: int = 2) -> list[str]:
 
 async def main() -> None:
     cfg_path, arm, n, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+    k = int(sys.argv[5]) if len(sys.argv) > 5 else 2
     cfg = load_sweep_config(cfg_path)
     bc = cfg.branch
     seed = Seed(bc.seed_run, bc.request, bc.provider)
@@ -58,7 +59,7 @@ async def main() -> None:
                                            top_p=s["top_p"])
         text = d["choices"][0].get("text") or ""
         return {"i": i, "experiment": cfg.experiment_name, "arm": arm, "prefix_tail": prefix[-200:],
-                "sentences": first_sentences(text), "head": text[:600],
+                "sentences": first_sentences(text, k), "head": text[:1200],
                 "finish_reason": d["choices"][0].get("finish_reason")}
 
     rows = await asyncio.gather(*(one(i) for i in range(n)))
