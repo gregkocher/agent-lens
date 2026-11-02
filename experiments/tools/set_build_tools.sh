@@ -43,6 +43,8 @@ case "$mode" in
     # of the system, and -dev library packages in the image would pull removals along.
     pkgs=$(dpkg-query -W -f='${Package}\n' | grep -E '^(build-essential|gcc(-[0-9]+)?|g\+\+(-[0-9]+)?|cpp(-[0-9]+)?|gfortran(-[0-9]+)?|binutils|binutils-x86-64-linux-gnu|make|cmake|dpkg-dev|(lib)?python3(\.[0-9]+)?-dev)$')
     [ -z "$pkgs" ] || dpkg --purge --force-depends $pkgs >/dev/null 2>&1
+    # The image also ships Homebrew GCC outside PATH (agents have found and run it).
+    rm -rf /home/linuxbrew
     # Compilers not owned by a package in the image would survive the purge, so check() decides.
     check off
     ;;
