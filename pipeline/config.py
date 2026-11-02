@@ -352,6 +352,10 @@ class SweepConfig(BaseModel):
     branch: BranchConfig | None = None
     isolation: IsolationConfig = Field(default_factory=IsolationConfig)
     realism: RealismConfig = Field(default_factory=RealismConfig)
+    # C/C++ build tools on the pod (experiments/tools/set_build_tools.sh): "on" = compilers,
+    # Python headers, Cython, pybind11; "off" = python + pip only; None = leave the image as is.
+    # Applies to the whole pod, so never run sweeps with different values on one pod.
+    build_tools: Literal["on", "off"] | None = None
 
     # Phase 1 — trajectories
     pressure: PressureConfig         # the swept x-axis (variable + values; None = no cap)

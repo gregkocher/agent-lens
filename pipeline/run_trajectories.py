@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -271,6 +272,18 @@ def setup_isolation(cfg: SweepConfig, engine: str) -> UserPool | None:
     return UserPool()
 
 
+def apply_build_tools(cfg: SweepConfig) -> None:
+    """Put the pod in the configured build-tools state; refuse to run if that fails."""
+    if cfg.build_tools is None:
+        return
+    script = Path(__file__).resolve().parent.parent / "experiments" / "tools" / "set_build_tools.sh"
+    res = subprocess.run(["bash", str(script), cfg.build_tools], capture_output=True, text=True)
+    (cfg.out / "build_tools_state.txt").write_text(res.stdout + res.stderr)
+    if res.returncode != 0:
+        raise RuntimeError(f"build_tools={cfg.build_tools} not reached:\n{res.stdout}{res.stderr}")
+    print(f"[build_tools] pod state: {cfg.build_tools}")
+
+
 async def run_all_trajectories(cfg: SweepConfig, shard: tuple[int, int] | None = None,
                                only: set[str] | None = None) -> list[dict]:
     """Roll out every (pressure value, rep) trajectory AND judge each one as it completes.
@@ -288,6 +301,7 @@ async def run_all_trajectories(cfg: SweepConfig, shard: tuple[int, int] | None =
     base_cfg = load_config(cfg.base_task_config)
     check_pressure_engine_compat(cfg.pressure, base_cfg.engine)  # fail-fast on bad combo
     base_sig = dir_signature(cfg.base_work_dir)  # computed once; captures repo edits
+    apply_build_tools(cfg)
     pool = setup_isolation(cfg, base_cfg.engine)
     if cfg.branch is not None:   # fail fast: unsupported model/provider/engine, bad arms
         seed = Seed(cfg.branch.seed_run, cfg.branch.request, cfg.branch.provider)
