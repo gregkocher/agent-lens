@@ -314,3 +314,29 @@ class TestBinarySafety:
         sg.commit_snapshot("s1")
         (tmp_work_dir / "old_name.py").rename(tmp_work_dir / "new_name.py")
         assert set(sg.diff_working_names()) == {"old_name.py", "new_name.py"}
+
+
+class TestArgvHygiene:
+    """`ps` is global on the pods, so snapshot command lines must look like ordinary git use."""
+
+    def test_snapshot_argv_has_no_harness_identity_or_tag_names(self, shadow_git: ShadowGit, monkeypatch):
+        import subprocess
+
+        seen: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy(cmd, *a, **kw):
+            seen.append(list(cmd))
+            return real_run(cmd, *a, **kw)
+
+        monkeypatch.setattr(subprocess, "run", spy)
+        shadow_git.commit_baseline()
+        (shadow_git.work_dir / "new.py").write_text("x = 1\n")
+        shadow_git.commit_snapshot(tag="_step_1_7")
+        shadow_git.tag("session_01")
+        argv = " ".join(" ".join(c) for c in seen)
+        for leak in ("agentlens", "shadow@", "_step_1_7", "session_01", "baseline", str(shadow_git.git_dir)):
+            assert leak not in argv, leak
+        assert shadow_git._git("rev-parse", "_step_1_7").stdout.strip() == shadow_git._git("rev-parse", "HEAD").stdout.strip()
+        log = shadow_git._git("log", "-1", "--format=%an %s").stdout.strip()
+        assert log == "agentlens-shadow _step_1_7"

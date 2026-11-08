@@ -58,31 +58,43 @@ class ShadowGit:
         self.work_dir = work_dir.resolve()
         self.git_dir = git_dir.resolve()
 
-    # Config overrides applied to every shadow-git invocation. These are
-    # throwaway bookkeeping commits; never sign them (a user's global
-    # commit.gpgsign=true would otherwise make every commit fail), and pin a
-    # committer identity so commits work even if the user has no global identity.
-    _CONFIG_OVERRIDES = [
-        "-c", "commit.gpgsign=false",
-        "-c", "tag.gpgsign=false",
-        "-c", "user.name=agentlens-shadow",
-        "-c", "user.email=shadow@agentlens.local",
-        "-c", "core.quotePath=false",  # raw UTF-8 path names, consistent with -z output
-    ]
+    # Config applied to every shadow-git invocation. These are throwaway bookkeeping
+    # commits; never sign them (a user's global commit.gpgsign=true would otherwise make
+    # every commit fail), and pin a committer identity so commits work even if the user
+    # has no global identity. Passed through the environment, not argv: `ps` is global on
+    # the pods, so an isolated agent can see these processes' command lines (but not their
+    # environment), and argv should look like ordinary git use.
+    _CONFIG = {
+        "commit.gpgsign": "false",
+        "tag.gpgsign": "false",
+        "user.name": "agentlens-shadow",
+        "user.email": "shadow@agentlens.local",
+        "core.quotePath": "false",  # raw UTF-8 path names, consistent with -z output
+    }
 
-    def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    @classmethod
+    def _config_env(cls) -> dict[str, str]:
+        items = {"safe.directory": "*", **cls._CONFIG}
+        env = {"GIT_CONFIG_COUNT": str(len(items))}
+        for i, (k, v) in enumerate(items.items()):
+            env[f"GIT_CONFIG_KEY_{i}"] = k
+            env[f"GIT_CONFIG_VALUE_{i}"] = v
+        return env
+
+    def _git(self, *args: str, check: bool = True, input: str | None = None) -> subprocess.CompletedProcess[str]:
         """Run a git command with GIT_DIR and GIT_WORK_TREE set."""
         import os
 
         env = {
             **os.environ,
-            **_SAFE_DIRECTORY,
+            **self._config_env(),
             "GIT_DIR": str(self.git_dir),
             "GIT_WORK_TREE": str(self.work_dir),
         }
         result = subprocess.run(
-            ["git", *self._CONFIG_OVERRIDES, *args],
+            ["git", *args],
             env=env,
+            input=input,
             capture_output=True,
             # Decode as text but never crash on binary output: `git show HEAD:<file>`
             # on a compiled artifact (e.g. a Cython/C .so the agent built) emits raw
@@ -122,8 +134,8 @@ class ShadowGit:
     def commit_baseline(self, message: str = "baseline") -> None:
         """Stage everything and commit as the baseline snapshot."""
         self._git("add", "-A")
-        self._git("commit", "-m", message, "--allow-empty")
-        self._git("tag", "-f", "baseline")
+        self._git("commit", "--allow-empty", "-F", "-", input=message)
+        self._set_tag("baseline")
         logger.info("Baseline committed and tagged")
 
     def commit_snapshot(self, tag: str, message: str | None = None) -> None:
@@ -133,11 +145,11 @@ class ShadowGit:
         # Only commit if there are staged changes
         status = self._git("diff", "--cached", "--quiet", check=False)
         if status.returncode != 0:
-            self._git("commit", "-m", msg)
+            self._git("commit", "-F", "-", input=msg)
         else:
             # Nothing to commit — still tag current HEAD
             logger.debug("No changes to commit for %s", tag)
-        self._git("tag", "-f", tag)
+        self._set_tag(tag)
 
     def diff_from_ref(self, ref: str = "baseline") -> str:
         """Get unified diff of all changes since a ref."""
@@ -234,7 +246,11 @@ class ShadowGit:
 
     def tag(self, name: str) -> None:
         """Create or update a tag at HEAD."""
-        self._git("tag", "-f", name)
+        self._set_tag(name)
+
+    def _set_tag(self, name: str) -> None:
+        """Point lightweight tag ``name`` at HEAD (same as ``git tag -f``), with the name on stdin."""
+        self._git("update-ref", "--stdin", input=f"update refs/tags/{name} HEAD\n")
 
     def begin_session(
         self,
