@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from harness.config import HookCommandConfig, RunConfig, SessionMode
+from harness.full_trajectory import write_full_trajectory_safely
 from harness.runner import SessionResult, run_session
 from harness.shadow_git import ShadowGit
 from harness.state import StateManager
@@ -259,6 +260,12 @@ async def run_experiment(config: RunConfig, output_base: Path | None = None) -> 
     # Save full diff (baseline → final state)
     full_diff = shadow_git.diff_from_ref("baseline")
     (run_dir / "full_diff.patch").write_text(full_diff or "# No changes\n")
+    if len({r.session_index for r in results}) > 1:
+        # Judges see session 1 only, so they get its changes, not later turns' edits.
+        first_sc = min(config.sessions, key=lambda s: s.session_index)
+        first_tag = f"session_{first_sc.session_index:02d}" + ("_r01" if (first_sc.count or 1) > 1 else "")
+        first = shadow_git.diff_between("baseline", first_tag)
+        (run_dir / "first_session_diff.patch").write_text(first or "# No changes\n")
 
     # Save changelog
     state.save_changelog(run_dir / "state_changelog.jsonl")
@@ -267,6 +274,7 @@ async def run_experiment(config: RunConfig, output_base: Path | None = None) -> 
     meta = _build_run_meta(config, run_name, results, state)
     with open(run_dir / "run_meta.json", "w") as f:
         json.dump(meta, f, indent=2, default=str)
+    write_full_trajectory_safely(run_dir, config.session_mode.value)
 
     # Revert working directory if requested
     if config.revert_work_dir:

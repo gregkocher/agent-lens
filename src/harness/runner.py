@@ -278,8 +278,6 @@ async def run_session(
         run_as_user=run_config.run_as_user,
         extra={
             "codex_prompt_stdin": run_config.codex_prompt_stdin,
-            # a branch rollout's prompt is the resume marker the proxy splices away
-            "codex_record_prompt": proxy_intercept is None,
             "codex_multi_agent": run_config.codex_multi_agent,
             "codex_rollout_budget_tokens": run_config.codex_rollout_budget_tokens,
             "codex_reasoning_summary": run_config.codex_reasoning_summary,

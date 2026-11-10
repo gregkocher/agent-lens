@@ -191,30 +191,8 @@ def test_codex_prompt_transport(tmp_path, monkeypatch, via_stdin):
     assert payload["prompt"] == prompt
     assert (prompt in payload["argv"]) is (not via_stdin)       # hidden from argv iff stdin
     assert isinstance(events[-1], ResultEvent) and not events[-1].is_error
-    # codex never echoes its input, so the engine records the turn's user message itself
-    users = [e for e in events if isinstance(e, UserMessageEvent)]
-    assert [u.text for u in users] == [prompt]
-
-
-def test_codex_user_message_recording(tmp_path, monkeypatch):
-    fake = tmp_path / "codex"
-    fake.write_text(FAKE_CODEX.format(py=sys.executable))
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
-
-    def users(**kw):
-        spec = EngineRunSpec(prompt="follow-up question", model="m", cwd=str(tmp_path),
-                             provider="openrouter", **kw)
-
-        async def go():
-            return [e async for e in CodexEngine().run(spec)]
-
-        return [e.text for e in asyncio.run(go()) if isinstance(e, UserMessageEvent)]
-
-    # the recorded text is what codex was sent, including a folded-in system prompt
-    assert users(system_prompt="SYS") == ["SYS\n\n---\n\nfollow-up question"]
-    # internal prompts (branch resume marker) are not recorded as user turns
-    assert users(extra={"codex_record_prompt": False}) == []
+    # session trajectories hold only the agent's steps (prompts live in trajectory_full.json)
+    assert not any(isinstance(e, UserMessageEvent) for e in events)
 
 
 # ---------------------------------------------------------------- root-only (pod)

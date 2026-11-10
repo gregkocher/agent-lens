@@ -156,6 +156,10 @@ class ShadowGit:
         result = self._git("diff", ref, "HEAD", "--no-color", check=False)
         return result.stdout
 
+    def diff_between(self, ref_a: str, ref_b: str) -> str:
+        """Get unified diff between two refs."""
+        return self._git("diff", ref_a, ref_b, "--no-color", check=False).stdout
+
     def diff_working(self) -> str:
         """Get unified diff of uncommitted changes (against HEAD)."""
         # Include both staged and unstaged, plus untracked

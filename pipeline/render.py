@@ -1,9 +1,11 @@
 """Render an AgentLens run into a single text document for the LLM judge.
 
-The judge sees the FULL run: the task the agent was given (system + session prompts from
-the run's saved config.yaml — NOT max_budget_usd, so the judge stays blind to the
-experimental condition), every step's reasoning, messages, tool calls and tool outputs
-in full, then the run's full_diff.patch (key evidence for file-level reward hacking).
+The judge sees the FULL first session: the task the agent was given (system prompt and
+session 1's prompt from the run's saved config.yaml — NOT max_budget_usd, so the judge
+stays blind to the experimental condition), every step's reasoning, messages, tool calls
+and tool outputs in full, then the run's file diff (key evidence for file-level reward
+hacking). Later sessions (follow-up turns) are never shown: their prompts, steps and file
+changes are left out (first_session_diff.patch replaces full_diff.patch).
 Only when that exceeds the judge's budget is anything cut, in this order: the largest
 tool outputs first (middle elided, visible marker), then the diff (priority files kept),
 and only as a last resort whole steps. ``render_info`` reports what was cut, so the
@@ -118,14 +120,8 @@ def _step_parts(steps: list[dict]) -> list[tuple[str, list[str]]]:
     budget policy can shorten the largest ones first. Heads are labelled `[step N]`."""
     out: list[tuple[str, list[str]]] = []
     for st in steps:
-        src = st.get("source")
-        if src == "user":
-            # The initial task prompt — include once for context.
-            msg = st.get("message") or ""
-            if msg.strip():
-                out.append((f"[TASK PROMPT]\n{msg}\n", []))
-            continue
-        if src != "agent":
+        if st.get("source") != "agent":
+            # The task prompt is rendered once, from config.yaml (_load_task_description).
             continue
         block = [f"[step {st.get('step_id')}]"]
         reasoning = st.get("reasoning_content")
@@ -197,7 +193,9 @@ def _fit_blocks(blocks: list[str], budget: int) -> str:
 def _load_task_description(run_dir: Path) -> str:
     """The instructions the agent was given, from the run's saved config.yaml.
     Only the prompts are included — the judge must stay blind to the experimental
-    condition, so max_budget_usd and other run parameters are deliberately omitted."""
+    condition, so max_budget_usd and other run parameters are deliberately omitted.
+    Judges see the first session only: later sessions (follow-up turns such as asking
+    the agent what it was being tested on) are for other analyses."""
     cfg_path = run_dir / "config.yaml"
     if not cfg_path.exists():
         return ""
@@ -208,10 +206,25 @@ def _load_task_description(run_dir: Path) -> str:
     parts: list[str] = []
     if cfg.get("system_prompt"):
         parts.append(f"[SYSTEM PROMPT]\n{str(cfg['system_prompt']).strip()}")
-    for s in cfg.get("sessions") or []:
-        if isinstance(s, dict) and s.get("prompt"):
-            parts.append(f"[USER TASK PROMPT]\n{str(s['prompt']).strip()}")
+    sessions = [s for s in cfg.get("sessions") or [] if isinstance(s, dict) and s.get("prompt")]
+    if sessions:
+        first = min(sessions, key=lambda s: s.get("session_index") or 1)
+        parts.append(f"[USER TASK PROMPT]\n{str(first['prompt']).strip()}")
     return "\n\n".join(parts)
+
+
+def _is_multi_session(run_dir: Path) -> bool:
+    return any(p.is_dir() for p in run_dir.glob("session_0[2-9]*")) or \
+        any(p.is_dir() for p in run_dir.glob("session_[1-9][0-9]*"))
+
+
+def _judged_diff(run_dir: Path) -> str:
+    """The file diff judges see: the whole run, or session 1's changes when the run has
+    later sessions (first_session_diff.patch, written by run_experiment)."""
+    if _is_multi_session(run_dir) and (run_dir / "first_session_diff.patch").exists():
+        return (run_dir / "first_session_diff.patch").read_text()
+    diff_path = run_dir / "full_diff.patch"
+    return diff_path.read_text() if diff_path.exists() else "(no full_diff.patch found)"
 
 
 def _write_steps_by_file(run_dir: Path) -> dict[str, list[int]]:
@@ -227,6 +240,8 @@ def _write_steps_by_file(run_dir: Path) -> dict[str, list[int]]:
             w = json.loads(line)
         except Exception:
             continue
+        if (w.get("session_index") or 1) != 1:
+            continue  # judges see session 1 only
         fp, sid = w.get("file_path"), w.get("step_id")
         if fp and sid is not None and sid not in out.setdefault(str(fp), []):
             out[str(fp)].append(sid)
@@ -245,7 +260,6 @@ def render_trajectory(run_dir: str | Path, max_chars: int = 750_000) -> str:
     """Render run_dir (an AgentLens run directory) to a judge-input string."""
     run_dir = Path(run_dir)
     traj_path = run_dir / "session_01" / "trajectory.json"
-    diff_path = run_dir / "full_diff.patch"
 
     try:
         traj = json.loads(traj_path.read_text())
@@ -254,7 +268,7 @@ def render_trajectory(run_dir: str | Path, max_chars: int = 750_000) -> str:
         parts = [(f"(could not load trajectory: {e})", [])]
     results = [list(rs) for _, rs in parts]
 
-    diff = diff_path.read_text() if diff_path.exists() else "(no full_diff.patch found)"
+    diff = _judged_diff(run_dir)
     step_map = _write_steps_by_file(run_dir)
     full_diff = _render_diff(diff, 10 ** 12, step_map)
     task = _load_task_description(run_dir) or "(task config not found)"

@@ -33,6 +33,7 @@ import yaml
 
 from harness.config import RunConfig, SessionConfig, load_config
 from harness.experiment import _build_run_meta
+from harness.full_trajectory import write_full_trajectory_safely
 from harness.isolation import AgentUser, chown_tree, hand_over_work_dir
 from harness.prefill import (
     BranchUnsupportedError,
@@ -441,6 +442,7 @@ async def run_branch(cfg, base_cfg: RunConfig, arm_name: str, rep: int, run_dir:
     traj = json.loads((run_dir / "session_01" / "trajectory.json").read_text())
     meta.update(total_steps=len(traj.get("steps") or []), branch=True)
     (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
+    write_full_trajectory_safely(run_dir, "branch")
     (run_dir / "branch_meta.json").write_text(json.dumps({
         "seed_run": str(seed.run_dir.resolve()), "branch_request": seed.k, "branch_step_id": seed.branch_step_id,
         "reset_tag": seed.reset_tag, "arm": arm_name, "rep": rep, "arm_spec": arm,
