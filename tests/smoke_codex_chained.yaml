@@ -1,0 +1,19 @@
+# Two-turn Codex smoke (chained): the second session is a follow-up question in the same
+# conversation. Each session's trajectory.json should start with its own user step.
+# work_dir is created by the caller (e.g. a 2-line main.py); run on a pod with
+# OPENROUTER_API_KEY set: harness run tests/smoke_codex_chained.yaml
+engine: codex
+provider: openrouter
+model: "qwen/qwen3-coder"
+sandbox_mode: danger-full-access
+work_dir: "./repos/codex_chained_test"
+session_mode: chained
+tags: ["smoke-test", "codex", "openrouter", "chained", "multi-turn"]
+max_turns: 8
+capture_api_requests: true
+
+sessions:
+  - session_index: 1
+    prompt: "Read main.py and tell me in one sentence what it does."
+  - session_index: 2
+    prompt: "Follow-up question: what number does it print, and how did you work that out from your previous answer?"

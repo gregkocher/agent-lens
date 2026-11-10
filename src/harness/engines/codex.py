@@ -41,6 +41,7 @@ from harness.engines.base import (
     EngineToolResult,
     ResultEvent,
     SystemEvent,
+    UserMessageEvent,
     classify_api_failure,
 )
 
@@ -173,6 +174,13 @@ class CodexEngine(Engine):
 
         assert proc.stderr is not None
         stderr_task = asyncio.ensure_future(proc.stderr.read())
+
+        # `codex exec --json` never echoes the input, so record this turn's user message
+        # ourselves: exactly the text sent (incl. a folded-in system prompt). One per
+        # invocation, so each chained/resumed session gets its own user step. Off for
+        # internal prompts that aren't a real user turn (branch resume marker).
+        if spec.extra.get("codex_record_prompt", True):
+            yield UserMessageEvent(text=prompt)
 
         thread_id: str | None = None
         usage_acc: dict[str, int] = {}
