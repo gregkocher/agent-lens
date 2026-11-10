@@ -97,7 +97,10 @@ def work_dir_hint(run_config: RunConfig, cwd: str) -> str | None:
     Mentions the memory file only when one exists (seeded, or carried over), so
     workspaces without MEMORY.md are not told to use it.
     """
-    if not run_config.work_dir_hint:
+    enabled = run_config.work_dir_hint
+    if enabled is None:
+        enabled = run_config.engine == "claude_code"
+    if not enabled:
         return None
     memory_path = Path(cwd) / run_config.memory_file
     memory_line = (

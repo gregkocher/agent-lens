@@ -69,7 +69,8 @@ def test_build_run_config_claude_keeps_hint():
     # Claude Code gets an empty default system prompt from the SDK, so the hint is the
     # only place it learns its cwd + the absolute-path rule: keep it.
     rc = _build_run_config(_sweep(), _run_config("claude_code"), 0.05, 1, Path("/tmp/ws/abc"))
-    assert rc.memory_seed is None and rc.work_dir_hint is True and not rc.codex_prompt_stdin
+    assert rc.memory_seed is None and not rc.codex_prompt_stdin
+    assert work_dir_hint(rc, "/tmp/ws/abc") is not None
 
 
 def test_build_run_config_realism_off_restores_old_behavior():
@@ -87,14 +88,20 @@ def test_fingerprint_ignores_pooled_user():
     assert _fingerprint_config(rc, "sig") == fp
 
 
+def test_work_dir_hint_defaults_off_for_codex_on_for_claude(tmp_path):
+    assert work_dir_hint(_run_config("codex"), str(tmp_path)) is None
+    assert "absolute paths" in work_dir_hint(_run_config("claude_code"), str(tmp_path))
+    assert work_dir_hint(_run_config("claude_code", work_dir_hint=False), str(tmp_path)) is None
+
+
 def test_work_dir_hint(tmp_path):
     assert work_dir_hint(_run_config(work_dir_hint=False), str(tmp_path)) is None
-    h = work_dir_hint(_run_config(), str(tmp_path))
+    h = work_dir_hint(_run_config(work_dir_hint=True), str(tmp_path))
     assert str(tmp_path) in h and "MEMORY.md" in h                      # seeded by default
-    h = work_dir_hint(_run_config(memory_seed=None), str(tmp_path))
+    h = work_dir_hint(_run_config(work_dir_hint=True, memory_seed=None), str(tmp_path))
     assert "MEMORY.md" not in h and "absolute paths" in h               # no memory file
     (tmp_path / "MEMORY.md").write_text("x")
-    assert "MEMORY.md" in work_dir_hint(_run_config(memory_seed=None), str(tmp_path))
+    assert "MEMORY.md" in work_dir_hint(_run_config(work_dir_hint=True, memory_seed=None), str(tmp_path))
 
 
 # ---------------------------------------------------------------- git history

@@ -114,8 +114,7 @@ def _build_run_config(cfg: SweepConfig, base_cfg, value, rep: int, work_dir: Pat
     if not cfg.realism.seed_memory_file:
         run_config.memory_seed = None
     if run_config.engine == "codex":
-        if not cfg.realism.codex_prompt_preamble:
-            run_config.work_dir_hint = False
+        run_config.work_dir_hint = cfg.realism.codex_prompt_preamble
         if cfg.isolation.hide_process_args:
             run_config.codex_prompt_stdin = True
     # agent_provider override bypasses RunConfig validation (model_copy doesn't

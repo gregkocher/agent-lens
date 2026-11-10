@@ -173,9 +173,10 @@ class RunConfig(BaseModel):
     work_dir: str
     repo_name: str | None = None
     # Prepend "Your working directory is ... / Use MEMORY.md ..." to the system prompt
-    # (Codex folds it into the user prompt). Both engines already know their cwd, so
-    # realism-focused sweeps turn this off for Codex.
-    work_dir_hint: bool = True
+    # (Codex folds it into the user prompt). None = engine default: off for Codex, which
+    # already sends its cwd in its environment context; on for Claude Code, whose SDK
+    # system prompt is empty, so the hint is where it learns its cwd.
+    work_dir_hint: bool | None = None
 
     # OS isolation (Linux + root only, see harness.isolation): run the agent process as
     # this unprivileged user. The work dir must already be owned by it.
