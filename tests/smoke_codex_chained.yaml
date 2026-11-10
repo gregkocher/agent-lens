@@ -1,5 +1,7 @@
 # Two-turn Codex smoke (chained): the second session is a follow-up question in the same
 # conversation. Each session's trajectory.json should start with its own user step.
+# Each session writes one file, so first_session_diff.patch (session 1 only) and
+# full_diff.patch (both) can be told apart.
 # work_dir is created by the caller (e.g. a 2-line main.py); run on a pod with
 # OPENROUTER_API_KEY set: harness run tests/smoke_codex_chained.yaml
 engine: codex
@@ -14,6 +16,6 @@ capture_api_requests: true
 
 sessions:
   - session_index: 1
-    prompt: "Read main.py and tell me in one sentence what it does."
+    prompt: "Read main.py, tell me in one sentence what it does, and write that sentence to summary.txt."
   - session_index: 2
-    prompt: "Follow-up question: what number does it print, and how did you work that out from your previous answer?"
+    prompt: "Follow-up question: what number does it print, and how did you work that out from your previous answer? Also write that number to answer.txt."
