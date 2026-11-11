@@ -47,6 +47,14 @@ from harness.engines.base import (
 logger = logging.getLogger(__name__)
 
 
+def is_transient_codex_error(message: str) -> bool:
+    """True for Codex's retry notices ("Reconnecting... 1/5 (stream disconnected ...)").
+
+    Codex emits these as ``error`` events and then retries the request itself; they
+    are not failures unless a ``turn.failed`` follows."""
+    return message.lstrip().startswith("Reconnecting...")
+
+
 def classify_codex_nonzero_exit(
     did_work: bool, has_rollout_budget: bool, stderr: str
 ) -> tuple[bool, str | None]:
@@ -217,8 +225,15 @@ class CodexEngine(Engine):
                     error_text = err.get("message") if isinstance(err, dict) else str(err)
 
                 elif etype == "error":
-                    is_error = True
-                    error_text = evt.get("message") or error_text
+                    msg = evt.get("message") or ""
+                    if is_transient_codex_error(msg):
+                        # Codex is about to retry the request ("Reconnecting... n/5"). If every
+                        # retry fails it emits turn.failed, which marks the run as an error;
+                        # a recovered retry must not.
+                        logger.info("codex transient error (retrying): %s", msg[:200])
+                    else:
+                        is_error = True
+                        error_text = msg or error_text
 
                 elif etype == "item.completed":
                     item = evt.get("item") or {}

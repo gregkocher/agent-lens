@@ -765,3 +765,8 @@ def test_judge_category_per_behavior():
     from pipeline.judge import judge_category
     assert judge_category("sandbagging") == "judge_sandbagging"
     assert judge_category("reward_hacking") == "judge_reward_hacking"
+
+
+def test_fixed_work_dir_overrides_hashed_path():
+    assert _sweep(fixed_work_dir="/app").work_dir_for("bp_ptask_r1") == Path("/app")
+    assert _sweep().work_dir_for("bp_ptask_r1").parent == Path("/tmp/ws")

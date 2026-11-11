@@ -18,6 +18,9 @@ shard_args=(); [ -n "${4:-}" ] && [ "${4}" != "-" ] && shard_args=(--shard "$4")
 [ -n "${5:-}" ] && shard_args+=(--runs "$5")
 [ -x "$repo/.venv/bin/python" ] || { echo "run 'uv sync' in $repo first" >&2; exit 1; }
 cd "$repo"
+# Root-only scratch for the orchestrator: Python tempfiles, uv lock files and the like would
+# otherwise land in the shared /tmp, where agents can list them. Agents get their own TMPDIR.
+export TMPDIR=/root/.cache/tmp; mkdir -p "$TMPDIR"; chmod 700 "$TMPDIR"
 # -u: unbuffered, so the log survives even if the orchestrator is killed.
 setsid nohup "$repo/.venv/bin/python" -u reward_hacking_budget_pressure.py \
   --config "$cfg" --phase "$phase" "${shard_args[@]}" > "$log" 2>&1 < /dev/null &

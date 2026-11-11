@@ -349,6 +349,9 @@ class SweepConfig(BaseModel):
     # the agent sees its cwd (pwd, and the engines inject it into context), so a path like
     # pipeline_runs/<experiment>/work_dirs/bp_<arm>_r1 would leak the condition.
     work_root: str = "/tmp/ws"
+    # Exact agent work dir, for tasks whose prompt names a fixed path (e.g. Terminal-Bench's
+    # /app). Every run then shares this one path, so only use it with one run per host.
+    fixed_work_dir: str | None = None
     branch: BranchConfig | None = None
     isolation: IsolationConfig = Field(default_factory=IsolationConfig)
     realism: RealismConfig = Field(default_factory=RealismConfig)
@@ -456,6 +459,8 @@ class SweepConfig(BaseModel):
         """Agent work dir for one run: <work_root>/<12-hex id>. The id hashes the resolved
         output_dir + run_name (unique across concurrent sweeps on one host) and reveals
         neither the experiment, the arm, nor the rep. run_meta.json records the mapping."""
+        if self.fixed_work_dir:
+            return Path(self.fixed_work_dir)
         key = f"{self.out.resolve()}\x00{run_name}"
         return Path(self.work_root) / hashlib.sha256(key.encode()).hexdigest()[:12]
 

@@ -38,7 +38,9 @@ elif command -v npm >/dev/null 2>&1; then
 else
   # fallback: release binary. The CLI asset is EXACTLY codex-<triple>.tar.gz
   # (NOT bwrap-/codex-app-server-/codex-package-/codex-responses-api-proxy-).
-  cd /tmp
+  # Download outside /tmp: agents can list /tmp, and codex.tgz plus the unpacked binary there
+  # tell them the machine was set up to run an agent. The download dir is removed afterwards.
+  DL=/root/.cache/codex_dl; rm -rf "$DL"; mkdir -p "$DL"; cd "$DL"
   # PIN 0.142.0: codex >=0.145 defaults an OpenAI Responses "server tool" on for
   # unknown model slugs (e.g. gemini-*-customtools via OpenRouter), which OpenRouter
   # rejects with {"error":"Server tool request failed","code":400}, failing every
@@ -46,9 +48,9 @@ else
   URL=https://github.com/openai/codex/releases/download/rust-v0.142.0/codex-x86_64-unknown-linux-musl.tar.gz
   echo "codex release asset: $URL"
   curl -LsSf "$URL" -o codex.tgz && tar xzf codex.tgz
-  BIN=$(find /tmp -maxdepth 1 -name 'codex-x86_64-unknown-linux-musl*' -type f ! -name '*.tgz' | head -1)
+  BIN=$(find "$DL" -maxdepth 1 -name 'codex-x86_64-unknown-linux-musl*' -type f ! -name '*.tgz' | head -1)
   [ -n "$BIN" ] && install -m755 "$BIN" /usr/local/bin/codex && echo "codex via binary: $(codex --version 2>&1 | head -1)"
-  cd /root/agent-lens
+  cd /root/agent-lens; rm -rf "$DL"
 fi
 
 echo "=== [6/6] keys ==="
