@@ -110,6 +110,24 @@ class ShadowGit:
             result.check_returncode()
         return result
 
+    def _stage_all(self, attempts: int = 3) -> None:
+        """``git add -A``, tolerant of files the agent is still writing.
+
+        A file that changes while git reads it (e.g. a log a background job appends to)
+        fails with "short read while indexing"; a moment later it usually succeeds. After
+        ``attempts`` failures, stage with --ignore-errors so one busy file can't end the run.
+        """
+        import time
+
+        for i in range(attempts):
+            result = self._git("add", "-A", check=False)
+            if result.returncode == 0:
+                return
+            time.sleep(0.5 * (i + 1))
+        result = self._git("add", "-A", "--ignore-errors", check=False)
+        if result.returncode != 0:
+            logger.warning("git add -A skipped unreadable files: %s", result.stderr.strip()[:500])
+
     def init(self) -> None:
         """Initialize the shadow git repo."""
         import os
@@ -133,14 +151,14 @@ class ShadowGit:
 
     def commit_baseline(self, message: str = "baseline") -> None:
         """Stage everything and commit as the baseline snapshot."""
-        self._git("add", "-A")
+        self._stage_all()
         self._git("commit", "--allow-empty", "-F", "-", input=message)
         self._set_tag("baseline")
         logger.info("Baseline committed and tagged")
 
     def commit_snapshot(self, tag: str, message: str | None = None) -> None:
         """Stage all changes and commit with a tag."""
-        self._git("add", "-A")
+        self._stage_all()
         msg = message or tag
         # Only commit if there are staged changes
         status = self._git("diff", "--cached", "--quiet", check=False)
@@ -163,13 +181,13 @@ class ShadowGit:
     def diff_working(self) -> str:
         """Get unified diff of uncommitted changes (against HEAD)."""
         # Include both staged and unstaged, plus untracked
-        self._git("add", "-A")
+        self._stage_all()
         result = self._git("diff", "--cached", "--no-color", check=False)
         return result.stdout
 
     def diff_working_names(self) -> list[str]:
         """Get list of changed files in working tree (uncommitted)."""
-        self._git("add", "-A")
+        self._stage_all()
         # --no-renames: a rename is reported as delete + add, so both paths get events
         result = self._git("diff", "--cached", "--no-renames", "--name-only", check=False)
         return [f for f in result.stdout.strip().splitlines() if f]
